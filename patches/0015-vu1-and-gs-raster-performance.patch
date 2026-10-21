@@ -1,0 +1,805 @@
+VU1 interpreter and GS rasterizer speedups for 3D scenes (dotr-recomp issue #13); output is bit-identical.
+
+VU1: FMAC flags take a float fast path (a round-to-zero result strictly inside (FLT_MIN, FLT_MAX), and for
+ACC +/- product no heavy cancellation, only sets S) instead of recomputing every lane in long double; the decoded
+pair is used by reference; the hazard scan is skipped once every register is ready (global and per-VF maxima);
+XGKICK copies a qword with memcpy and no longer zeroes its 64 KiB buffer on each kick or program start; upper NOPs
+skip operand normalization; commits only clear `valid`; free flag/VF slots come from the occupancy masks.
+
+GS: small sprites/triangles, previously drawn one by one on the caller thread, are queued (up to 1024) and drawn
+in one row-band-parallel pass. Every other backend entry point flushes the queue first, as does a primitive whose
+texture overlaps a queued frame/Z buffer (or whose buffers overlap a queued texture), or a change in rounding mode.
+GS::processGIFPacket/writeRegister flush on return unless GS::setDeferredRaster(true); the runtime enables it
+because it reads VRAM only through GS methods (tests that read the VRAM buffer directly keep the old contract).
+
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -209,6 +209,7 @@
+     uint32_t m_cachedCodeSize = 0;
+     uint64_t m_cachedCodeGeneration = 0;
+     bool m_decodedCodeCacheValid = false;
++    DecodedInstructionPair m_uncachedDecoded{}; // holds pairs decoded outside the cache
+ 
+     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
+     ScalarPipelineEntry m_fdiv{};
+@@ -224,6 +225,9 @@
+     std::array<std::array<uint64_t, 4>, 32> m_vfLatestWrite{};
+     std::array<uint64_t, 16> m_viLatestWrite{};
+     std::array<uint64_t, 4> m_accLatestWrite{};
++    // Latest cycle stored in m_vfReady/m_viReady/m_accReady; the hazard scan is skipped once m_cycle reaches it.
++    uint64_t m_regReadyMax = 0;
++    std::array<uint64_t, 32> m_vfRegReadyMax{}; // per register, max over its lanes in m_vfReady
+ 
+     uint64_t m_cycle = 0;
+     // Earliest readyCycle of any queued pipeline entry; commitReadyPipelines() is a no-op before it.
+@@ -255,7 +259,7 @@
+     static void addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
+     static uint8_t vfReadLanes(const InstructionUsage &usage, uint8_t reg);
+     DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
+-    DecodedInstructionPair getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
++    const DecodedInstructionPair &getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
+     void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint64_t generation);
+ 
+     void execUpper(uint32_t instr);
+@@ -280,6 +284,7 @@
+     void queueViWrite(uint8_t reg, int32_t value, uint32_t latency);
+     void queueAccWrite(uint8_t laneMask, const float value[4], uint32_t latency);
+     void startXgkick(uint32_t qwordAddress);
++    void clearXgkick(); // resets the PATH1 state without zeroing its 64 KiB packet buffer
+ 
+     void resetScheduler();
+     void commitReadyPipelines();
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -17,6 +17,17 @@
+ 
+ namespace
+ {
++    // ACC +/- product instructions (MADD/MSUB/OPMSUB and their ACC forms); OPMULA (special 0x2E) is a plain product.
++    constexpr bool isFmacProductSum(uint8_t op, uint8_t special)
++    {
++        return (op >= 0x08u && op <= 0x0Fu) ||
++               op == 0x21u || op == 0x23u || op == 0x25u || op == 0x27u ||
++               op == 0x29u || op == 0x2Du || op == 0x2Eu ||
++               (special >= 0x08u && special <= 0x0Fu) ||
++               special == 0x21u || special == 0x23u || special == 0x25u ||
++               special == 0x27u || special == 0x29u || special == 0x2Du;
++    }
++
+     constexpr uint8_t laneForComponent(uint32_t component)
+     {
+         return static_cast<uint8_t>(1u << (3u - component));
+@@ -74,13 +85,15 @@
+     m_vfWritePipeline = {};
+     m_viWritePipeline = {};
+     m_accWritePipeline = {};
+-    m_xgkick = {};
++    clearXgkick();
+     m_vfReady = {};
+     m_viReady = {};
+     m_accReady = {};
+     m_vfLatestWrite = {};
+     m_viLatestWrite = {};
+     m_accLatestWrite = {};
++    m_regReadyMax = 0;
++    m_vfRegReadyMax = {};
+     m_nextWriteSequence = 0;
+     m_nextCommitCycle = ~0ull;
+     m_flagMask = m_efuMask = m_storeMask = m_vfMask = m_viMask = m_accMask = 0u;
+@@ -173,12 +186,36 @@
+ void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
+                                          uint8_t laneFlags[4])
+ {
++    // Fast path: under round-to-zero, a result strictly between FLT_MIN and FLT_MAX means the exact result has the
++    // same sign and is neither zero, underflow nor overflow, so only S can be set. For ACC +/- product this holds
++    // only without heavy cancellation: with |ACC| <= |result| * 2^17 the float rounding error is below |result| / 64.
++    const uint32_t upper = m_currentUpperInstruction;
++    const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
++    const uint8_t special = op >= 0x3Cu ? static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu)) : 0xFFu;
++    const bool productSum = isFmacProductSum(op, special);
+     for (uint32_t component = 0; component < 4u; ++component)
+     {
+         laneFlags[component] = 0u;
+         if ((dest & laneForComponent(component)) == 0u)
+             continue;
+ 
++        uint32_t bits = 0u;
++        std::memcpy(&bits, &result[component], sizeof(bits));
++        const uint32_t exponent = (bits >> 23) & 0xFFu;
++        bool fast = (bits & 0x7FFFFFFFu) > 0x00800000u && (bits & 0x7FFFFFFFu) < 0x7F7FFFFFu;
++        if (fast && productSum)
++        {
++            uint32_t accBits = 0u;
++            std::memcpy(&accBits, &m_state.acc[component], sizeof(accBits));
++            const uint32_t accExponent = (accBits >> 23) & 0xFFu;
++            fast = exponent >= 3u && exponent <= 253u && accExponent <= 253u && accExponent <= exponent + 16u;
++        }
++        if (fast)
++        {
++            laneFlags[component] = static_cast<uint8_t>((bits >> 30) & 0x2u);
++            continue;
++        }
++
+         long double exactResult = 0.0L;
+         if (calculateFmacExactResult(component, exactResult))
+         {
+@@ -411,14 +448,7 @@
+     const uint32_t upper = m_currentUpperInstruction;
+     const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
+     const uint8_t special = op >= 0x3Cu ? static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu)) : 0xFFu;
+-    const bool productSum =
+-        (op >= 0x08u && op <= 0x0Fu) ||
+-        op == 0x21u || op == 0x23u || op == 0x25u || op == 0x27u ||
+-        op == 0x29u || op == 0x2Du || op == 0x2Eu ||
+-        (special >= 0x08u && special <= 0x0Fu) ||
+-        special == 0x21u || special == 0x23u || special == 0x25u ||
+-        special == 0x27u || special == 0x29u || special == 0x2Du;
+-    if (!productSum)
++    if (!isFmacProductSum(op, special))
+         return 0u;
+ 
+     const uint8_t fs = FS(upper);
+@@ -454,8 +484,14 @@
+         }
+ 
+         float product = left * right;
+-        const long double exactProduct = static_cast<long double>(left) * static_cast<long double>(right);
+-        const uint8_t productFlags = normalizeFmacExactResult(product, exactProduct);
++        uint32_t productBits = 0u;
++        std::memcpy(&productBits, &product, sizeof(productBits));
++        const uint32_t productMagnitude = productBits & 0x7FFFFFFFu;
++        // A single rounded product strictly inside (FLT_MIN, FLT_MAX) only reports its sign; see normalizeFmacResult.
++        const uint8_t productFlags =
++            productMagnitude > 0x00800000u && productMagnitude < 0x7F7FFFFFu
++                ? static_cast<uint8_t>((productBits >> 30) & 0x2u)
++                : normalizeFmacExactResult(product, static_cast<long double>(left) * static_cast<long double>(right));
+         // Product-sum instructions report Z/S/U/O from the add/subtract result
+         // as current flags, while every product condition accumulates into the
+         // corresponding sticky flag.
+@@ -490,15 +526,9 @@
+         status |= flags;
+     }
+ 
+-    FlagPipelineEntry *entry = nullptr;
+-    for (FlagPipelineEntry &candidate : m_flagPipeline)
+-    {
+-        if (!candidate.valid)
+-        {
+-            entry = &candidate;
+-            break;
+-        }
+-    }
++    // m_flagMask mirrors the valid entries, so its lowest clear bit is the first free one.
++    const uint32_t freeIndex = static_cast<uint32_t>(std::countr_one(m_flagMask));
++    FlagPipelineEntry *entry = freeIndex < kMaxFlagEntries ? &m_flagPipeline[freeIndex] : nullptr;
+     if (!entry)
+     {
+         reportReservedInstruction(true, 0xFFFFFFFFu);
+@@ -663,9 +693,10 @@
+ {
+     if (reg == 0u || laneMask == 0u)
+         return;
+-    for (PendingVfWrite &write : m_vfWritePipeline)
++    const uint32_t freeIndex = static_cast<uint32_t>(std::countr_one(m_vfMask));
++    if (freeIndex < kMaxPendingVfWrites)
+     {
+-        if (!write.valid)
++        PendingVfWrite &write = m_vfWritePipeline[freeIndex];
+         {
+             write = {};
+             write.valid = true;
+@@ -773,7 +804,7 @@
+         }
+         if (entry.writesClip)
+             m_state.clip = entry.clip;
+-        entry = {};
++        entry.valid = false; // queueing rewrites every field
+         m_flagMask &= ~(1u << index);
+     }
+ 
+@@ -782,7 +813,7 @@
+         m_state.q = m_fdiv.value;
+         const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
+         m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
+-        m_fdiv = {};
++        m_fdiv.valid = false;
+     }
+ 
+     for (uint32_t bits = m_efuMask; bits != 0u; bits &= bits - 1u)
+@@ -792,7 +823,7 @@
+         if (!ready(entry.readyCycle))
+             continue;
+         m_state.p = entry.value;
+-        entry = {};
++        entry.valid = false; // queueing rewrites every field
+         m_efuMask &= ~(1u << index);
+     }
+ 
+@@ -813,7 +844,7 @@
+             }
+             std::memcpy(m_activeVuData + store.address, oldWords, sizeof(oldWords));
+         }
+-        store = {};
++        store.valid = false;
+         m_storeMask &= ~(1u << index);
+     }
+ 
+@@ -831,7 +862,7 @@
+                 m_state.vf[write.reg][component] = write.value[component];
+             }
+         }
+-        write = {};
++        write.valid = false;
+         m_vfMask &= ~(1u << index);
+     }
+ 
+@@ -843,7 +874,7 @@
+             continue;
+         if (m_viLatestWrite[write.reg] == write.sequence)
+             m_state.vi[write.reg] = static_cast<int16_t>(write.value);
+-        write = {};
++        write.valid = false;
+         m_viMask &= ~(1u << index);
+     }
+ 
+@@ -861,7 +892,7 @@
+                 m_state.acc[component] = write.value[component];
+             }
+         }
+-        write = {};
++        write.valid = false;
+         m_accMask &= ~(1u << index);
+     }
+     m_nextCommitCycle = next;
+@@ -884,11 +915,12 @@
+         }
+ 
+         const uint32_t qwordOffset = m_xgkick.copiedBytes;
+-        for (uint32_t i = 0; i < 16u; ++i)
+-        {
+-            const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes + i) % m_activeVuDataSize;
+-            m_xgkick.packet[m_xgkick.copiedBytes + i] = m_activeVuData[source];
+-        }
++        const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes) % m_activeVuDataSize;
++        if (source + 16u <= m_activeVuDataSize)
++            std::memcpy(m_xgkick.packet.data() + qwordOffset, m_activeVuData + source, 16u);
++        else
++            for (uint32_t i = 0; i < 16u; ++i)
++                m_xgkick.packet[qwordOffset + i] = m_activeVuData[(source + i) % m_activeVuDataSize];
+         m_xgkick.copiedBytes += 16u;
+ 
+         if (m_xgkick.currentTagEnd == 0u)
+@@ -959,13 +991,25 @@
+         return;
+ 
+     const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
+-    m_xgkick = {};
++    clearXgkick();
+     m_xgkick.active = true;
+     m_xgkick.sourceAddress = sourceAddress;
+     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
+     m_xgkick.issueCycle = m_cycle;
+ }
+ 
++void VU1Interpreter::clearXgkick()
++{
++    m_xgkick.sourceAddress = 0;
++    m_xgkick.totalBytes = 0;
++    m_xgkick.copiedBytes = 0;
++    m_xgkick.currentTagEnd = 0;
++    m_xgkick.cycleCredit = 0;
++    m_xgkick.issueCycle = 0;
++    m_xgkick.active = false;
++    m_xgkick.currentTagEop = false;
++}
++
+ void VU1Interpreter::advanceOneCycle()
+ {
+     ++m_cycle;
+@@ -1019,13 +1063,16 @@
+     const InstructionUsage *usages[2] = {
+         &decoded.upperUsage,
+         &decoded.lowerUsage};
++    // Every register ready cycle is <= m_regReadyMax, so none can stall once it has passed.
+     for (const InstructionUsage *usage : usages)
+     {
+-        if (!usage)
+-            continue;
++        if (m_regReadyMax <= m_cycle)
++            break; // same answer for both usages
+         for (uint32_t index = 0; index < usage->vfReadCount; ++index)
+         {
+             const VfAccess &access = usage->vfRead[index];
++            if (m_vfRegReadyMax[access.reg] <= m_cycle)
++                continue;
+             for (uint32_t component = 0; component < 4u; ++component)
+             {
+                 if ((access.lanes & laneForComponent(component)) != 0u)
+@@ -1072,6 +1119,8 @@
+             if ((lowerWrite.lanes & laneForComponent(component)) != 0u)
+                 m_vfReady[lowerWrite.reg][component] = m_cycle + latency;
+         }
++        m_vfRegReadyMax[lowerWrite.reg] = std::max<uint64_t>(m_vfRegReadyMax[lowerWrite.reg], m_cycle + latency);
++        m_regReadyMax = std::max<uint64_t>(m_regReadyMax, m_cycle + latency);
+     }
+ 
+     const VfAccess upperWrite = decoded.upperUsage.vfWrite;
+@@ -1085,14 +1134,24 @@
+             if ((upperWrite.lanes & laneForComponent(component)) != 0u)
+                 m_vfReady[upperWrite.reg][component] = m_cycle + latency;
+         }
++        m_vfRegReadyMax[upperWrite.reg] = std::max<uint64_t>(m_vfRegReadyMax[upperWrite.reg], m_cycle + latency);
++        m_regReadyMax = std::max<uint64_t>(m_regReadyMax, m_cycle + latency);
+     }
+ 
+     for (uint32_t bits = decoded.lowerUsage.viWrite & 0xFFFEu; bits != 0u; bits &= bits - 1u)
+-        m_viReady[std::countr_zero(bits)] = m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
+-    for (uint32_t component = 0; component < 4u; ++component)
+     {
+-        if ((decoded.upperUsage.accWrite & laneForComponent(component)) != 0u)
+-            m_accReady[component] = m_cycle + kAccForwardLatency;
++        const uint64_t ready = m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
++        m_viReady[std::countr_zero(bits)] = ready;
++        m_regReadyMax = std::max(m_regReadyMax, ready);
++    }
++    if (decoded.upperUsage.accWrite != 0u)
++    {
++        for (uint32_t component = 0; component < 4u; ++component)
++        {
++            if ((decoded.upperUsage.accWrite & laneForComponent(component)) != 0u)
++                m_accReady[component] = m_cycle + kAccForwardLatency;
++        }
++        m_regReadyMax = std::max<uint64_t>(m_regReadyMax, m_cycle + kAccForwardLatency);
+     }
+ }
+ 
+@@ -1566,17 +1625,17 @@
+     m_decodedCodeCacheValid = true;
+ }
+ 
+-VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPairForPc(
++const VU1Interpreter::DecodedInstructionPair &VU1Interpreter::getDecodedInstructionPairForPc(
+     const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc)
+ {
+     if ((pc & 7u) != 0u)
+-        return decodeInstructionPair(vuCode, pc);
++        return m_uncachedDecoded = decodeInstructionPair(vuCode, pc);
+ 
+     const bool trackedVu1Code = memory != nullptr &&
+                                 ((m_unit == Unit::VU1 && vuCode == memory->getVU1Code()) ||
+                                  (m_unit == Unit::VU0 && vuCode == memory->getVU0Code()));
+     if (!trackedVu1Code)
+-        return decodeInstructionPair(vuCode, pc);
++        return m_uncachedDecoded = decodeInstructionPair(vuCode, pc);
+ 
+     const uint64_t generation = m_unit == Unit::VU1 ? memory->getVU1CodeGeneration() : memory->getVU0CodeGeneration();
+     if (!m_decodedCodeCacheValid ||
+@@ -1589,7 +1648,7 @@
+     }
+     const uint32_t pairIndex = pc / 8u;
+     if (pairIndex >= kMaxDecodedPairs)
+-        return decodeInstructionPair(vuCode, pc);
++        return m_uncachedDecoded = decodeInstructionPair(vuCode, pc);
+     return m_decodedCodeCache[pairIndex];
+ }
+ 
+@@ -1660,7 +1719,7 @@
+         if (m_state.pc + 8u > codeSize)
+             break;
+ 
+-        const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
++        const DecodedInstructionPair &decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
+         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
+         {
+             reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
+@@ -1681,17 +1740,9 @@
+         if (m_cycle >= budgetEnd)
+             break;
+ 
+-        uint8_t writtenVi = 0u;
+-        int32_t oldVi = 0;
+-        for (uint32_t reg = 1; reg < 16u; ++reg)
+-        {
+-            if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
+-            {
+-                writtenVi = static_cast<uint8_t>(reg);
+-                oldVi = m_state.vi[reg];
+-                break;
+-            }
+-        }
++        const uint32_t viWriteBits = decoded.lowerUsage.viWrite & 0xFFFEu;
++        const uint8_t writtenVi = viWriteBits != 0u ? static_cast<uint8_t>(std::countr_zero(viWriteBits)) : 0u;
++        const int32_t oldVi = writtenVi != 0u ? m_state.vi[writtenVi] : 0;
+ 
+         const VfAccess upperWrite = decoded.upperUsage.vfWrite;
+         const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+@@ -24,6 +24,8 @@
+ void VU1Interpreter::execUpper(uint32_t instr)
+ {
+     m_currentUpperInstruction = instr;
++    if ((instr & 0x7FFu) == 0x2FFu || (instr & 0x7FFu) == 0x33Cu)
++        return; // NOP (special 0x2F/0x30): skip the operand normalization below
+     uint8_t dest = DEST(instr);
+     uint8_t ft = FT(instr);
+     uint8_t fs = FS(instr);
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -3,6 +3,7 @@
+ #include "runtime/gs/gs_backend.h"
+ #include "runtime/gs/gs_texture_page_cache.h"
+ 
++#include <algorithm>
+ #include <array>
+ #include <condition_variable>
+ #include <cstdint>
+@@ -45,7 +46,9 @@
+     void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
+ 
+     void DrawPrimitive(const GSPrimitiveBatch &batch);
+-    void DrawPrimitiveParallel(const GSPrimitiveBatch &batch);
++    void DrawPrimitiveParallel(const GSPrimitiveBatch *batches, size_t count);
++    void DeferPrimitive(const GSPrimitiveBatch &batch);
++    void FlushDeferredUnlocked();
+     void RasterWorkerLoop(uint32_t index);
+     void DrawSprite(const GSPrimitiveBatch &batch);
+     void DrawTriangle(const GSPrimitiveBatch &batch);
+@@ -87,11 +90,25 @@
+     std::condition_variable m_rasterStart;
+     std::condition_variable m_rasterDone;
+     const GSPrimitiveBatch *m_rasterBatch = nullptr;
++    size_t m_rasterBatchCount = 0;
+     uint64_t m_rasterGeneration = 0;
+     uint32_t m_rasterPending = 0;
+     int m_rasterRounding = 0;
+     bool m_rasterStop = false;
+ 
++    // Small sprites/triangles are queued and rasterized together in one band-parallel pass. Every other backend
++    // entry point flushes the queue first, and a primitive that would read VRAM a queued one writes (or write VRAM
++    // a queued one reads as texture) flushes it too, so the result matches drawing them one by one.
++    struct VramRange
++    {
++        uint32_t lo = ~0u, hi = 0u; // 256-byte blocks, [lo, hi)
++        void add(const VramRange &other) { lo = std::min(lo, other.lo); hi = std::max(hi, other.hi); }
++        bool overlaps(const VramRange &other) const { return lo < other.hi && other.lo < hi; }
++    };
++    std::vector<GSPrimitiveBatch> m_deferred;
++    VramRange m_deferredFrame, m_deferredZ, m_deferredTexture;
++    int m_deferredRounding = 0;
++
+     GSTransferCommand m_transfer{};
+     GSTransferSnapshot m_transferState{};
+     std::vector<uint8_t> m_localToHostBuffer;
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -570,7 +570,8 @@
+     uint64_t seen = 0;
+     for (;;)
+     {
+-        const GSPrimitiveBatch *batch = nullptr;
++        const GSPrimitiveBatch *batches = nullptr;
++        size_t batchCount = 0;
+         int rounding = 0;
+         {
+             std::unique_lock<std::mutex> lock(m_rasterMutex);
+@@ -579,17 +580,21 @@
+             if (m_rasterStop)
+                 return;
+             seen = m_rasterGeneration;
+-            batch = m_rasterBatch;
++            batches = m_rasterBatch;
++            batchCount = m_rasterBatchCount;
+             rounding = m_rasterRounding;
+         }
+         // The caller may be inside the VU1 interpreter, which rasterizes with round-toward-zero.
+         std::fesetround(rounding);
+         runRasterBand(index, static_cast<uint32_t>(m_rasterWorkers.size() + 1u), [&]()
+                       {
+-                          if (batch->state.prim.type == GS_PRIM_SPRITE)
+-                              DrawSprite(*batch);
+-                          else
+-                              DrawTriangle(*batch); });
++                          for (size_t i = 0; i < batchCount; ++i)
++                          {
++                              if (batches[i].state.prim.type == GS_PRIM_SPRITE)
++                                  DrawSprite(batches[i]);
++                              else
++                                  DrawTriangle(batches[i]);
++                          } });
+         bool last = false;
+         {
+             std::lock_guard<std::mutex> lock(m_rasterMutex);
+@@ -600,11 +605,12 @@
+     }
+ }
+ 
+-void GSCpuBackend::DrawPrimitiveParallel(const GSPrimitiveBatch &batch)
++void GSCpuBackend::DrawPrimitiveParallel(const GSPrimitiveBatch *batches, size_t count)
+ {
+     {
+         std::lock_guard<std::mutex> lock(m_rasterMutex);
+-        m_rasterBatch = &batch;
++        m_rasterBatch = batches;
++        m_rasterBatchCount = count;
+         m_rasterRounding = std::fegetround();
+         m_rasterPending = static_cast<uint32_t>(m_rasterWorkers.size());
+         ++m_rasterGeneration;
+@@ -612,15 +618,89 @@
+     m_rasterStart.notify_all();
+     runRasterBand(0u, static_cast<uint32_t>(m_rasterWorkers.size() + 1u), [&]()
+                   {
+-                      if (batch.state.prim.type == GS_PRIM_SPRITE)
+-                          DrawSprite(batch);
+-                      else
+-                          DrawTriangle(batch); });
++                      for (size_t i = 0; i < count; ++i)
++                      {
++                          if (batches[i].state.prim.type == GS_PRIM_SPRITE)
++                              DrawSprite(batches[i]);
++                          else
++                              DrawTriangle(batches[i]);
++                      } });
+     std::unique_lock<std::mutex> lock(m_rasterMutex);
+     m_rasterDone.wait(lock, [this]()
+                       { return m_rasterPending == 0u; });
+ }
+ 
++void GSCpuBackend::DeferPrimitive(const GSPrimitiveBatch &batch)
++{
++    const GSDrawState &state = batch.state;
++    const auto &ctx = state.context;
++    // Conservative block range of a buffer: pages of 64x32 pixels (the narrowest PS2 page, so other formats are
++    // over-covered), plus one page because the base need not be page aligned. False when it wraps past 4 MiB.
++    const auto range = [](uint32_t baseBlock, uint32_t widthPages, uint32_t height, VramRange &out)
++    {
++        out.lo = baseBlock;
++        out.hi = baseBlock + (std::max<uint32_t>(widthPages, 1u) * ((height + 31u) / 32u) + 1u) * 32u;
++        return out.hi <= GSMem::MEMORY_SIZE / 256u;
++    };
++    const uint32_t height = static_cast<uint32_t>(ctx.scissor.y1) + 1u;
++    VramRange frame, z, texture;
++    bool deferrable = !m_rasterWorkers.empty() &&
++                      range(GSInternal::framePageBaseToBlock(ctx.frame.fbp), ctx.frame.fbw, height, frame) &&
++                      range(GSInternal::framePageBaseToBlock(ctx.zbuf.zbp), ctx.frame.fbw, height, z);
++    if (deferrable && state.prim.tme)
++    {
++        uint32_t texHeight = state.textureHeight;
++        if (((ctx.clamp >> 2) & 0x3u) == 2u) // REGION_CLAMP may address rows past the texture height
++            texHeight = std::max<uint32_t>(texHeight, static_cast<uint32_t>((ctx.clamp >> 34) & 0x3FFu) + 1u);
++        deferrable = range(ctx.tex0.tbp0, ctx.tex0.tbw, texHeight, texture) &&
++                     !texture.overlaps(frame) && !texture.overlaps(z);
++    }
++    if (!deferrable)
++    {
++        FlushDeferredUnlocked();
++        if (state.prim.type == GS_PRIM_SPRITE)
++            DrawSprite(batch);
++        else
++            DrawTriangle(batch);
++        return;
++    }
++
++    const int rounding = std::fegetround();
++    if (!m_deferred.empty() &&
++        (rounding != m_deferredRounding ||
++         texture.overlaps(m_deferredFrame) || texture.overlaps(m_deferredZ) ||
++         frame.overlaps(m_deferredTexture) || z.overlaps(m_deferredTexture)))
++    {
++        FlushDeferredUnlocked();
++    }
++    if (m_deferred.empty())
++        m_deferredRounding = rounding;
++    m_deferredFrame.add(frame);
++    m_deferredZ.add(z);
++    if (state.prim.tme)
++        m_deferredTexture.add(texture);
++    m_deferred.push_back(batch);
++    if (m_deferred.size() >= 1024u)
++        FlushDeferredUnlocked();
++}
++
++void GSCpuBackend::FlushDeferredUnlocked()
++{
++    if (m_deferred.empty())
++        return;
++    // Rasterize with the rounding mode the primitives were submitted under (VU1 XGKICKs run round-toward-zero).
++    const int saved = std::fegetround();
++    if (saved != m_deferredRounding)
++        std::fesetround(m_deferredRounding);
++    DrawPrimitiveParallel(m_deferred.data(), m_deferred.size());
++    if (saved != m_deferredRounding)
++        std::fesetround(saved);
++    m_deferred.clear();
++    m_deferredFrame = {};
++    m_deferredZ = {};
++    m_deferredTexture = {};
++}
++
+ void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
+ {
+     if (vram && vramSize < GSMem::MEMORY_SIZE)
+@@ -640,6 +720,10 @@
+ 
+ void GSCpuBackend::ResetUnlocked()
+ {
++    m_deferred.clear();
++    m_deferredFrame = {};
++    m_deferredZ = {};
++    m_deferredTexture = {};
+     m_clut.fill(0u);
+     m_clutCbp.fill(0u);
+     m_texturePageCache.Invalidate();
+@@ -662,6 +746,7 @@
+ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    FlushDeferredUnlocked();
+     if (!m_vram || (!isFourBitIndexedPsm(tex0.psm) && !isEightBitIndexedPsm(tex0.psm)))
+         return;
+ 
+@@ -746,7 +831,8 @@
+ 
+ void GSCpuBackend::Flush()
+ {
+-    // CPU backend is immediate. GPU backends may submit command buffers here.
++    std::lock_guard<std::mutex> lock(m_mutex);
++    FlushDeferredUnlocked();
+ }
+ 
+ void GSCpuBackend::TextureFlush()
+@@ -757,12 +843,14 @@
+ 
+ void GSCpuBackend::Sync(GSSyncReason)
+ {
+-    // CPU backend is immediate. GPU backends may wait on fences/readbacks here.
++    std::lock_guard<std::mutex> lock(m_mutex);
++    FlushDeferredUnlocked();
+ }
+ 
+ uint32_t GSCpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    const_cast<GSCpuBackend *>(this)->FlushDeferredUnlocked();
+     return ReadVramUnlocked(psm, base, bw, x, y);
+ }
+ 
+@@ -784,6 +872,7 @@
+ void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    FlushDeferredUnlocked();
+     WriteVramUnlocked(psm, base, bw, x, y, value);
+ }
+ 
+@@ -797,6 +886,7 @@
+ void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    const_cast<GSCpuBackend *>(this)->FlushDeferredUnlocked();
+     if (!m_vram || m_vramSize == 0u)
+     {
+         out.clear();
+@@ -950,25 +1040,25 @@
+     switch (state.prim.type)
+     {
+     case GS_PRIM_SPRITE:
+-        if (parallel())
+-            DrawPrimitiveParallel(batch);
+-        else
+-            DrawSprite(batch);
+-        break;
+     case GS_PRIM_TRIANGLE:
+     case GS_PRIM_TRISTRIP:
+     case GS_PRIM_TRIFAN:
+         if (parallel())
+-            DrawPrimitiveParallel(batch);
++        {
++            FlushDeferredUnlocked();
++            DrawPrimitiveParallel(&batch, 1u);
++        }
+         else
+-            DrawTriangle(batch);
++            DeferPrimitive(batch);
+         break;
+     case GS_PRIM_LINE:
+     case GS_PRIM_LINESTRIP:
++        FlushDeferredUnlocked();
+         DrawLine(batch);
+         break;
+     case GS_PRIM_POINT:
+     {
++        FlushDeferredUnlocked();
+         const GSVertex &v = batch.vertices[0];
+         const auto &ctx = state.context;
+         int px = static_cast<int>(v.x) - (ctx.xyoffset.ofx >> 4);
+@@ -1606,6 +1696,7 @@
+ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    FlushDeferredUnlocked();
+     m_transfer = command;
+     m_transferState.x = command.trxpos.dsax;
+     m_transferState.y = command.trxpos.dsay;
+@@ -1623,6 +1714,7 @@
+ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    FlushDeferredUnlocked();
+     if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
+         return;
+     if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
+@@ -1852,6 +1944,7 @@
+ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    FlushDeferredUnlocked();
+     if (!m_vram || context.frame.fbw == 0u)
+         return false;
+ 
+diff --git a/ps2xRuntime/include/runtime/gs/gs_frontend.h b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+--- a/ps2xRuntime/include/runtime/gs/gs_frontend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+@@ -103,6 +103,9 @@
+     ~GS() = default;
+ 
+     void init(uint8_t *vram, uint32_t vramSize, struct GSRegisters *privRegs = nullptr);
++    // When true, GIF packets may return with small primitives still queued in the raster backend; only callers
++    // that read VRAM exclusively through GS/backend methods (which flush first) may enable it.
++    void setDeferredRaster(bool enabled) { m_deferredRaster = enabled; }
+     void reset();
+     void setRasterBackend(std::unique_ptr<GSRasterBackend> backend);
+ 
+@@ -178,6 +181,7 @@
+     GSContext &activeContext();
+ 
+     uint8_t *m_localMemoryStorage = nullptr;
++    bool m_deferredRaster = false;
+     uint32_t m_localMemorySize = 0u;
+     struct GSRegisters *m_privRegs = nullptr;
+     mutable std::recursive_mutex m_stateMutex;
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -643,6 +643,16 @@
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (!data || sizeBytes < 16 || !m_backend)
+         return;
++    // The backend may queue small primitives; unless deferral is enabled, VRAM is complete when the packet returns.
++    struct FlushOnExit
++    {
++        GSRasterBackend *backend;
++        ~FlushOnExit()
++        {
++            if (backend)
++                backend->Flush();
++        }
++    } flushOnExit{m_deferredRaster ? nullptr : m_backend.get()};
+ 
+     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
+         return;
+@@ -1063,6 +1073,8 @@
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     writeRegisterUnlocked(regAddr, value);
++    if (m_backend && !m_deferredRaster)
++        m_backend->Flush();
+ }
+ 
+ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -679,6 +679,7 @@
+     }
+ 
+     m_gs->init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
++    m_gs->setDeferredRaster(true); // the runtime reads GS VRAM only through GS methods
+     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
+                                     { m_gs->processGIFPacket(data, size); });
+     m_memory.setGifArbiter(&m_gifArbiter);

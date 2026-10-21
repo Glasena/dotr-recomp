@@ -129,6 +129,13 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
 - vblank/s (swap/s) before -> after: movie 22 -> 52-60 (intro reaches the title in ~2 min instead of ~8.5),
   title 54 (27) -> 60 (30), menu 19 (9.5) -> 47 (23.5), map 2.9 (1.45) -> 7 (3.5).
 - Map is still VU1-interpreter bound (~75% of the game thread): needs a VU1 recompiler or async VU1 (#13 open).
+- Patch 0015 (2026-10-21, #13): map 8.5 -> ~11 VBlanks/s (`PS2X_EXIT_AT=2300`, frames 1900-2300), frame dumps
+  byte-identical. VU1: float fast path for FMAC flags, decoded pair by reference, hazard scan skipped when all
+  registers are ready, memcpy XGKICK, no 64 KiB zeroing per kick. GS: small prims queued and drawn in one band-
+  parallel pass (flushed by any other backend call or a VRAM read/write overlap); `GS::setDeferredRaster(true)`
+  keeps the queue across GIF packets in the runtime only. Now ~65% of the game thread is the VU1 pipeline model
+  itself (commit/ready-cycle bookkeeping); the next real step is a VU1 recompiler or async VU1.
+- Unit tests after 0015: 444/445; the one failure (sceGsSyncVCallback async stack pool) is unrelated.
   Exception-based EE thread switches cost ~14% in movies (#16). One upstream GS unit test fails before and after (#17).
 
 ## Automated test mode (2026-10-21, #18) — agents MUST use this, never manual screenshots
