@@ -136,6 +136,12 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   keeps the queue across GIF packets in the runtime only. Now ~65% of the game thread is the VU1 pipeline model
   itself (commit/ready-cycle bookkeeping); the next real step is a VU1 recompiler or async VU1.
 - Unit tests after 0015: 444/445; the one failure (sceGsSyncVCallback async stack pool) is unrelated.
+- Patch 0016 (2026-10-21, #23): VU1 block executor. Per start PC a straight-line block (ends after a branch/E-bit
+  delay slot) gets static issue offsets once; it runs when no earlier result stalls it (liveIn check), with results
+  written immediately (no VF/VI/ACC/store queues, no hazard scan), PATH1 caught up lazily before stores/XGKICK/exit.
+  Flags/Q/P keep their pipelines. Anything else (XGKICK while PATH1 busy, budget end) falls back to the interpreter.
+  Caches survive re-uploads of identical microcode (memcmp). Map ~10.7 -> ~13.4 VBlanks/s, dumps byte-identical,
+  tests 444/445. `PS2X_VU_NO_BLOCKS=1` forces the interpreter for A/B. Next VU1 cost: FMAC flags (~15%), exec decode.
   Exception-based EE thread switches cost ~14% in movies (#16). One upstream GS unit test fails before and after (#17).
 
 ## Automated test mode (2026-10-21, #18) — agents MUST use this, never manual screenshots
