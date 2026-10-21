@@ -40,6 +40,7 @@ workspace/
     tools/        iso9660.py (extracts files from the ISO root, stdlib only)
                   find_functions.py (builds config/funcmap.csv from the ELF)
                   sync_runner.sh (copies generated code into the PS2Recomp runner)
+                  test_run.sh (headless scripted run with PNG frame dumps)
 ```
 
 ## Building

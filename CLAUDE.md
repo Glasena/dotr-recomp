@@ -110,7 +110,7 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   runner gets an RPATH to it. The `build-runtime` cache now has FFmpeg ON.
 - OPMV_US.PSS plays with real frames; Start (Enter key, via xdotool keydown/keyup) skips it to the title, then
   Enter → menu → Cross (`X`) on New Game works. The stream is 114.6 s (pack SCR).
-- Screenshots: `xdotool search --name PS2-Recomp` + `import -window $W`.
+- Screenshots: use `tools/test_run.sh` (below), not xdotool/import.
 
 ## Performance (2026-10-21, #13, #15)
 - Profiling: no perf installed, but `apt-get download linux-tools-5.15.0-117` + `dpkg-deb -x` gives a working
@@ -128,6 +128,18 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   title 54 (27) -> 60 (30), menu 19 (9.5) -> 47 (23.5), map 2.9 (1.45) -> 7 (3.5).
 - Map is still VU1-interpreter bound (~75% of the game thread): needs a VU1 recompiler or async VU1 (#13 open).
   Exception-based EE thread switches cost ~14% in movies (#16). One upstream GS unit test fails before and after (#17).
+
+## Automated test mode (2026-10-21, #18) — agents MUST use this, never manual screenshots
+- `tools/test_run.sh`: hidden window, no audio, uncapped VBlanks, scripted pad, PNG dumps, exit. Default script:
+  `start@1000` skips the movie, title at 1200, `start@1400` → menu (1500), `cross@1500` New Game → "NOW LOADING"
+  (1700), exit 1750. ~23 s wall clock; two runs gave bit-identical dumps. Dumps: `../dotr/test/frame_<N>.png`,
+  log: `../dotr/test_run.log` (only `[test]` lines are echoed). Look at dumps with the Read tool (`montage` to tile).
+- Env (patch 0011, all off by default): `PS2X_HEADLESS=1`, `PS2X_UNCAPPED=1` (EE deadlines ignore wall clock),
+  `PS2X_INPUT_SCRIPT=button@vblank,...` (held 10 VBlanks; up/down/left/right/start/select/cross/circle/square/
+  triangle/l1/r1/l2/r2/l3/r3), `PS2X_DUMP_FRAMES=n,...`, `PS2X_DUMP_DIR`, `PS2X_EXIT_AT=n`. The script honours
+  overrides, e.g. `PS2X_INPUT_SCRIPT=... PS2X_DUMP_FRAMES=... PS2X_EXIT_AT=... tools/test_run.sh`.
+- Uncapped only helps where the host is faster than the PS2 (boot ~105 VBlank/s); movie/title/menu are CPU-bound
+  near 50–60/s and the map ~7/s, so keep scripts short past New Game.
 
 ## Backlog
 GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in the commit message.
