@@ -82,7 +82,13 @@ On Ubuntu the runtime (`ps2xRuntime`) needs `libxinerama-dev` and `libasound2-de
 - **Takedown.** If you are a rights holder and believe something here infringes your rights, please open an issue
   and it will be reviewed and removed promptly if appropriate.
 
-## License
+## Credits and license
 
-The original code in this repository is licensed under [GPL-3.0](https://www.gnu.org/licenses/gpl-3.0.html), like
-PS2Recomp. This license covers only this project's own code, not the game.
+- [**PS2Recomp**](https://github.com/ran-j/PS2Recomp) by ran-j and contributors — recompiler and runtime (GPL-3.0).
+- [**Tobiichi-Port**](https://github.com/YYOzcan/Tobiichi-Port) (God of War PS2 recomp) — `tools/find_functions.py`
+  is adapted from its function finder, and its docs guided the approach (GPL-3.0).
+- *Yu-Gi-Oh! The Duelists of the Roses* © Konami. This project is not affiliated with or endorsed by Konami.
+  No game content is distributed.
+
+The original code in this repository is released under the **GPL-3.0** license, consistent with PS2Recomp.
+See [`LICENSE`](LICENSE). This license covers only this project's own code, not the game.
