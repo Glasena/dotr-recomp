@@ -1,0 +1,14 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c7c7af5..8faf3a0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -77,6 +77,9 @@ if(PS2X_IS_ARM_TARGET)
+             add_compile_options(-march=armv8-a+fp+simd)
+         endif()
+     endif()
++elseif(NOT MSVC)
++    # The runtime uses SSE4.1 intrinsics (blendv, extract_epi64, mullo_epi32); GCC/Clang need them enabled.
++    add_compile_options(-msse4.1)
+ endif()
+ 
+ if(PS2X_BUILD_RECOMP)

@@ -39,6 +39,7 @@ workspace/
     src/          game-specific overrides
     tools/        iso9660.py (extracts files from the ISO root, stdlib only)
                   find_functions.py (builds config/funcmap.csv from the ELF)
+                  sync_runner.sh (copies generated code into the PS2Recomp runner)
 ```
 
 ## Building
@@ -60,9 +61,16 @@ python3 -I tools/find_functions.py ../dotr/SLUS_205.15 config/funcmap.csv [../do
 
 # 4. generate the C++ (run from this folder: toml paths are relative to it)
 ../PS2Recomp/out/build-tools/ps2xRecomp/ps2_recomp config/dotr.toml
+
+# 5. copy the generated code into the runtime and build it (FFmpeg off: only needed for MPEG movies)
+tools/sync_runner.sh
+cmake -S ../PS2Recomp -B ../PS2Recomp/out/build-runtime -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF \
+  -DPS2X_ENABLE_FFMPEG=OFF -DPS2X_ENABLE_DEBUG_UI=OFF
+cmake --build ../PS2Recomp/out/build-runtime --target ps2EntryRunner
 ```
 
-On Ubuntu the runtime (`ps2xRuntime`) needs `libxinerama-dev` and `libasound2-dev`.
+On Ubuntu the runtime needs `sudo apt install libxinerama-dev libasound2-dev`.
 
 ## Legal
 

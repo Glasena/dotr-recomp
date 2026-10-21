@@ -183,6 +183,7 @@ stubs = [
   "sceCdSync@0x001914F8",
   "sceCdSyncS@0x00191598",
   "sceCdInit@0x00191778",
+  "sceCdChangeThreadPriority@0x00191A58", # missed by ps2_analyzer; identified by structure (binds SID 0x8000059A)
   "sceCdMmode@0x00191C50",
   "sceCdRead@0x00191D18",
   "sceCdGetError@0x00191EF8",
