@@ -1,5 +1,5 @@
 # Minimal ISO 9660 reader: list root dir, extract named files.
-# usage: iso9660.py <iso> [outdir name...]
+# usage: iso9660.py <iso> [outdir name... | outdir --all]
 import os
 import struct
 import sys
@@ -26,6 +26,23 @@ def records(f, lba, size):
         i += n
 
 
+def extract_tree(f, entries, out):
+    os.makedirs(out, exist_ok=True)
+    for name, ext, sz, d in entries:
+        path = os.path.join(out, name)
+        if d:
+            extract_tree(f, list(records(f, ext, sz)), path)
+            continue
+        f.seek(ext * S)
+        with open(path, 'wb') as o:
+            left = sz
+            while left:
+                chunk = f.read(min(left, 1 << 24))
+                o.write(chunk)
+                left -= len(chunk)
+        print('extracted', path, sz)
+
+
 def main():
     iso = sys.argv[1]
     with open(iso, 'rb') as f:
@@ -41,6 +58,9 @@ def main():
                 print(f"{'D' if d else ' '} {sz:>12} {name}")
             return
         out, wanted = sys.argv[2], set(sys.argv[3:])
+        if wanted == {'--all'}:
+            extract_tree(f, entries, out)
+            return
         for name, ext, sz, d in entries:
             if name in wanted and not d:
                 f.seek(ext * S)

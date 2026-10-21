@@ -42,7 +42,12 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   `../PS2Recomp` and `../dotr/output`.
 - First boot: window/audio up, guest sets `gp=0x317ef0`, SIF init, then hung in `sub_00191A58` retrying
   `sceSifBindRpc(0x8000059A)` (libcdvd, between sceCdInit and sceCdMmode). Stubbed as
-  `sceCdChangeThreadPriority@0x00191A58` (identified by structure, not verified). Next boot not tested yet.
+  `sceCdDiskReady@0x00191A58`: boot code at 0x200058 loops until it returns 2 (SCECdComplete). A first guess
+  (sceCdChangeThreadPriority, returns 1) made it spin there instead.
+- Then it looped forever loading `cdrom0:\IOP\SDRDRV.IRX` (no HLE provider). `cdrom0:` maps to the ELF's folder, so
+  the whole disc is now extracted into `../dotr/` (`tools/iso9660.py ISO ../dotr --all`: IOP/, DATA/, SOUND/,
+  MOVIE/). With the real IRX, all 7 modules load in the IOP emulator (SDR driver 4.0.1 prints), EE sends DMA to GIF
+  and writes GS registers, then the tick log shows `pc=0x0 ra=0x0` forever (issue #6). Nothing drawn yet.
 - The runtime's HLE IOP only serves libsd, mcserv and dbcman RPC IDs; libcdvd works through EE-side stubs, so any
   CD function the analyzer missed hangs like this one.
 
@@ -59,7 +64,7 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
   find_functions.py, regenerate, full rebuild.
 
 ## Next steps
-1. Boot again with the CD stub and fix the next hang (open an issue per new blocker).
+1. Issue #6: `pc=0x0` after IOP modules load and first DMA/GS writes. Open an issue per new blocker.
 2. Possible patch 0003: compile `register_functions.cpp` at -O0 outside the unity build (it only runs at startup).
 3. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).
 4. Open issues #2–#5.
