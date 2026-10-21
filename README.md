@@ -1,45 +1,48 @@
 # dotr-recomp — Yu-Gi-Oh! The Duelists of the Roses (PS2)
 
-Recompilação estática de **Yu-Gi-Oh! The Duelists of the Roses** (PS2, NTSC-U `SLUS-20515`) para PC/Linux com o
-[PS2Recomp](https://github.com/ran-j/PS2Recomp). Estado: **explorando**, ainda não roda.
+Static recompilation of **Yu-Gi-Oh! The Duelists of the Roses** (PS2, NTSC-U `SLUS-20515`) for PC/Linux using
+[PS2Recomp](https://github.com/ran-j/PS2Recomp). Status: **exploring**, does not run yet.
 
-Este repositório **não contém** arquivos do jogo (ISO, ELF, IRX, dados) nem código C++ gerado a partir deles.
-Você precisa da **sua própria cópia** do jogo.
+This repository does **not** contain any game files (ISO, ELF, IRX, data) or C++ generated from them.
+You need **your own copy** of the game.
 
 ## Layout
 
 ```text
 workspace/
-  PS2Recomp/      clone de https://github.com/ran-j/PS2Recomp + patches/ aplicados
-  dotr/           SLUS_205.15 e SYSTEM.CNF extraídos do seu disco (fora do git)
-  dotr-recomp/    este repositório
-    patches/      correções no PS2Recomp, aplicadas em ordem
-    config/       dotr.toml (config do recompilador)
-    src/          overrides do jogo
-    tools/        iso9660.py (extrai arquivos da raiz do ISO, só stdlib)
-    docs/         notas
+  PS2Recomp/      clone of https://github.com/ran-j/PS2Recomp + patches/ applied
+  dotr/           SLUS_205.15 and SYSTEM.CNF extracted from your disc (outside git)
+  dotr-recomp/    this repository
+    patches/      fixes to PS2Recomp, applied in order
+    config/       dotr.toml (recompiler config), funcmap.csv (function map)
+    src/          game-specific overrides
+    tools/        iso9660.py (extracts files from the ISO root, stdlib only)
+                  find_functions.py (builds config/funcmap.csv from the ELF)
 ```
 
-## Passos
+## Steps
 
 ```bash
-# 1. extrair o ELF do seu ISO
+# 1. extract the ELF from your ISO
 mkdir -p ../dotr
-python3 tools/iso9660.py "/caminho/do/seu.iso" ../dotr SYSTEM.CNF SLUS_205.15
+python3 tools/iso9660.py "/path/to/your.iso" ../dotr SYSTEM.CNF SLUS_205.15
 
-# 2. PS2Recomp com os patches
+# 2. PS2Recomp with the patches
 git clone https://github.com/ran-j/PS2Recomp.git ../PS2Recomp
 git -C ../PS2Recomp apply "$PWD"/patches/*.patch
 cmake -S ../PS2Recomp -B ../PS2Recomp/out/build-tools -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DPS2X_BUILD_RUNTIME=OFF -DPS2X_BUILD_STUDIO=OFF -DPS2X_BUILD_TEST=OFF
 cmake --build ../PS2Recomp/out/build-tools
 
-# 3. gerar o C++ (rodar a partir desta pasta: os caminhos do toml são relativos a ela)
+# 3. (optional) regenerate the function map; the third argument seeds it with starts from a previous output
+python3 -I tools/find_functions.py ../dotr/SLUS_205.15 config/funcmap.csv [../dotr/output]
+
+# 4. generate the C++ (run from this folder: toml paths are relative to it)
 ../PS2Recomp/out/build-tools/ps2xRecomp/ps2_recomp config/dotr.toml
 ```
 
-O runtime (`ps2xRuntime`) no Ubuntu precisa de `libxinerama-dev` e `libasound2-dev`.
+On Ubuntu the runtime (`ps2xRuntime`) needs `libxinerama-dev` and `libasound2-dev`.
 
-## Licença
+## License
 
-GPL-3.0, como o PS2Recomp. Yu-Gi-Oh! é marca da Konami; projeto sem fins comerciais e sem afiliação.
+GPL-3.0, like PS2Recomp. Yu-Gi-Oh! is a trademark of Konami; non-commercial project, not affiliated.

@@ -6,7 +6,7 @@
 input = "../dotr/SLUS_205.15"
 
 # Path to Ghidra exported function map (optional CSV)
-ghidra_output = ""
+ghidra_output = "config/funcmap.csv"
 
 # Path to output directory
 output = "../dotr/output/"

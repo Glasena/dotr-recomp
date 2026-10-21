@@ -1,4 +1,4 @@
-# Arquivos do jogo e tudo que deriva deles — nunca versionar
+# Game files and everything derived from them — never commit
 *.iso
 *.zip
 *.elf
