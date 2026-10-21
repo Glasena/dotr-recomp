@@ -1,0 +1,83 @@
+Runtime hook for code outside the generated function table (overlay modules sharing one load address):
+g_ps2OverlayFunctionResolver, consulted by hasFunction()/lookupFunction() on a table miss. Runner sources
+named ov_*.cpp are kept out of unity batches and the PCH and built at -O1 -g0.
+
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,5 +1,6 @@
+ #include "runtime/ps2_test_mode.h"
+ #include "ps2_runtime.h"
++#include "ps2_overlay_resolver.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+@@ -1117,10 +1118,17 @@
+     return replaceFunction(address, func);
+ }
+ 
++PS2OverlayFunctionResolver g_ps2OverlayFunctionResolver = nullptr;
++
+ bool PS2Runtime::hasFunction(uint32_t address) const
+ {
+     uint32_t slot = 0u;
+-    return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
++    if (generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr)
++    {
++        return true;
++    }
++    return g_ps2OverlayFunctionResolver &&
++           g_ps2OverlayFunctionResolver(const_cast<PS2Memory &>(m_memory).getRDRAM(), address) != nullptr;
+ }
+ 
+ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
+@@ -1154,6 +1162,14 @@
+         {
+             return fn;
+         }
++    }
++
++    if (g_ps2OverlayFunctionResolver)
++    {
++        if (RecompiledFunction fn = g_ps2OverlayFunctionResolver(m_memory.getRDRAM(), address))
++        {
++            return fn;
++        }
+     }
+ 
+     std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -479,6 +479,20 @@
+     )
+ endif()
+ 
++# Overlay modules (runner/ov_*.cpp, one translation unit per module, recompiled separately because they share a
++# load address): many and large, rarely changed, cold compared with the main code. Keep them out of the unity
++# batches and build them at -O1 without debug info to bound build time. No PCH either: it holds the main
++# ps2_recompiled_functions.h, so regenerating the main code would rebuild every overlay.
++set(PS2X_RUNNER_OVERLAY_FILES ${RUNNER_SRC_FILES})
++list(FILTER PS2X_RUNNER_OVERLAY_FILES INCLUDE REGEX "/src/runner/ov_[^/]*\\.cpp$")
++if(PS2X_RUNNER_OVERLAY_FILES)
++    set_source_files_properties(${PS2X_RUNNER_OVERLAY_FILES} PROPERTIES
++        SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
++    if(NOT MSVC)
++        set_source_files_properties(${PS2X_RUNNER_OVERLAY_FILES} PROPERTIES COMPILE_OPTIONS "-O1;-g0")
++    endif()
++endif()
++
+ if(PS2X_ENABLE_RUNNER_PCH)
+     set(PS2X_RUNNER_PCH_HEADERS
+         "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime_macros.h"
+--- /dev/null
++++ b/ps2xRuntime/include/ps2_overlay_resolver.h
+@@ -0,0 +1,10 @@
++#pragma once
++
++#include "ps2_runtime.h"
++
++// Optional hook for guest code that is not in the generated function table, e.g. overlay modules loaded at run time
++// at an address shared by several modules. Game code sets it (from a static initializer) to a function that returns
++// the recompiled function for `address` given the current guest RAM, or nullptr. Consulted by hasFunction() and
++// lookupFunction() only when the generated table has no entry.
++using PS2OverlayFunctionResolver = PS2Runtime::RecompiledFunction (*)(const uint8_t *rdram, uint32_t address);
++extern PS2OverlayFunctionResolver g_ps2OverlayFunctionResolver;

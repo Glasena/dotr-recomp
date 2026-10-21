@@ -36,9 +36,10 @@ workspace/
   dotr-recomp/    this repository
     patches/      fixes to PS2Recomp, applied in order
     config/       dotr.toml (recompiler config), funcmap.csv (function map)
-    src/          game-specific overrides
+    src/          game-specific code (dotr_overlays.cpp: picks the recompiled overlay module at 0x1E00000)
     tools/        iso9660.py (extracts files from the ISO root, stdlib only)
                   find_functions.py (builds config/funcmap.csv from the ELF)
+                  overlays.py (recompiles the overlay modules in DATA/*MODULE.MRG one by one)
                   sync_runner.sh (copies generated code into the PS2Recomp runner)
                   test_run.sh (headless scripted run with PNG frame dumps)
 ```
@@ -57,11 +58,16 @@ cmake -S ../PS2Recomp -B ../PS2Recomp/out/build-tools -G Ninja -DCMAKE_BUILD_TYP
   -DPS2X_BUILD_RUNTIME=OFF -DPS2X_BUILD_STUDIO=OFF -DPS2X_BUILD_TEST=OFF
 cmake --build ../PS2Recomp/out/build-tools
 
-# 3. (optional) regenerate the function map; the third argument seeds it with starts from a previous output
-python3 -I tools/find_functions.py ../dotr/SLUS_205.15 config/funcmap.csv [../dotr/output]
+# 3. (optional) regenerate the function map; the third argument seeds it with starts from a previous output, the
+#    fourth (extracted disc) adds main functions that only overlay modules call
+python3 -I tools/find_functions.py ../dotr/SLUS_205.15 config/funcmap.csv [../dotr/output [../dotr]]
 
 # 4. generate the C++ (run from this folder: toml paths are relative to it)
 ../PS2Recomp/out/build-tools/ps2xRecomp/ps2_recomp config/dotr.toml
+
+# 4b. recompile the overlay modules (762 modules, ~20 s; writes ../dotr/overlays/cpp/ov_*.cpp)
+python3 -I tools/iso9660.py "/path/to/your.iso" ../dotr --all   # the whole disc, DATA/*.MRG included
+python3 -I tools/overlays.py ../dotr ../dotr/overlays ../PS2Recomp/out/build-tools/ps2xRecomp/ps2_recomp
 
 # 5. (optional, for the intro/story movies) build a minimal FFmpeg into ../deps/ffmpeg; no root needed
 mkdir -p ../deps/src && curl -L https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz | tar xJ -C ../deps/src

@@ -18,8 +18,8 @@ Everything in the repo (code, comments, docs, commit messages) is written in Eng
 - Code ends at 0x286968. After it: VU microcode (0x286980…), data, and libkernel's 0x8007xxxx kernel patch blobs
   at 0x28C258 (string "PsIIlibkernel 2430"); not EE game code.
 - No symbols (`.symtab` empty although `file` says "not stripped").
-- 834 extra LOAD segments, all at 0x01E00000, filesz 0, memsz 0x100–0x7000, unnamed sections.
-  **Nature not verified**: may be code overlays loaded from disc, VU microcode or a linker artifact.
+- 833 extra LOAD segments at 0x01E00000, filesz 0, memsz 0x100–0x7000: linker descriptors of the overlay modules
+  (segment i = module id i+1, memsz = its image size; 762 of the 833 ids ship on disc). See "Overlay modules" (#2).
 - IOP: PADMAN, MCMAN/MCSERV, LIBSD, SDRDRV, SIO2MAN, KCEJEAST (Konami module), IOPRP.IMG.
 - `ps2_analyzer` (fallback without Ghidra): 263 lib functions to stub, 293 with no runtime handler, 6 jump tables.
 
@@ -147,11 +147,30 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   words*2 cycles, so the BGM "played" at bus speed and the EE transfer queue overflowed.
 - Patch 0012: with ADMAS set for the core, the DMA completes after bytes*192 IOP cycles (48 kHz 16-bit stereo).
   Now the title BGM queue stays at 0-1, the New Game BGM change clears bit 0x2000 at VBlank ~1675.
-- Next blocker (#19): at VBlank ~1870 the main thread calls overlay code at 0x1E00080 (`c400.bin` from
-  DATA/CMODULE.MRG, "MWo3" modules loaded at 0x1E00000; also BMODULE/MMODULE.MRG) and hangs there; screen black.
+- Next blocker (#19, fixed below): at VBlank ~1870 the main thread called overlay code at 0x1E00080.
 - KCEJEAST.IRX keeps its `.symtab` and `.mdebug`: `readelf -s` names every libspu2/driver function.
 - Debug trick: sample guest PCs from `ps2x::test::onVBlank` via `runtime.eeScheduler().thread(id)->activeContext()`
   (`currentContext()` is null there).
+
+## Overlay modules (2026-10-21, #19, #2)
+- DATA/CMODULE.MRG (78), BMODULE.MRG (683), MMODULE.MRG (1): "MWo3" modules, header = magic, id, load 0x1E00000,
+  ?, ?, ?, end, end (+0x18/+0x1C), name at +0x20, code from +0x80. `sub_001F4900` copies a 0x8000 slot to 0x1E00000
+  and calls `ENTRY_TABLES[mrg][N]` (0x2B9190/0x2BA140/0x2BAEA0, via 0x292FF0) for module `<c|b|m>N.bin`.
+  ~12 MB of code in total (B modules are per-card battle code), 6x the main ELF.
+- `tools/overlays.py` builds a tiny ELF per module (entry-table entry added as a start), runs `ps2_recomp`
+  (single-file, `output_worker_threads = 1`: the parallel single-file writer drops entries, #20) and wraps the output in
+  `namespace ov_<name>` with a sorted entry table → `../dotr/overlays/cpp/ov_<name>.cpp` (762 files, 555 MB, ~20 s).
+  `src/dotr_overlays.cpp` resolves 0x1E00000-0x1E08000 by the id at 0x1E00004 (after checking "MWo3").
+- Patch 0013: `g_ps2OverlayFunctionResolver` hook in `hasFunction`/`lookupFunction` (table miss only); runner
+  `ov_*.cpp` are built outside unity batches and PCH at -O1 -g0. Full overlay build ~35 min; they only rebuild
+  when runtime headers change.
+- 169 main functions are only called from overlays: `find_functions.py ... ../dotr/output ../dotr` now adds
+  boundary-checked overlay J/JAL targets (3005 → 3173 functions).
+- Now: New Game plays the story intro (text + portraits, 3D Stonehenge), Simon McMooran's dialogue and the NAME
+  ENTRY screen (Start finishes the name), then "Play a Practice Duel" (Start) loads the tutorial duel: board, LP,
+hand, Dark Magician summon with its 3D model (VBlank ~10500). Not tested further. All of this runs at ~4-7 VBlank/s (#13), so a run to VBlank 8000 takes
+  ~15 min, to the duel ~25 min. Script used: `start@1000,start@1400,cross@1500`, cross every 60 from 2200 to 5600,
+  `start@5750`, cross every 60 to 9100, `start@9300`, cross every 80.
 
 ## Backlog
 GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in the commit message.
@@ -166,8 +185,8 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
   find_functions.py, regenerate, full rebuild.
 
 ## Next steps
-1. #19 (overlay modules at 0x1E00000), #10 (box glyphs), #13 (VU1 still the 3D ceiling), #14 (display env), #16,
+1. #10 (box glyphs), #13 (VU1 still the 3D ceiling), #14 (display env), #16,
    #17. Open an issue per new blocker.
 2. Possible patch: compile `register_functions.cpp` at -O0 outside the unity build (it only runs at startup).
 3. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).
-4. Open issues #2–#5.
+4. Open issues #3–#5.
