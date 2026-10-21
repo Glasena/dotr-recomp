@@ -89,6 +89,21 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
 - Debug trick that found it: temporary `fprintf` in a runner copy of a generated function
   (`ps2xRuntime/src/runner/sub_*.cpp`, ~1 min rebuild; `tools/sync_runner.sh` restores it).
 
+## New Game and the IOP sound driver (2026-10-21, #10, #9)
+- Root cause of #10: `IopMemory::allocate` bumped a cursor and never reused freed blocks. On the post-movie sound
+  reset KCEJEAST.IRX frees and re-allocates its 0xC1800 stream buffer; that allocation returned 0, so the EE streamed
+  BGM and the `system0.grp` bank to IOP 0x0-0xA6320, overwriting the IOP modules. The KCEJEAST RPC server (0x4A08C)
+  then hit a Reserved Instruction, every reply became an echo of the request, and New Game waited forever for the BGM
+  change (status bit 0x2000 at EE 0x400000) behind a full black fade.
+- Patch 0009: first-fit IOP heap (+ real `maxFreeMemory`, unit test in `iop_import_tests`) and IOP
+  `RegisterVblankHandler` delivery (KCEJEAST drives its bank upload from a vblank handler). Also fixes #9.
+- Now: title shows PRESS START BUTTON, BGM streams/fades, New Game loads the map and `BGM/0024.pcm`, but the map stays
+  behind the fade: the BGM transfer queue overflows because SPU2 streaming isn't paced (#12). 3D runs ~1.3 fps (#13);
+  black/green frames come from the HLE swap's display env (#14).
+- Note: SPU2 STATX bit 0x80 must stay set after a DMA start (KCEJEAST's IRQ 0x28 handler polls for it set).
+- Debug tricks used: temporary hooks in `PS2Runtime::dispatchGuestBranch` (first-call log, call histogram, guest-pc
+  sampling profiler, RAM dumps, word watch) and VRAM dumps decoded with the runtime's `ps2_gs_psmt*.h` swizzle headers.
+
 ## Backlog
 GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in the commit message.
 
@@ -102,7 +117,7 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
   find_functions.py, regenerate, full rebuild.
 
 ## Next steps
-1. Issue #10 (New Game flow), #9 (IOP heap reuse). Open an issue per new blocker. Real movie playback
+1. #12 (SPU2 stream pacing for New Game), #13 (VU1/VIF speed), #14 (display env). Open an issue per new blocker. Real movie playback
    needs a Linux FFmpeg path in CMake (pkg-config) once FFmpeg dev packages can be installed.
 2. Possible patch: compile `register_functions.cpp` at -O0 outside the unity build (it only runs at startup).
 3. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).
