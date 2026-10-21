@@ -1,10 +1,31 @@
-# dotr-recomp — Yu-Gi-Oh! The Duelists of the Roses (PS2)
+<div align="center">
 
-Static recompilation of **Yu-Gi-Oh! The Duelists of the Roses** (PS2, NTSC-U `SLUS-20515`) for PC/Linux using
-[PS2Recomp](https://github.com/ran-j/PS2Recomp). Status: **exploring**, does not run yet.
+# dotr-recomp
 
-This repository does **not** contain any game files (ISO, ELF, IRX, data) or C++ generated from them.
-You need **your own copy** of the game.
+**Yu-Gi-Oh! The Duelists of the Roses — PS2 static recompilation for PC/Linux**
+
+![status](https://img.shields.io/badge/status-exploring-orange)
+![platform](https://img.shields.io/badge/platform-Linux-blue)
+![license](https://img.shields.io/badge/license-GPL--3.0-green)
+![assets](https://img.shields.io/badge/game%20assets-not%20included-red)
+
+</div>
+
+---
+
+> [!IMPORTANT]
+> This repository contains **no game code, no game data and no copyrighted assets**: no ISO, ELF, IRX, textures,
+> audio or C++ generated from them. It contains only original tooling, configuration and patches.
+> **To use it you must own a legitimate copy of the game and dump it yourself.** Nothing here helps obtain the game
+> by any other means, and requests for game files will be ignored.
+
+## About
+
+A static recompilation of **Yu-Gi-Oh! The Duelists of the Roses** (PS2, NTSC-U `SLUS-20515`) built on
+[PS2Recomp](https://github.com/ran-j/PS2Recomp). The MIPS R5900 code of *your* copy of the game is translated into
+C++ on *your* machine and linked against a runtime that emulates the PS2 hardware.
+
+**Status:** exploring. The recompiler produces code for all 3005 discovered functions; it does not run yet.
 
 ## Layout
 
@@ -20,10 +41,10 @@ workspace/
                   find_functions.py (builds config/funcmap.csv from the ELF)
 ```
 
-## Steps
+## Building
 
 ```bash
-# 1. extract the ELF from your ISO
+# 1. extract the ELF from your own disc image
 mkdir -p ../dotr
 python3 tools/iso9660.py "/path/to/your.iso" ../dotr SYSTEM.CNF SLUS_205.15
 
@@ -43,6 +64,25 @@ python3 -I tools/find_functions.py ../dotr/SLUS_205.15 config/funcmap.csv [../do
 
 On Ubuntu the runtime (`ps2xRuntime`) needs `libxinerama-dev` and `libasound2-dev`.
 
+## Legal
+
+- **No affiliation.** This is an unofficial, non-commercial fan project for preservation, interoperability and
+  research. It is not affiliated with, endorsed, sponsored or approved by Konami, Sony Interactive Entertainment or
+  any other rights holder.
+- **Trademarks.** Yu-Gi-Oh!, The Duelists of the Roses and Konami are trademarks of Konami Holdings Corporation
+  and/or Kazuki Takahashi / Studio Dice / Shueisha. PlayStation and PS2 are trademarks of Sony Interactive
+  Entertainment. They are used here only to identify the game this tooling is compatible with.
+- **No copyrighted material.** The repository ships no part of the game. Files in `config/` hold only addresses and
+  settings derived by analysis, needed for interoperability with a copy the user already owns. Generated code,
+  dumps and assets must never be committed or redistributed; `.gitignore` blocks them.
+- **Your responsibility.** You are responsible for complying with the laws of your country, including those on
+  copying and dumping software you own. Do not use this project to pirate the game.
+- **No warranty.** The software is provided "as is", without warranty of any kind, as stated in the GPL-3.0. The
+  authors are not liable for any damage or claim arising from its use.
+- **Takedown.** If you are a rights holder and believe something here infringes your rights, please open an issue
+  and it will be reviewed and removed promptly if appropriate.
+
 ## License
 
-GPL-3.0, like PS2Recomp. Yu-Gi-Oh! is a trademark of Konami; non-commercial project, not affiliated.
+The original code in this repository is licensed under [GPL-3.0](https://www.gnu.org/licenses/gpl-3.0.html), like
+PS2Recomp. This license covers only this project's own code, not the game.
