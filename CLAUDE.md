@@ -67,12 +67,27 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
 - Patch 0007: `RotateThreadReadyQueue` charges 4096 EE cycles. VBlank needs both host time and EE cycles; the
   movie's threads spin on yields, which cost host time but almost no cycles, so VBlank ran at ~0.5 Hz.
 - Now: intro skipped in a few s, then `system/system0.grp` + `BGM/0002.pcm` load and the title loop runs (attract
-  replays the intro after ~20 s; Enter = Start stops that), but the screen is black: per-frame VIF1 chain DMA
-  (DIRECT/PATH2) never reaches the GS (#8). Replaying the movie leaks IOP heap (#9).
-- Driving the window: `xdotool` (Enter = Start) and `import -window root -crop` work; `import -window <id>` and
-  `xwd` capture the GL window as black.
+  replays the intro after ~20 s; Enter = Start stops that), but the screen was black (#8, fixed below).
+  Replaying the movie fails an IOP heap allocation (#9).
+- Driving the window: `xdotool` (Enter = Start, X = Cross) and `import -window <id>` work (`xwd` gives black).
 - Patch 0005 (diagnostics): tick log lists every EE thread (status/wait/pc); a thread falling to pc=0 prints its last
   32 dispatches (`[ee:thread-pc0]`). Changing `ps2_runtime.h` rebuilds everything (~10 min).
+
+## Title screen and main menu (2026-10-21, #8)
+- Root cause of the black title: the analyzer stubs only some libvifpk helpers (`sceVif1PkAddGsAD`,
+  `sceVif1PkCloseGifTag`, GIF variants). Their HLE wrote the open DMA tag's QWC eagerly on every pointer move, and
+  the game's recompiled terminate (0x187608) then did the SDK `+=`, doubling QWC. The VIF1 chain walker went off
+  phase into GS data (a fake REF tag) and DIRECT data never matched the draws.
+- Then every pixel failed ZTST=GEQUAL: z buffer stayed at 0xFFFFFF because the HLE `sceGsSetDefClear` was a no-op
+  and `sceGsSwapDBuff` never sent the DBuff clear packet (and `sceGsSetDefDBuff` read ztest/zpsm/clear from the
+  stack instead of t0-t2).
+- Patch 0008: terminate adds QWC like the SDK (no eager count), real `sceGsSetDefClear`, `sceGsSetDefDBuff` args
+  + clear seeding, `sceGsSwapDBuff` applies the clear, `sceGsPutDrawEnv` sends the tagged packet (arg is the GIFtag,
+  not the env). Upstream test updated, not run (ps2xTest build needs elfio headers).
+- Now: title screen and main menu render and accept input. NEW GAME -> #10. `sceSifFreeIopHeap@0x001829B0` is now
+  a toml stub; #9 needs IOP RAM ownership tracking (see the issue comment).
+- Debug trick that found it: temporary `fprintf` in a runner copy of a generated function
+  (`ps2xRuntime/src/runner/sub_*.cpp`, ~1 min rebuild; `tools/sync_runner.sh` restores it).
 
 ## Backlog
 GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in the commit message.
@@ -87,7 +102,7 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
   find_functions.py, regenerate, full rebuild.
 
 ## Next steps
-1. Issue #8: black title screen (VIF1 DIRECT/PATH2). Then #9. Open an issue per new blocker. Real movie playback
+1. Issue #10 (New Game flow), #9 (IOP heap reuse). Open an issue per new blocker. Real movie playback
    needs a Linux FFmpeg path in CMake (pkg-config) once FFmpeg dev packages can be installed.
 2. Possible patch: compile `register_functions.cpp` at -O0 outside the unity build (it only runs at startup).
 3. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).
