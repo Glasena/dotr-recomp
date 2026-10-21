@@ -1,0 +1,15 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+index 5110ee2..330054d 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+@@ -124,6 +124,10 @@ namespace ps2_syscalls
+             EeScheduler &ee = scheduler(rdram, ctx, runtime);
+             const int result = ee.rotateReadyQueue(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
+             setReturnS32(ctx, result);
++            // A yield is cheap in guest cycles but expensive on the host; without a cost, threads that spin on
++            // RotateThreadReadyQueue starve the cycle-gated VBlank (~0.5 Hz in DotR's movie player).
++            // ponytail: flat cost, model real syscall/context-switch timing if a game becomes timing-sensitive.
++            ee.accountCycles(4096u);
+             ee.transferIfRequested(interruptSafe);
+         }
+ 

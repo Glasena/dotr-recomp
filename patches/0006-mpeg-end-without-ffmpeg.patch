@@ -1,0 +1,78 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index 44eaef4..3889893 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -1103,6 +1103,10 @@ namespace ps2_stubs
+                 playback.waitingForVideoSequenceHeader = true;
+                 playback.videoSequenceSyncBuffer.clear();
+                 playback.decoderFailed = false;
++#if !PS2X_HAS_FFMPEG
++                // No decoder: mark it failed (demux keeps feeding audio) so the movie ends early.
++                playback.decoderFailed = true;
++#endif
+                 return;
+             }
+ 
+@@ -2173,6 +2177,7 @@ namespace ps2_stubs
+         uint32_t traceIdx = 0u;
+         bool eofChanged = false;
+         bool backpressured = false;
++        bool decoderFailed = false;
+         {
+             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+@@ -2192,6 +2197,7 @@ namespace ps2_stubs
+                 recordCdStreamBytesDemuxedUnlocked(consumed, completedMpegIds, eofChanged);
+             }
+             decodedCount = playback.decodedFrames.size();
++            decoderFailed = playback.decoderFailed;
+             traceIdx = g_mpeg_stub_state.demuxRingTraceCount++;
+         }
+ 
+@@ -2209,7 +2215,7 @@ namespace ps2_stubs
+             return;
+         }
+         const bool currentStreamCompleted = std::find(completedMpegIds.begin(), completedMpegIds.end(), mpegAddr) != completedMpegIds.end();
+-        if (decodedCount != decodedBefore || eofChanged || currentStreamCompleted)
++        if (decodedCount != decodedBefore || eofChanged || currentStreamCompleted || decoderFailed)
+         {
+             runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_OK);
+         }
+@@ -2386,6 +2392,10 @@ namespace ps2_stubs
+                 width = playback.width;
+                 height = playback.height;
+                 frameCount = playback.picturesServed;
++#if !PS2X_HAS_FFMPEG
++                // No decoder: count blank pictures so players that prebuffer frames start and finish.
++                playback.picturesServed += 1u;
++#endif
+             }
+         }
+ 
+@@ -2459,8 +2469,9 @@ namespace ps2_stubs
+         // be observed while more PSS data is still buffered, and a decoder
+         // failure before producer EOF may still recover on a later sequence.
+         const bool producerEnded =
+-            g_mpeg_stub_state.currentCdStreamEofSeen &&
+-            playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration;
++            !PS2X_HAS_FFMPEG || // no decoder: don't wait for the rest of the stream
++            (g_mpeg_stub_state.currentCdStreamEofSeen &&
++             playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration);
+         const bool ended = producerEnded &&
+                            (playback.streamEnded || (playback.decoderFailed && playback.sawInput));
+         const uint64_t presentationEnd = playback.presentationEndTickQ32;
+@@ -2486,7 +2497,13 @@ namespace ps2_stubs
+             ++g_mpeg_stub_state.isEndTraceCount;
+         }
+ 
+-        setReturnS32(ctx, (ended && playback.decodedFrames.empty() && presentationComplete) ? 1 : 0);
++#if !PS2X_HAS_FFMPEG
++        // No decoder: end after a short run of blank pictures (~0.5 s at 60 Hz).
++        const bool enoughBlankPictures = playback.picturesServed >= 30u;
++#else
++        const bool enoughBlankPictures = true;
++#endif
++        setReturnS32(ctx, (ended && enoughBlankPictures && playback.decodedFrames.empty() && presentationComplete) ? 1 : 0);
+     }
+ 
+     void sceMpegIsRefBuffEmpty(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

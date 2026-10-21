@@ -56,8 +56,21 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   boot-mode pools to 0x80000-0xBFFFF and callback stacks to 0xC0000-0xFFFFF, and lets an explicit heap reach 32 MB.
 - Then SDFS (game file layer, 0x1FF480) waited forever: `sceCdCallback` was a no-op. Patch 0004 stores the callback
   (0x200170) and queues it after each `sceCdRead`.
-- Now: 98 `sceCdSearchFile` OK, SDFS loads, memory card probed, opening movie OPMV_US.PSS starts streaming, then
-  stalls because the runtime has no MPEG decoder without FFmpeg (issue #7).
+- 98 `sceCdSearchFile` OK, SDFS loads, memory card probed, opening movie OPMV_US.PSS starts streaming.
+
+## Movie skip and title loop (2026-10-20, #7)
+- No sudo here, so no system FFmpeg; movies are skipped instead. The analyzer had missed `sceMpegIsEnd@0x0018EE58`
+  and `sceMpegIsRefBuffEmpty@0x0018EE68` (now toml stubs; the recompiled IsEnd just read guest memory).
+- Patch 0006: without FFmpeg, the MPEG HLE marks the decoder failed (demux keeps running, so the audio-ready check
+  passes), serves 30 blank pictures (the player at 0x242600 only starts display once its 2-slot frame queue at
+  0x350600 is full) and then `sceMpegIsEnd` returns 1.
+- Patch 0007: `RotateThreadReadyQueue` charges 4096 EE cycles. VBlank needs both host time and EE cycles; the
+  movie's threads spin on yields, which cost host time but almost no cycles, so VBlank ran at ~0.5 Hz.
+- Now: intro skipped in a few s, then `system/system0.grp` + `BGM/0002.pcm` load and the title loop runs (attract
+  replays the intro after ~20 s; Enter = Start stops that), but the screen is black: per-frame VIF1 chain DMA
+  (DIRECT/PATH2) never reaches the GS (#8). Replaying the movie leaks IOP heap (#9).
+- Driving the window: `xdotool` (Enter = Start) and `import -window root -crop` work; `import -window <id>` and
+  `xwd` capture the GL window as black.
 - Patch 0005 (diagnostics): tick log lists every EE thread (status/wait/pc); a thread falling to pc=0 prints its last
   32 dispatches (`[ee:thread-pc0]`). Changing `ps2_runtime.h` rebuilds everything (~10 min).
 
@@ -74,8 +87,8 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
   find_functions.py, regenerate, full rebuild.
 
 ## Next steps
-1. Issue #7: opening movie stalls without FFmpeg (Linux FFmpeg path in CMake, or skip movies). Open an issue per new
-   blocker.
+1. Issue #8: black title screen (VIF1 DIRECT/PATH2). Then #9. Open an issue per new blocker. Real movie playback
+   needs a Linux FFmpeg path in CMake (pkg-config) once FFmpeg dev packages can be installed.
 2. Possible patch: compile `register_functions.cpp` at -O0 outside the unity build (it only runs at startup).
 3. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).
 4. Open issues #2–#5.
