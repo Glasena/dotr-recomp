@@ -76,14 +76,27 @@ mkdir -p ../deps/src && curl -L https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz | 
   --disable-avdevice --disable-avfilter --enable-decoder=mpeg1video,mpeg2video --enable-parser=mpegvideo \
   --enable-demuxer=mpegps,mpegvideo --enable-protocol=file && make -j"$(nproc)" install)
 
-# 6. copy the generated code into the runtime and build it
+# 6. (optional, recommended) ccache, a static binary in ../deps/bin; no root needed
+mkdir -p ../deps/bin && curl -L https://github.com/ccache/ccache/releases/download/v4.10.2/ccache-4.10.2-linux-x86_64.tar.xz \
+  | tar xJ -C ../deps/bin --strip-components=1 ccache-4.10.2-linux-x86_64/ccache
+../deps/bin/ccache -o max_size=20G -o sloppiness=pch_defines,time_macros,include_file_mtime,include_file_ctime
+
+# 7. copy the generated code into the runtime and build it (drop the two LAUNCHER lines without ccache)
 tools/sync_runner.sh
 cmake -S ../PS2Recomp -B ../PS2Recomp/out/build-runtime -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF \
   -DPS2X_ENABLE_DEBUG_UI=OFF -DPS2X_ENABLE_AGRESSIVE_LOGS=OFF -DPS2X_ENABLE_FFMPEG=ON \
-  -DCMAKE_PREFIX_PATH="$(realpath ../deps/ffmpeg)"
+  -DCMAKE_PREFIX_PATH="$(realpath ../deps/ffmpeg)" \
+  -DCMAKE_CXX_COMPILER_LAUNCHER="$(realpath ../deps/bin/ccache)" -DCMAKE_C_COMPILER_LAUNCHER="$(realpath ../deps/bin/ccache)"
 cmake --build ../PS2Recomp/out/build-runtime --target ps2EntryRunner
 ```
+
+Rebuild times (12 threads): cold full build ~39 min (968 steps, ~555 MB of generated C++); no change 0.03 s; a
+runtime `.cpp` edit ~12 s (mostly the link); a runtime subsystem header edit such as `ps2_vu1.h` ~30 s (was ~14 min:
+it rebuilt every unity batch). Patch 0014 makes generated code include only `ps2_runtime_core.h` (the guest call ABI),
+not the GS/VU/audio/pad/VFS headers. Editing `ps2_runtime_core.h`, `ps2_runtime_macros.h` or the generated headers
+still rebuilds everything. ccache turns rebuilds of unchanged sources (touched files, reverted edits, a wiped build
+folder) into cache hits.
 
 `PS2X_ENABLE_AGRESSIVE_LOGS` defaults to ON upstream: it makes every recompiled function write and flush a line to
 `ps2_log.txt` (gigabytes in minutes) and slows the whole game, so keep it OFF unless you need that trace. The runtime

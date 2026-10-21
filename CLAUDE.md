@@ -37,8 +37,10 @@ Pipeline (README "Building"): `ps2_recomp config/dotr.toml` → `tools/sync_runn
 `../PS2Recomp/out/build-runtime` (RelWithDebInfo, FFmpeg/debug UI off) → run
 `../PS2Recomp/out/build-runtime/ps2xRuntime/ps2EntryRunner "$PWD/../dotr/SLUS_205.15"`. Use `stdbuf -o0` when
 logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr/*.log`.
-- Build times: full ~20 min; stub/toml change ~10–15 min (the batch with the 4.9 MB `register_functions.cpp`
-  takes ~8 min alone); runtime `.cpp` change ~1 min. Never run two builds or two `ps2_recomp` at once: they share
+- Build times (issue #21, ccache + patch 0014): cold full ~39 min (968 steps); no change 0.03 s; runtime `.cpp`
+  ~12 s; runtime subsystem header (`ps2_vu1.h`, GS, audio, pad, VFS) ~30 s. Generated code includes only
+  `ps2_runtime_core.h`: keep new runtime internals out of it, `ps2_runtime_macros.h` and `ps2_syscalls.h`, or every
+  edit rebuilds everything again. ccache lives in `../deps/bin/ccache` (README step 6). Never run two builds or two `ps2_recomp` at once: they share
   `../PS2Recomp` and `../dotr/output`.
 - First boot: window/audio up, guest sets `gp=0x317ef0`, SIF init, then hung in `sub_00191A58` retrying
   `sceSifBindRpc(0x8000059A)` (libcdvd, between sceCdInit and sceCdMmode). Stubbed as
