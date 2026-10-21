@@ -1,0 +1,23 @@
+# Arquivos do jogo e tudo que deriva deles — nunca versionar
+*.iso
+*.zip
+*.elf
+SLUS_*
+*.IRX
+*.irx
+SYSTEM.CNF
+disc/
+game/
+output/
+generated/
+
+# Build
+build/
+out/
+
+# Editor / OS
+*.swp
+*~
+.DS_Store
+.vscode/
+.idea/
