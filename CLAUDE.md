@@ -50,6 +50,16 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   and writes GS registers, then the tick log shows `pc=0x0 ra=0x0` forever (issue #6). Nothing drawn yet.
 - The runtime's HLE IOP only serves libsd, mcserv and dbcman RPC IDs; libcdvd works through EE-side stubs, so any
   CD function the analyzer missed hangs like this one.
+- Issue #6 (`pc=0x0`) fixed: the main thread was Dormant. `SetupHeap(0x1FE0000, 0x20000)` (DotR's newlib heap; the
+  834 LOAD segments fill 0x1E00000-0x1FE0000) was clamped to the runtime limit 0x1F00000 → empty heap → every
+  malloc returned 0 → init `sub_001001D0` failed → main returned to ra=0. Patch 0003 moves the runtime's RPC/TLS/
+  boot-mode pools to 0x80000-0xBFFFF and callback stacks to 0xC0000-0xFFFFF, and lets an explicit heap reach 32 MB.
+- Then SDFS (game file layer, 0x1FF480) waited forever: `sceCdCallback` was a no-op. Patch 0004 stores the callback
+  (0x200170) and queues it after each `sceCdRead`.
+- Now: 98 `sceCdSearchFile` OK, SDFS loads, memory card probed, opening movie OPMV_US.PSS starts streaming, then
+  stalls because the runtime has no MPEG decoder without FFmpeg (issue #7).
+- Patch 0005 (diagnostics): tick log lists every EE thread (status/wait/pc); a thread falling to pc=0 prints its last
+  32 dispatches (`[ee:thread-pc0]`). Changing `ps2_runtime.h` rebuilds everything (~10 min).
 
 ## Backlog
 GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in the commit message.
@@ -64,7 +74,8 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
   find_functions.py, regenerate, full rebuild.
 
 ## Next steps
-1. Issue #6: `pc=0x0` after IOP modules load and first DMA/GS writes. Open an issue per new blocker.
-2. Possible patch 0003: compile `register_functions.cpp` at -O0 outside the unity build (it only runs at startup).
+1. Issue #7: opening movie stalls without FFmpeg (Linux FFmpeg path in CMake, or skip movies). Open an issue per new
+   blocker.
+2. Possible patch: compile `register_functions.cpp` at -O0 outside the unity build (it only runs at startup).
 3. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).
 4. Open issues #2–#5.

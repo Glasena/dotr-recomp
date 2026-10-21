@@ -1,0 +1,75 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..e0b8876 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -3,6 +3,8 @@
+ #include "ps2_log.h"
+ #include "ps2_runtime_macros.h"
+ 
++#include <array>
++#include <iostream>
+ #include <algorithm>
+ #include <cassert>
+ #include <cstring>
+@@ -82,6 +84,9 @@ EeScheduler::~EeScheduler()
+     requestStop();
+ }
+ 
++static std::array<std::array<uint32_t, 3>, 32> s_lastDispatch{};
++static size_t s_lastDispatchPos = 0;
++
+ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+ {
+     m_executorThread = std::this_thread::get_id();
+@@ -246,6 +251,16 @@ void EeScheduler::run()
+                 }
+                 continue;
+             }
++            if (running->id > 0)
++            {
++                std::cerr << "[ee:thread-pc0] thread=" << running->id << " fell to pc=0; last dispatches (oldest first):";
++                for (size_t i = 0; i < 32; ++i)
++                {
++                    const auto &e = s_lastDispatch[(s_lastDispatchPos + i) % 32];
++                    std::cerr << std::hex << " pc=0x" << e[0] << "/ra=0x" << e[1] << "/sp=0x" << e[2] << std::dec;
++                }
++                std::cerr << std::endl;
++            }
+             makeDormant(*running);
+             m_currentThreadId = 0;
+             copyMainContextToRuntime();
+@@ -286,6 +301,11 @@ void EeScheduler::run()
+             continue;
+         }
+         PS2Runtime::RecompiledFunction function = m_runtime.lookupFunction(context.pc);
++        if (running->id > 0)
++        {
++            s_lastDispatch[s_lastDispatchPos] = {context.pc, getRegU32(&context, 31), getRegU32(&context, 29)};
++            s_lastDispatchPos = (s_lastDispatchPos + 1) % 32;
++        }
+ 
+         if (checkpointDue(kGuestDispatchCycles))
+         {
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..ac060ff 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2417,7 +2425,17 @@ void PS2Runtime::run()
+                                                << " gsw=" << curGs
+                                                << " vif=" << curVif
+                                                << std::endl);
+-
++                for (const auto &t : eeSnapshot.threads)
++                {
++                    RUNTIME_LOG("[run:tick:thread] id=" << t.id
++                                << " status=" << static_cast<int>(t.status)
++                                << " wait=" << static_cast<int>(t.waitReason)
++                                << " waitId=" << t.waitId
++                                << std::hex << " pc=0x" << t.pc << " ra=0x" << t.ra
++                                << " entry=0x" << t.entry << std::dec
++                                << " prio=" << t.currentPriority
++                                << " inv=" << t.invocationDepth << std::endl);
++                }
+             }
+         });
+         uint32_t presentWidth = FB_WIDTH;

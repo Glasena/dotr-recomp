@@ -1,0 +1,49 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+index 56a978e..b2bbb89 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+@@ -8,6 +8,25 @@ namespace ps2_stubs
+     namespace
+     {
+         constexpr uint32_t kCdStreamBlocking = 1u;
++        constexpr uint32_t kCdFuncRead = 1u; // SCECdFuncRead
++        uint32_t g_cdCallback = 0u;          // sceCdCallback() function, called when an N-command ends
++
++        // Reads complete synchronously, so the end-of-command callback is queued right away.
++        void queueCdCallback(R5900Context *ctx, PS2Runtime *runtime, uint32_t reason)
++        {
++            if (!runtime || g_cdCallback == 0u || !runtime->hasFunction(g_cdCallback))
++            {
++                return;
++            }
++            GuestInvocation invocation{};
++            invocation.kind = GuestInvocationKind::RpcCallback;
++            invocation.context = *ctx;
++            invocation.context.pc = g_cdCallback;
++            SET_GPR_U32(&invocation.context, 4, reason);
++            SET_GPR_U32(&invocation.context, 29, 0u);
++            SET_GPR_U32(&invocation.context, 31, 0u);
++            runtime->eeScheduler().queueInvocation(std::move(invocation));
++        }
+         constexpr uint32_t kDvdSectorsPerSecondX1 = 675u;
+         constexpr uint32_t kDvdSectorsPerSecondX4 = kDvdSectorsPerSecondX1 * 4u;
+         constexpr uint64_t kNtScFieldsPerSecondNumerator = 60000u;
+@@ -317,6 +336,7 @@ namespace ps2_stubs
+         {
+             g_cdStreamingLbn = selected.lbn + selected.sectors;
+             setReturnS32(ctx, 1); // command accepted/success
++            queueCdCallback(ctx, runtime, kCdFuncRead);
+             return;
+         }
+ 
+@@ -355,7 +375,9 @@ namespace ps2_stubs
+ 
+     void sceCdCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        setReturnS32(ctx, 0);
++        const uint32_t previous = g_cdCallback;
++        g_cdCallback = getRegU32(ctx, 4);
++        setReturnU32(ctx, previous);
+     }
+ 
+     void sceCdChangeThreadPriority(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
