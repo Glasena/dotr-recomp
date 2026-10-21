@@ -1,0 +1,28 @@
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -12,6 +12,8 @@
+         constexpr uint32_t kDmaStart = 1u << 24u;
+         constexpr int kDmaSpu0Irq = 0x24;
+         constexpr int kDmaSpu1Irq = 0x28;
++        constexpr uint32_t kSpu2AdmaStatus = 0x1F9001B0u;
++        constexpr uint64_t kIopCyclesPerAdmaByte = 36'864'000u / (48'000u * 4u); // 16-bit stereo at 48 kHz
+ 
+         uint32_t alignUp(uint32_t value, uint32_t alignment)
+         {
+@@ -269,9 +271,15 @@
+         const uint32_t wordsPerBlock = std::max<uint32_t>(blockControl & 0xFFFFu, 1u);
+         const uint32_t blockCount = std::max<uint32_t>(blockControl >> 16u, 1u);
+         const uint64_t transferWords = static_cast<uint64_t>(wordsPerBlock) * blockCount;
++        // With AutoDMA on (ADMAS, written by libspu2/libsd stream code) the SPU2 pulls the buffer at
++        // its 48 kHz stereo playback rate, so the completion IRQ is the stream clock. Finishing it at
++        // bus speed makes drivers think a 128 KB BGM half played in microseconds.
++        const uint32_t adma = readHardware32(kSpu2AdmaStatus + (secondCore ? 0x400u : 0u)) & 0xFFFFu;
++        const uint64_t delay = adma != 0u ? transferWords * sizeof(uint32_t) * kIopCyclesPerAdmaByte
++                                          : std::max<uint64_t>(transferWords * 2u, 64u);
+         m_dmaStart = DmaStart{
+             secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
+-            std::max<uint64_t>(transferWords * 2u, 64u),
++            delay,
+         };
+     }
+ 

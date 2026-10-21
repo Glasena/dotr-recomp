@@ -141,6 +141,18 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
 - Uncapped only helps where the host is faster than the PS2 (boot ~105 VBlank/s); movie/title/menu are CPU-bound
   near 50–60/s and the map ~7/s, so keep scripts short past New Game.
 
+## SPU2 AutoDMA pacing and overlays (2026-10-21, #12, #19)
+- Root cause of #12: KCEJEAST links libspu2 and streams BGM with AutoDMA (`_spu_FwAutoDMA` sets ADMAS 0x1F9001B0=1,
+  `_spu_FiAutoDMA` re-arms each 128 KB half from the DMA4 IRQ). The IOP emulator finished every SPU2 DMA in
+  words*2 cycles, so the BGM "played" at bus speed and the EE transfer queue overflowed.
+- Patch 0012: with ADMAS set for the core, the DMA completes after bytes*192 IOP cycles (48 kHz 16-bit stereo).
+  Now the title BGM queue stays at 0-1, the New Game BGM change clears bit 0x2000 at VBlank ~1675.
+- Next blocker (#19): at VBlank ~1870 the main thread calls overlay code at 0x1E00080 (`c400.bin` from
+  DATA/CMODULE.MRG, "MWo3" modules loaded at 0x1E00000; also BMODULE/MMODULE.MRG) and hangs there; screen black.
+- KCEJEAST.IRX keeps its `.symtab` and `.mdebug`: `readelf -s` names every libspu2/driver function.
+- Debug trick: sample guest PCs from `ps2x::test::onVBlank` via `runtime.eeScheduler().thread(id)->activeContext()`
+  (`currentContext()` is null there).
+
 ## Backlog
 GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in the commit message.
 
@@ -154,8 +166,8 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
   find_functions.py, regenerate, full rebuild.
 
 ## Next steps
-1. #12 (SPU2 stream pacing for New Game), #13 (VU1 still the 3D ceiling), #14 (display env), #16, #17. Open an issue
-   per new blocker.
+1. #19 (overlay modules at 0x1E00000), #10 (box glyphs), #13 (VU1 still the 3D ceiling), #14 (display env), #16,
+   #17. Open an issue per new blocker.
 2. Possible patch: compile `register_functions.cpp` at -O0 outside the unity build (it only runs at startup).
 3. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).
 4. Open issues #2–#5.
