@@ -32,6 +32,23 @@ promoted N fallback entries", i.e. jump tables/indirect jumps handled by fallbac
 - 74 of the 263 toml stubs are not map starts (uncalled SDK functions, folded into the previous function).
 - Log says "No BSS found, gp=0x0" (merged section); check `$gp` setup when the runtime starts.
 
+## Runtime build and first boot (2026-10-20)
+Pipeline (README "Building"): `ps2_recomp config/dotr.toml` → `tools/sync_runner.sh` → build `ps2EntryRunner` in
+`../PS2Recomp/out/build-runtime` (RelWithDebInfo, FFmpeg/debug UI off) → run
+`../PS2Recomp/out/build-runtime/ps2xRuntime/ps2EntryRunner "$PWD/../dotr/SLUS_205.15"`. Use `stdbuf -o0` when
+logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr/*.log`.
+- Build times: full ~20 min; stub/toml change ~10–15 min (the batch with the 4.9 MB `register_functions.cpp`
+  takes ~8 min alone); runtime `.cpp` change ~1 min. Never run two builds or two `ps2_recomp` at once: they share
+  `../PS2Recomp` and `../dotr/output`.
+- First boot: window/audio up, guest sets `gp=0x317ef0`, SIF init, then hung in `sub_00191A58` retrying
+  `sceSifBindRpc(0x8000059A)` (libcdvd, between sceCdInit and sceCdMmode). Stubbed as
+  `sceCdChangeThreadPriority@0x00191A58` (identified by structure, not verified). Next boot not tested yet.
+- The runtime's HLE IOP only serves libsd, mcserv and dbcman RPC IDs; libcdvd works through EE-side stubs, so any
+  CD function the analyzer missed hangs like this one.
+
+## Backlog
+GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in the commit message.
+
 ## Reference: God of War PS2 (playable, Oct 2026)
 `../Tobiichi-Port` (clone). Useful docs in `docs/waffle/`, mainly `elf-and-recompilation.md` and
 `runtime-changes.md`. KIexster's pipeline: github.com/KIexster/god-of-war-recomp (68 patches in `patches/`).
@@ -42,6 +59,7 @@ promoted N fallback entries", i.e. jump tables/indirect jumps handled by fallbac
   find_functions.py, regenerate, full rebuild.
 
 ## Next steps
-1. Build the generated code with the runtime.
-2. Find out what the 834 segments at 0x01E00000 are.
-3. Evaluate applying KIexster's patches / generic open PRs (lfsayrn, danfreitas97, abilliontokens).
+1. Boot again with the CD stub and fix the next hang (open an issue per new blocker).
+2. Possible patch 0003: compile `register_functions.cpp` at -O0 outside the unity build (it only runs at startup).
+3. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).
+4. Open issues #2–#5.
