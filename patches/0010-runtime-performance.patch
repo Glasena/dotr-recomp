@@ -1,0 +1,716 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 589d768..487f960 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -396,6 +396,15 @@ add_library(ps2_runtime STATIC
+     src/lib/games_database.cpp
+ )
+ 
++# The VU1 interpreter and the software rasterizer are the hottest host code (3D scenes, movies); build them at -O3
++# even in RelWithDebInfo.
++if(NOT MSVC)
++    set_source_files_properties(
++        src/lib/vu/ps2_vu1_core.cpp src/lib/vu/ps2_vu1_upper.cpp src/lib/vu/ps2_vu1_lower.cpp
++        src/lib/gs/gs_cpu_backend.cpp src/lib/gs/ps2_gs_memory.cpp
++        PROPERTIES COMPILE_OPTIONS "-O3")
++endif()
++
+ if(PS2X_ENABLE_RUNTIME_LOGS)
+     target_compile_definitions(ps2_runtime PUBLIC
+         PS2_RUNTIME_LOGS=1
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index 2421f9e..f48dc02 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -4,13 +4,17 @@
+ #include "runtime/gs/gs_texture_page_cache.h"
+ 
+ #include <array>
++#include <condition_variable>
++#include <cstdint>
+ #include <mutex>
++#include <thread>
+ #include <vector>
+ 
+ class GSCpuBackend final : public GSRasterBackend
+ {
+ public:
+     GSCpuBackend();
++    ~GSCpuBackend() override;
+ 
+     void Initialize(uint8_t *vram, uint32_t vramSize) override;
+     void Reset() override;
+@@ -41,6 +45,8 @@ private:
+     void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
+ 
+     void DrawPrimitive(const GSPrimitiveBatch &batch);
++    void DrawPrimitiveParallel(const GSPrimitiveBatch &batch);
++    void RasterWorkerLoop(uint32_t index);
+     void DrawSprite(const GSPrimitiveBatch &batch);
+     void DrawTriangle(const GSPrimitiveBatch &batch);
+     void DrawLine(const GSPrimitiveBatch &batch);
+@@ -74,6 +80,18 @@ private:
+     std::array<uint32_t, 2> m_clutCbp{};
+     GSMem::TexturePageCache m_texturePageCache;
+ 
++    // Large sprites/triangles are rasterized by row bands on a small pool (worker 0 is the caller), synchronously:
++    // the draw returns only when every band is done, so primitive order and VRAM visibility are unchanged.
++    std::vector<std::thread> m_rasterWorkers;
++    std::mutex m_rasterMutex;
++    std::condition_variable m_rasterStart;
++    std::condition_variable m_rasterDone;
++    const GSPrimitiveBatch *m_rasterBatch = nullptr;
++    uint64_t m_rasterGeneration = 0;
++    uint32_t m_rasterPending = 0;
++    int m_rasterRounding = 0;
++    bool m_rasterStop = false;
++
+     GSTransferCommand m_transfer{};
+     GSTransferSnapshot m_transferState{};
+     std::vector<uint8_t> m_localToHostBuffer;
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 67c8184..bac29b8 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -3,6 +3,7 @@
+ 
+ #include <array>
+ #include <cstdint>
++#include <cstring>
+ 
+ class GS;
+ class PS2Memory;
+@@ -225,6 +226,10 @@ private:
+     std::array<uint64_t, 4> m_accLatestWrite{};
+ 
+     uint64_t m_cycle = 0;
++    // Earliest readyCycle of any queued pipeline entry; commitReadyPipelines() is a no-op before it.
++    uint64_t m_nextCommitCycle = ~0ull;
++    // One bit per valid entry of each pipeline array, so commits visit only queued entries.
++    uint32_t m_flagMask = 0, m_efuMask = 0, m_storeMask = 0, m_vfMask = 0, m_viMask = 0, m_accMask = 0;
+     uint64_t m_nextWriteSequence = 0;
+     uint64_t m_efuResourceReady = 0;
+     uint32_t m_workingClip = 0;
+@@ -287,13 +292,25 @@ private:
+     void markPairWrites(const DecodedInstructionPair &decoded);
+     bool pipelinesPending() const;
+ 
+-    float normalizeOperand(float value) const;
++    // Inline: called for nearly every VU operand from all three interpreter source files.
++    float normalizeOperand(float value) const
++    {
++        uint32_t bits = 0;
++        std::memcpy(&bits, &value, sizeof(bits));
++        const uint32_t exponent = (bits >> 23) & 0xFFu;
++        if (exponent == 0u)
++            bits &= 0x80000000u;
++        else if (exponent == 0xFFu)
++            bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
++        std::memcpy(&value, &bits, sizeof(value));
++        return value;
++    }
+     float normalizeResult(float value, uint32_t &laneFlags) const;
+-    uint32_t microAddressMask() const;
++    uint32_t microAddressMask() const { return m_unit == Unit::VU1 ? 0x3FFFu : 0x0FFFu; }
+     int32_t readBranchVi(uint8_t reg) const;
+     void recordViWriteForBranch(uint8_t reg, int32_t oldValue);
+     void reportReservedInstruction(bool upper, uint32_t instruction);
+-    float broadcast(const float *vf, uint8_t bc);
++    float broadcast(const float *vf, uint8_t bc) { return normalizeOperand(vf[bc & 3u]); }
+ };
+ 
+ #endif
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index e0b8876..1cfa309 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -84,6 +84,8 @@ EeScheduler::~EeScheduler()
+     requestStop();
+ }
+ 
++extern std::atomic<uint32_t> g_ps2GsSwapCount;
++
+ static std::array<std::array<uint32_t, 3>, 32> s_lastDispatch{};
+ static size_t s_lastDispatchPos = 0;
+ 
+@@ -1887,6 +1889,23 @@ void EeScheduler::processEvent(const EeEvent &event)
+         requestStop();
+         break;
+     case EeEventType::VBlankStart:
++    {
++        // Report guest VBlank and sceGsSwapDBuff rates against wall clock (60/s each means full speed).
++        static auto rateStart = std::chrono::steady_clock::now();
++        static uint64_t rateTick = m_vsyncTick;
++        static uint32_t rateSwaps = g_ps2GsSwapCount.load(std::memory_order_relaxed);
++        const auto rateNow = std::chrono::steady_clock::now();
++        const double rateSecs = std::chrono::duration<double>(rateNow - rateStart).count();
++        if (rateSecs >= 5.0)
++        {
++            const uint32_t swaps = g_ps2GsSwapCount.load(std::memory_order_relaxed);
++            std::cerr << "[perf] vblank/s=" << (m_vsyncTick - rateTick) / rateSecs
++                      << " swap/s=" << (swaps - rateSwaps) / rateSecs << std::endl;
++            rateStart = rateNow;
++            rateTick = m_vsyncTick;
++            rateSwaps = swaps;
++        }
++    }
+         ++m_vsyncTick;
+         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
+         if ((m_vsyncTick & 1u) != 0u)
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+index 4db133a..8d64b73 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+@@ -5,6 +5,9 @@
+ #include "runtime/gs/ps2_gs_psmct16.h"
+ #include "runtime/ee_scheduler.h"
+ 
++// Frame counter for the scheduler's once-per-5s rate report (EeScheduler.cpp).
++std::atomic<uint32_t> g_ps2GsSwapCount{0};
++
+ namespace ps2_stubs
+ {
+     namespace
+@@ -1208,6 +1211,7 @@ namespace ps2_stubs
+             return;
+         }
+ 
++        g_ps2GsSwapCount.fetch_add(1u, std::memory_order_relaxed);
+         applyGsDispEnv(runtime, db.disp[which]);
+         // Like sceGsPutDrawEnv: the draw env is followed by the clear packet seeded by sceGsSetDefDBuff.
+         applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(which == 0u ? &db.draw0 : &db.draw1), 8u);
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f0ad507..843f30f 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -7,6 +7,7 @@
+ #include "runtime/gs/ps2_gs_memory.h"
+ #include "ps2_log.h"
+ #include <atomic>
++#include <cfenv>
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdio>
+@@ -19,6 +20,21 @@ using namespace GSInternal;
+ 
+ namespace
+ {
++    // Row-band ownership for parallel rasterization: band (y / kRasterBandRows) belongs to rasterizer
++    // t_rasterIndex of t_rasterCount. Outside a parallel draw the count is 1 and every row is owned.
++    constexpr int kRasterBandRows = 8;
++    // ponytail: fixed area threshold; tune or batch small primitives if many mid-size draws dominate.
++    constexpr int64_t kParallelMinArea = 4096;
++    thread_local uint32_t t_rasterIndex = 0u;
++    thread_local uint32_t t_rasterCount = 1u;
++    thread_local GSMem::TexturePageCache *t_textureCache = nullptr;
++
++    inline bool ownsRow(int y)
++    {
++        return t_rasterCount == 1u ||
++               static_cast<uint32_t>(y / kRasterBandRows) % t_rasterCount == t_rasterIndex;
++    }
++
+     float fabsQ(float q)
+     {
+         return (std::fabs(q) > 1.0e-8f) ? q : 1.0f;
+@@ -296,7 +312,8 @@ namespace
+     {
+         const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
+         const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
+-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
++        // The lerp stays in [0, 255], so +0.5 and truncation round like lround without the libm call.
++        return clampU8(static_cast<int>(top + (bottom - top) * fy + 0.5f));
+     }
+ }
+ 
+@@ -511,6 +528,97 @@ GSCpuBackend::GSCpuBackend()
+         }
+     }
+     Reset();
++
++    const uint32_t hw = std::max(1u, std::thread::hardware_concurrency());
++    const uint32_t rasterizers = std::clamp(hw / 2u, 1u, 8u);
++    for (uint32_t i = 1; i < rasterizers; ++i)
++        m_rasterWorkers.emplace_back([this, i]()
++                                     { RasterWorkerLoop(i); });
++}
++
++GSCpuBackend::~GSCpuBackend()
++{
++    {
++        std::lock_guard<std::mutex> lock(m_rasterMutex);
++        m_rasterStop = true;
++    }
++    m_rasterStart.notify_all();
++    for (std::thread &worker : m_rasterWorkers)
++        worker.join();
++}
++
++namespace
++{
++    // Draws one band set of a sprite/triangle with a private texture page cache.
++    template <typename Draw>
++    void runRasterBand(uint32_t index, uint32_t count, Draw &&draw)
++    {
++        thread_local GSMem::TexturePageCache cache;
++        cache.Invalidate();
++        t_textureCache = &cache;
++        t_rasterIndex = index;
++        t_rasterCount = count;
++        draw();
++        t_rasterCount = 1u;
++        t_rasterIndex = 0u;
++        t_textureCache = nullptr;
++    }
++}
++
++void GSCpuBackend::RasterWorkerLoop(uint32_t index)
++{
++    uint64_t seen = 0;
++    for (;;)
++    {
++        const GSPrimitiveBatch *batch = nullptr;
++        int rounding = 0;
++        {
++            std::unique_lock<std::mutex> lock(m_rasterMutex);
++            m_rasterStart.wait(lock, [&]()
++                               { return m_rasterStop || m_rasterGeneration != seen; });
++            if (m_rasterStop)
++                return;
++            seen = m_rasterGeneration;
++            batch = m_rasterBatch;
++            rounding = m_rasterRounding;
++        }
++        // The caller may be inside the VU1 interpreter, which rasterizes with round-toward-zero.
++        std::fesetround(rounding);
++        runRasterBand(index, static_cast<uint32_t>(m_rasterWorkers.size() + 1u), [&]()
++                      {
++                          if (batch->state.prim.type == GS_PRIM_SPRITE)
++                              DrawSprite(*batch);
++                          else
++                              DrawTriangle(*batch); });
++        bool last = false;
++        {
++            std::lock_guard<std::mutex> lock(m_rasterMutex);
++            last = --m_rasterPending == 0u;
++        }
++        if (last)
++            m_rasterDone.notify_one();
++    }
++}
++
++void GSCpuBackend::DrawPrimitiveParallel(const GSPrimitiveBatch &batch)
++{
++    {
++        std::lock_guard<std::mutex> lock(m_rasterMutex);
++        m_rasterBatch = &batch;
++        m_rasterRounding = std::fegetround();
++        m_rasterPending = static_cast<uint32_t>(m_rasterWorkers.size());
++        ++m_rasterGeneration;
++    }
++    m_rasterStart.notify_all();
++    runRasterBand(0u, static_cast<uint32_t>(m_rasterWorkers.size() + 1u), [&]()
++                  {
++                      if (batch.state.prim.type == GS_PRIM_SPRITE)
++                          DrawSprite(batch);
++                      else
++                          DrawTriangle(batch); });
++    std::unique_lock<std::mutex> lock(m_rasterMutex);
++    m_rasterDone.wait(lock, [this]()
++                      { return m_rasterPending == 0u; });
+ }
+ 
+ void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
+@@ -670,7 +778,7 @@ uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint
+     if (!m_vram)
+         return 0u;
+ 
+-    return GSMem::ReadTexture(m_texturePageCache, m_vram, psm, base, bw, x, y);
++    return GSMem::ReadTexture(t_textureCache ? *t_textureCache : m_texturePageCache, m_vram, psm, base, bw, x, y);
+ }
+ 
+ void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+@@ -818,15 +926,42 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+         }
+     });
+ 
++    const auto parallel = [&]()
++    {
++        if (m_rasterWorkers.empty() || t_rasterCount != 1u)
++            return false;
++        const GSVertex *v = batch.vertices.data();
++        const bool sprite = state.prim.type == GS_PRIM_SPRITE;
++        const int vertices = sprite ? 2 : 3;
++        float minX = v[0].x, maxX = v[0].x, minY = v[0].y, maxY = v[0].y;
++        for (int i = 1; i < vertices; ++i)
++        {
++            minX = std::min(minX, v[i].x);
++            maxX = std::max(maxX, v[i].x);
++            minY = std::min(minY, v[i].y);
++            maxY = std::max(maxY, v[i].y);
++        }
++        const float height = std::min(maxY - minY, static_cast<float>(ctx.scissor.y1 - ctx.scissor.y0 + 1));
++        const float width = std::min(maxX - minX, static_cast<float>(ctx.scissor.x1 - ctx.scissor.x0 + 1));
++        const float area = width * height * (sprite ? 1.0f : 0.5f);
++        return height >= 2.0f * kRasterBandRows && area >= static_cast<float>(kParallelMinArea);
++    };
++
+     switch (state.prim.type)
+     {
+     case GS_PRIM_SPRITE:
+-        DrawSprite(batch);
++        if (parallel())
++            DrawPrimitiveParallel(batch);
++        else
++            DrawSprite(batch);
+         break;
+     case GS_PRIM_TRIANGLE:
+     case GS_PRIM_TRISTRIP:
+     case GS_PRIM_TRIFAN:
+-        DrawTriangle(batch);
++        if (parallel())
++            DrawPrimitiveParallel(batch);
++        else
++            DrawTriangle(batch);
+         break;
+     case GS_PRIM_LINE:
+     case GS_PRIM_LINESTRIP:
+@@ -1236,6 +1371,8 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+ 
+         for (int y = drawY0; y <= drawY1; ++y)
+         {
++            if (!ownsRow(y))
++                continue;
+             float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
+             float texVf = v0f + (v1f - v0f) * ty;
+ 
+@@ -1270,8 +1407,12 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+     else
+     {
+         for (int y = drawY0; y <= drawY1; ++y)
++        {
++            if (!ownsRow(y))
++                continue;
+             for (int x = drawX0; x <= drawX1; ++x)
+                 WritePixel(state, x, y, z1, r, g, b, a, v1.fog);
++        }
+     }
+ }
+ 
+@@ -1313,6 +1454,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+ 
+     for (int y = minY; y <= maxY; ++y)
+     {
++        if (!ownsRow(y))
++            continue;
+         float py = static_cast<float>(y) + 0.5f;
+         for (int x = minX; x <= maxX; ++x)
+         {
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index bd75bba..9a77096 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -4,6 +4,7 @@
+ #include "runtime/ps2_memory.h"
+ #include "ps2_vu1_detail.h"
+ 
++#include <bit>
+ #include <algorithm>
+ #include <cfenv>
+ #include <cmath>
+@@ -81,6 +82,8 @@ void VU1Interpreter::resetScheduler()
+     m_viLatestWrite = {};
+     m_accLatestWrite = {};
+     m_nextWriteSequence = 0;
++    m_nextCommitCycle = ~0ull;
++    m_flagMask = m_efuMask = m_storeMask = m_vfMask = m_viMask = m_accMask = 0u;
+     m_efuResourceReady = 0;
+     m_workingClip = m_state.clip;
+     m_viBranchBackupValue = 0;
+@@ -101,28 +104,6 @@ void VU1Interpreter::reset()
+     resetScheduler();
+ }
+ 
+-float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
+-{
+-    return normalizeOperand(vf[bc & 3u]);
+-}
+-
+-float VU1Interpreter::normalizeOperand(float value) const
+-{
+-    uint32_t bits = 0;
+-    std::memcpy(&bits, &value, sizeof(bits));
+-    const uint32_t exponent = (bits >> 23) & 0xFFu;
+-    if (exponent == 0u)
+-    {
+-        bits &= 0x80000000u;
+-    }
+-    else if (exponent == 0xFFu)
+-    {
+-        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+-    }
+-    std::memcpy(&value, &bits, sizeof(value));
+-    return value;
+-}
+-
+ float VU1Interpreter::normalizeResult(float value, uint32_t &laneFlags) const
+ {
+     uint32_t bits = 0;
+@@ -151,11 +132,6 @@ float VU1Interpreter::normalizeResult(float value, uint32_t &laneFlags) const
+     return value;
+ }
+ 
+-uint32_t VU1Interpreter::microAddressMask() const
+-{
+-    return m_unit == Unit::VU1 ? 0x3FFFu : 0x0FFFu;
+-}
+-
+ int32_t VU1Interpreter::readBranchVi(uint8_t reg) const
+ {
+     if (reg == 0u)
+@@ -533,6 +509,8 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+     entry->valid = true;
+     entry->issueCycle = m_cycle;
+     entry->readyCycle = m_cycle + kFmacLatency;
++    m_nextCommitCycle = std::min(m_nextCommitCycle, entry->readyCycle);
++    m_flagMask |= 1u << (entry - m_flagPipeline.data());
+     entry->mac = mac;
+     entry->status = status;
+     entry->extraSticky = extraSticky;
+@@ -572,6 +550,8 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, entry.readyCycle);
++            m_flagMask |= 1u << (&entry - m_flagPipeline.data());
+             entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
+             entry.writesSticky = true;
+             return;
+@@ -591,6 +571,8 @@ void VU1Interpreter::queueClip(uint32_t clip)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, entry.readyCycle);
++            m_flagMask |= 1u << (&entry - m_flagPipeline.data());
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -615,6 +597,8 @@ void VU1Interpreter::queueFcset(uint32_t clip)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, entry.readyCycle);
++            m_flagMask |= 1u << (&entry - m_flagPipeline.data());
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -629,6 +613,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
+     value = normalizeResult(value, ignoredFlags);
+     m_fdiv.valid = true;
+     m_fdiv.readyCycle = m_cycle + latency;
++    m_nextCommitCycle = std::min(m_nextCommitCycle, m_fdiv.readyCycle);
+     m_fdiv.value = value;
+     m_fdiv.statusDi = statusDi & 0x30u;
+ }
+@@ -643,6 +628,8 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+         {
+             entry.valid = true;
+             entry.readyCycle = m_cycle + latency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, entry.readyCycle);
++            m_efuMask |= 1u << (&entry - m_efu.data());
+             entry.value = value;
+             // EFU throughput is one cycle shorter than result visibility.
+             m_efuResourceReady = m_cycle + (latency > 0u ? latency - 1u : 0u);
+@@ -660,6 +647,8 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
+         {
+             store.valid = true;
+             store.readyCycle = m_cycle + 1u;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, store.readyCycle);
++            m_storeMask |= 1u << (&store - m_storePipeline.data());
+             store.address = address;
+             store.laneMask = laneMask;
+             std::copy(words, words + 4, store.words.begin());
+@@ -681,6 +670,8 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, write.readyCycle);
++            m_vfMask |= 1u << (&write - m_vfWritePipeline.data());
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.laneMask = laneMask;
+@@ -707,6 +698,8 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, write.readyCycle);
++            m_viMask |= 1u << (&write - m_viWritePipeline.data());
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.value = value;
+@@ -728,6 +721,8 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, write.readyCycle);
++            m_accMask |= 1u << (&write - m_accWritePipeline.data());
+             write.sequence = ++m_nextWriteSequence;
+             write.laneMask = laneMask;
+             std::copy(value, value + 4, write.value.begin());
+@@ -744,9 +739,25 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+ 
+ void VU1Interpreter::commitReadyPipelines()
+ {
+-    for (FlagPipelineEntry &entry : m_flagPipeline)
++    if (m_cycle < m_nextCommitCycle)
++        return;
++    // Visit queued entries only; the ones that stay queued define the next commit cycle.
++    uint64_t next = ~0ull;
++    auto ready = [&](uint64_t readyCycle)
+     {
+-        if (!entry.valid || entry.readyCycle > m_cycle)
++        if (readyCycle > m_cycle)
++        {
++            next = std::min(next, readyCycle);
++            return false;
++        }
++        return true;
++    };
++
++    for (uint32_t bits = m_flagMask; bits != 0u; bits &= bits - 1u)
++    {
++        const uint32_t index = static_cast<uint32_t>(std::countr_zero(bits));
++        FlagPipelineEntry &entry = m_flagPipeline[index];
++        if (!ready(entry.readyCycle))
+             continue;
+ 
+         if (entry.writesMac)
+@@ -763,9 +774,10 @@ void VU1Interpreter::commitReadyPipelines()
+         if (entry.writesClip)
+             m_state.clip = entry.clip;
+         entry = {};
++        m_flagMask &= ~(1u << index);
+     }
+ 
+-    if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
++    if (m_fdiv.valid && ready(m_fdiv.readyCycle))
+     {
+         m_state.q = m_fdiv.value;
+         const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
+@@ -773,18 +785,22 @@ void VU1Interpreter::commitReadyPipelines()
+         m_fdiv = {};
+     }
+ 
+-    for (ScalarPipelineEntry &entry : m_efu)
++    for (uint32_t bits = m_efuMask; bits != 0u; bits &= bits - 1u)
+     {
+-        if (entry.valid && entry.readyCycle <= m_cycle)
+-        {
+-            m_state.p = entry.value;
+-            entry = {};
+-        }
++        const uint32_t index = static_cast<uint32_t>(std::countr_zero(bits));
++        ScalarPipelineEntry &entry = m_efu[index];
++        if (!ready(entry.readyCycle))
++            continue;
++        m_state.p = entry.value;
++        entry = {};
++        m_efuMask &= ~(1u << index);
+     }
+ 
+-    for (PendingStore &store : m_storePipeline)
++    for (uint32_t bits = m_storeMask; bits != 0u; bits &= bits - 1u)
+     {
+-        if (!store.valid || store.readyCycle > m_cycle)
++        const uint32_t index = static_cast<uint32_t>(std::countr_zero(bits));
++        PendingStore &store = m_storePipeline[index];
++        if (!ready(store.readyCycle))
+             continue;
+         if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
+         {
+@@ -798,11 +814,14 @@ void VU1Interpreter::commitReadyPipelines()
+             std::memcpy(m_activeVuData + store.address, oldWords, sizeof(oldWords));
+         }
+         store = {};
++        m_storeMask &= ~(1u << index);
+     }
+ 
+-    for (PendingVfWrite &write : m_vfWritePipeline)
++    for (uint32_t bits = m_vfMask; bits != 0u; bits &= bits - 1u)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        const uint32_t index = static_cast<uint32_t>(std::countr_zero(bits));
++        PendingVfWrite &write = m_vfWritePipeline[index];
++        if (!ready(write.readyCycle))
+             continue;
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+@@ -813,20 +832,26 @@ void VU1Interpreter::commitReadyPipelines()
+             }
+         }
+         write = {};
++        m_vfMask &= ~(1u << index);
+     }
+ 
+-    for (PendingViWrite &write : m_viWritePipeline)
++    for (uint32_t bits = m_viMask; bits != 0u; bits &= bits - 1u)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        const uint32_t index = static_cast<uint32_t>(std::countr_zero(bits));
++        PendingViWrite &write = m_viWritePipeline[index];
++        if (!ready(write.readyCycle))
+             continue;
+         if (m_viLatestWrite[write.reg] == write.sequence)
+             m_state.vi[write.reg] = static_cast<int16_t>(write.value);
+         write = {};
++        m_viMask &= ~(1u << index);
+     }
+ 
+-    for (PendingAccWrite &write : m_accWritePipeline)
++    for (uint32_t bits = m_accMask; bits != 0u; bits &= bits - 1u)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        const uint32_t index = static_cast<uint32_t>(std::countr_zero(bits));
++        PendingAccWrite &write = m_accWritePipeline[index];
++        if (!ready(write.readyCycle))
+             continue;
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+@@ -837,7 +862,9 @@ void VU1Interpreter::commitReadyPipelines()
+             }
+         }
+         write = {};
++        m_accMask &= ~(1u << index);
+     }
++    m_nextCommitCycle = next;
+ }
+ 
+ void VU1Interpreter::progressXgkick()
+@@ -1005,11 +1032,8 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
+                     ready = std::max(ready, m_vfReady[access.reg][component]);
+             }
+         }
+-        for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
+-        {
+-            if ((usage->viRead & (1u << reg)) != 0u)
+-                ready = std::max(ready, m_viReady[reg]);
+-        }
++        for (uint32_t bits = usage->viRead & 0xFFFEu; bits != 0u; bits &= bits - 1u)
++            ready = std::max(ready, m_viReady[std::countr_zero(bits)]);
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+             if ((usage->accRead & laneForComponent(component)) != 0u)
+@@ -1063,11 +1087,8 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
+         }
+     }
+ 
+-    for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
+-    {
+-        if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
+-            m_viReady[reg] = m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
+-    }
++    for (uint32_t bits = decoded.lowerUsage.viWrite & 0xFFFEu; bits != 0u; bits &= bits - 1u)
++        m_viReady[std::countr_zero(bits)] = m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
+     for (uint32_t component = 0; component < 4u; ++component)
+     {
+         if ((decoded.upperUsage.accWrite & laneForComponent(component)) != 0u)

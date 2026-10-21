@@ -73,13 +73,18 @@ mkdir -p ../deps/src && curl -L https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz | 
 tools/sync_runner.sh
 cmake -S ../PS2Recomp -B ../PS2Recomp/out/build-runtime -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF \
-  -DPS2X_ENABLE_DEBUG_UI=OFF -DPS2X_ENABLE_FFMPEG=ON -DCMAKE_PREFIX_PATH="$(realpath ../deps/ffmpeg)"
+  -DPS2X_ENABLE_DEBUG_UI=OFF -DPS2X_ENABLE_AGRESSIVE_LOGS=OFF -DPS2X_ENABLE_FFMPEG=ON \
+  -DCMAKE_PREFIX_PATH="$(realpath ../deps/ffmpeg)"
 cmake --build ../PS2Recomp/out/build-runtime --target ps2EntryRunner
 ```
 
+`PS2X_ENABLE_AGRESSIVE_LOGS` defaults to ON upstream: it makes every recompiled function write and flush a line to
+`ps2_log.txt` (gigabytes in minutes) and slows the whole game, so keep it OFF unless you need that trace. The runtime
+prints `[perf] vblank/s=… swap/s=…` to stderr every 5 s (60 VBlanks/s is full speed; DotR swaps at 30/s).
+
 The runtime finds FFmpeg through pkg-config, which searches `CMAKE_PREFIX_PATH`; the binary gets an RPATH to
 `../deps/ffmpeg/lib`, so no `LD_LIBRARY_PATH` is needed. Without FFmpeg, pass `-DPS2X_ENABLE_FFMPEG=OFF` instead:
-movies are then skipped with blank frames (patch 0006). In-game, Cross (keyboard `X`) skips the intro movie.
+movies are then skipped with blank frames (patch 0006). In-game, Start (keyboard Enter) skips the intro movie.
 
 On Ubuntu the runtime needs `sudo apt install libxinerama-dev libasound2-dev`.
 

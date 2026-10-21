@@ -108,9 +108,26 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
 - FFmpeg 7.1 built from source (README step 5, no nasm so `--disable-x86asm`, shared libs) into `../deps/ffmpeg`.
   Upstream's Linux branch already uses pkg-config; `-DCMAKE_PREFIX_PATH=../deps/ffmpeg` is enough, no patch. The
   runner gets an RPATH to it. The `build-runtime` cache now has FFmpeg ON.
-- OPMV_US.PSS plays with real frames; Cross (`X` key, via xdotool keydown/keyup) skips it to the title, then
-  Enter → menu → New Game works. Played to the end it takes ~8.5 min for a ~165 s stream (#15).
+- OPMV_US.PSS plays with real frames; Start (Enter key, via xdotool keydown/keyup) skips it to the title, then
+  Enter → menu → Cross (`X`) on New Game works. The stream is 114.6 s (pack SCR).
 - Screenshots: `xdotool search --name PS2-Recomp` + `import -window $W`.
+
+## Performance (2026-10-21, #13, #15)
+- Profiling: no perf installed, but `apt-get download linux-tools-5.15.0-117` + `dpkg-deb -x` gives a working
+  user-space `perf` (paranoid=2, no root). `perf record -F 999 -p PID`, `perf report --comm GameThread`.
+- Measure with the runtime's `[perf] vblank/s=… swap/s=…` stderr line (every 5 s; 60/s = full speed, DotR swaps 30).
+- Hotspots found: (1) `PS2X_ENABLE_AGRESSIVE_LOGS` (upstream default ON) logs+flushes every recompiled function call
+  to `ps2_log.txt` (GBs) -> now OFF in the README configure line. (2) Software GS rasterizer (WritePixel/
+  SampleTexture) is single-threaded: menu draws ~1.75 Mpixel/frame. (3) VU1 interpreter scanned ~50 pipeline slots
+  every cycle.
+- Patch 0010: sprites/triangles >= 4096 px rasterized by 8-row bands on hw/2 threads (synchronous, per-thread
+  texture page cache, caller's FP rounding mode); VU1 commit visits only queued entries (bitmasks) and skips
+  cycles before the next ready one; VU/GS sources at -O3; small VU1 helpers inlined (header change = full rebuild);
+  bilinear lerp without libm `lround`; `[perf]` rate line.
+- vblank/s (swap/s) before -> after: movie 22 -> 52-60 (intro reaches the title in ~2 min instead of ~8.5),
+  title 54 (27) -> 60 (30), menu 19 (9.5) -> 47 (23.5), map 2.9 (1.45) -> 7 (3.5).
+- Map is still VU1-interpreter bound (~75% of the game thread): needs a VU1 recompiler or async VU1 (#13 open).
+  Exception-based EE thread switches cost ~14% in movies (#16). One upstream GS unit test fails before and after (#17).
 
 ## Backlog
 GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in the commit message.
@@ -125,8 +142,8 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
   find_functions.py, regenerate, full rebuild.
 
 ## Next steps
-1. #12 (SPU2 stream pacing for New Game), #13 (VU1/VIF speed), #14 (display env). #15 (movie ~3x slow). Open an issue per new
-   blocker.
+1. #12 (SPU2 stream pacing for New Game), #13 (VU1 still the 3D ceiling), #14 (display env), #16, #17. Open an issue
+   per new blocker.
 2. Possible patch: compile `register_functions.cpp` at -O0 outside the unity build (it only runs at startup).
 3. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).
 4. Open issues #2–#5.
