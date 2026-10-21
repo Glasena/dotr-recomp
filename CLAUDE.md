@@ -104,6 +104,14 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
 - Debug tricks used: temporary hooks in `PS2Runtime::dispatchGuestBranch` (first-call log, call histogram, guest-pc
   sampling profiler, RAM dumps, word watch) and VRAM dumps decoded with the runtime's `ps2_gs_psmt*.h` swizzle headers.
 
+## Real movie playback (2026-10-21, #11)
+- FFmpeg 7.1 built from source (README step 5, no nasm so `--disable-x86asm`, shared libs) into `../deps/ffmpeg`.
+  Upstream's Linux branch already uses pkg-config; `-DCMAKE_PREFIX_PATH=../deps/ffmpeg` is enough, no patch. The
+  runner gets an RPATH to it. The `build-runtime` cache now has FFmpeg ON.
+- OPMV_US.PSS plays with real frames; Cross (`X` key, via xdotool keydown/keyup) skips it to the title, then
+  Enter → menu → New Game works. Played to the end it takes ~8.5 min for a ~165 s stream (#15).
+- Screenshots: `xdotool search --name PS2-Recomp` + `import -window $W`.
+
 ## Backlog
 GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in the commit message.
 
@@ -117,8 +125,8 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
   find_functions.py, regenerate, full rebuild.
 
 ## Next steps
-1. #12 (SPU2 stream pacing for New Game), #13 (VU1/VIF speed), #14 (display env). Open an issue per new blocker. Real movie playback
-   needs a Linux FFmpeg path in CMake (pkg-config) once FFmpeg dev packages can be installed.
+1. #12 (SPU2 stream pacing for New Game), #13 (VU1/VIF speed), #14 (display env). #15 (movie ~3x slow). Open an issue per new
+   blocker.
 2. Possible patch: compile `register_functions.cpp` at -O0 outside the unity build (it only runs at startup).
 3. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).
 4. Open issues #2–#5.

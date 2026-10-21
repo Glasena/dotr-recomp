@@ -62,13 +62,24 @@ python3 -I tools/find_functions.py ../dotr/SLUS_205.15 config/funcmap.csv [../do
 # 4. generate the C++ (run from this folder: toml paths are relative to it)
 ../PS2Recomp/out/build-tools/ps2xRecomp/ps2_recomp config/dotr.toml
 
-# 5. copy the generated code into the runtime and build it (FFmpeg off: only needed for MPEG movies)
+# 5. (optional, for the intro/story movies) build a minimal FFmpeg into ../deps/ffmpeg; no root needed
+mkdir -p ../deps/src && curl -L https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz | tar xJ -C ../deps/src
+(cd ../deps/src/ffmpeg-7.1 && ./configure --prefix="$(realpath ../../ffmpeg)" --enable-shared --disable-static \
+  --disable-programs --disable-doc --disable-x86asm --disable-everything --disable-network --disable-autodetect \
+  --disable-avdevice --disable-avfilter --enable-decoder=mpeg1video,mpeg2video --enable-parser=mpegvideo \
+  --enable-demuxer=mpegps,mpegvideo --enable-protocol=file && make -j"$(nproc)" install)
+
+# 6. copy the generated code into the runtime and build it
 tools/sync_runner.sh
 cmake -S ../PS2Recomp -B ../PS2Recomp/out/build-runtime -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF \
-  -DPS2X_ENABLE_FFMPEG=OFF -DPS2X_ENABLE_DEBUG_UI=OFF
+  -DPS2X_ENABLE_DEBUG_UI=OFF -DPS2X_ENABLE_FFMPEG=ON -DCMAKE_PREFIX_PATH="$(realpath ../deps/ffmpeg)"
 cmake --build ../PS2Recomp/out/build-runtime --target ps2EntryRunner
 ```
+
+The runtime finds FFmpeg through pkg-config, which searches `CMAKE_PREFIX_PATH`; the binary gets an RPATH to
+`../deps/ffmpeg/lib`, so no `LD_LIBRARY_PATH` is needed. Without FFmpeg, pass `-DPS2X_ENABLE_FFMPEG=OFF` instead:
+movies are then skipped with blank frames (patch 0006). In-game, Cross (keyboard `X`) skips the intro movie.
 
 On Ubuntu the runtime needs `sudo apt install libxinerama-dev libasound2-dev`.
 
