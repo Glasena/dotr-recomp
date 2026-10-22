@@ -86,17 +86,21 @@ tools/sync_runner.sh
 cmake -S ../PS2Recomp -B ../PS2Recomp/out/build-runtime -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF \
   -DPS2X_ENABLE_DEBUG_UI=OFF -DPS2X_ENABLE_AGRESSIVE_LOGS=OFF -DPS2X_ENABLE_FFMPEG=ON \
+  -DPS2X_ENABLE_RUNNER_UNITY_BUILD=OFF -DPS2X_ENABLE_RUNNER_PCH=OFF \
   -DCMAKE_PREFIX_PATH="$(realpath ../deps/ffmpeg)" \
   -DCMAKE_CXX_COMPILER_LAUNCHER="$(realpath ../deps/bin/ccache)" -DCMAKE_C_COMPILER_LAUNCHER="$(realpath ../deps/bin/ccache)"
 cmake --build ../PS2Recomp/out/build-runtime --target ps2EntryRunner
 ```
 
-Rebuild times (12 threads): cold full build ~39 min (968 steps, ~555 MB of generated C++); no change 0.03 s; a
-runtime `.cpp` edit ~12 s (mostly the link); a runtime subsystem header edit such as `ps2_vu1.h` ~30 s (was ~14 min:
-it rebuilt every unity batch). Patch 0014 makes generated code include only `ps2_runtime_core.h` (the guest call ABI),
-not the GS/VU/audio/pad/VFS headers. Editing `ps2_runtime_core.h`, `ps2_runtime_macros.h` or the generated headers
-still rebuilds everything. ccache turns rebuilds of unchanged sources (touched files, reverted edits, a wiped build
-folder) into cache hits.
+Rebuild times (12 threads): cold full build ~45 min (~4000 steps, most of it the 762 overlay modules); no change
+0.1 s; a runtime `.cpp` edit ~25 s (mostly the link); an edit to `ps2_runtime_core.h` or another runtime header ~45 s;
+`ps2_syscalls.h`/`ps2_stubs.h` ~1 min (only the stub files); a regeneration (steps 4 + 7) that adds or removes a
+function ~40 s. Patch 0017 makes generated code and overlays see the runtime only through `ps2_guest_abi.h` and
+`ps2_runtime_macros.h`, and each generated file declare just the functions it calls. Editing those two headers or
+`runtime/ps2_address.h` still rebuilds all generated code (~45 min), so keep them stable. Unity batches and the runner
+PCH are off: batches shift when a function is added, and ccache never hits on CMake's GCC PCH. With ccache, touched
+or reverted files are cache hits (a touch of `ps2_runtime_macros.h` rebuilds in ~35 s). Configure with real paths,
+not through a symlink: every compile command holds absolute paths.
 
 `PS2X_ENABLE_AGRESSIVE_LOGS` defaults to ON upstream: it makes every recompiled function write and flush a line to
 `ps2_log.txt` (gigabytes in minutes) and slows the whole game, so keep it OFF unless you need that trace. The runtime

@@ -22,7 +22,7 @@ namespace
         return tables;
     }
 
-    PS2Runtime::RecompiledFunction resolveDotrOverlay(const uint8_t *rdram, uint32_t address)
+    Ps2RecompiledFunction resolveDotrOverlay(const uint8_t *rdram, uint32_t address)
     {
         if (!rdram || address < kDotrOverlayBase || address >= kDotrOverlayEnd)
         {

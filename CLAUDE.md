@@ -37,11 +37,10 @@ Pipeline (README "Building"): `ps2_recomp config/dotr.toml` → `tools/sync_runn
 `../PS2Recomp/out/build-runtime` (RelWithDebInfo, FFmpeg/debug UI off) → run
 `../PS2Recomp/out/build-runtime/ps2xRuntime/ps2EntryRunner "$PWD/../dotr/SLUS_205.15"`. Use `stdbuf -o0` when
 logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr/*.log`.
-- Build times (issue #21, ccache + patch 0014): cold full ~39 min (968 steps); no change 0.03 s; runtime `.cpp`
-  ~12 s; runtime subsystem header (`ps2_vu1.h`, GS, audio, pad, VFS) ~30 s. Generated code includes only
-  `ps2_runtime_core.h`: keep new runtime internals out of it, `ps2_runtime_macros.h` and `ps2_syscalls.h`, or every
-  edit rebuilds everything again. ccache lives in `../deps/bin/ccache` (README step 6). Never run two builds or two `ps2_recomp` at once: they share
-  `../PS2Recomp` and `../dotr/output`.
+- Build times: see "Build times (#24)". Generated code and overlays include only `ps2_guest_abi.h` +
+  `ps2_runtime_macros.h` (+ `ps2_syscalls.h`/`ps2_stubs.h` in stub files): keep runtime internals out of them, or every
+  edit rebuilds everything (~45 min). ccache lives in `../deps/bin/ccache` (README step 6). Never run two builds or two
+  `ps2_recomp` at once: they share `../PS2Recomp` and `../dotr/output`.
 - First boot: window/audio up, guest sets `gp=0x317ef0`, SIF init, then hung in `sub_00191A58` retrying
   `sceSifBindRpc(0x8000059A)` (libcdvd, between sceCdInit and sceCdMmode). Stubbed as
   `sceCdDiskReady@0x00191A58`: boot code at 0x200058 loops until it returns 2 (SCECdComplete). A first guess
@@ -177,8 +176,8 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   `namespace ov_<name>` with a sorted entry table → `../dotr/overlays/cpp/ov_<name>.cpp` (762 files, 555 MB, ~20 s).
   `src/dotr_overlays.cpp` resolves 0x1E00000-0x1E08000 by the id at 0x1E00004 (after checking "MWo3").
 - Patch 0013: `g_ps2OverlayFunctionResolver` hook in `hasFunction`/`lookupFunction` (table miss only); runner
-  `ov_*.cpp` are built outside unity batches and PCH at -O1 -g0. Full overlay build ~35 min; they only rebuild
-  when runtime headers change.
+  `ov_*.cpp` are built outside unity batches and PCH at -O1 -g0. Full overlay build ~30 min; since patch 0017 they
+  only rebuild when the guest ABI headers change.
 - 169 main functions are only called from overlays: `find_functions.py ... ../dotr/output ../dotr` now adds
   boundary-checked overlay J/JAL targets (3005 → 3173 functions).
 - Now: New Game plays the story intro (text + portraits, 3D Stonehenge), Simon McMooran's dialogue and the NAME
@@ -186,6 +185,23 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
 hand, Dark Magician summon with its 3D model (VBlank ~10500). Not tested further. All of this runs at ~4-7 VBlank/s (#13), so a run to VBlank 8000 takes
   ~15 min, to the duel ~25 min. Script used: `start@1000,start@1400,cross@1500`, cross every 60 from 2200 to 5600,
   `start@5750`, cross every 60 to 9100, `start@9300`, cross every 80.
+
+## Build times (2026-10-22, #24)
+- Patch 0017: `ps2_guest_abi.h` = R5900Context + address map (`runtime/ps2_address.h`) + `ps2_guest::` free functions
+  forwarding to PS2Runtime (incomplete type there); emitters write `ps2_guest::X(runtime, ...)`; each generated file
+  declares only its direct callees (no `ps2_recompiled_functions.h`); `register_functions.cpp` out of unity at -O0
+  (881 s -> 11 s); runner unity build and PCH default OFF. `tools/overlays.py` emits only the ABI includes.
+- ccache root cause: CMake's GCC PCH command `-include`s the `.gch` it writes, so ccache hashes the previous,
+  non-reproducible `.gch`: the PCH and all 3189 files using it always missed. Without PCH a touch of
+  `ps2_runtime_macros.h` is 100% hits (34 s; 598 s with PCH). Cost: compiling the main generated code from scratch
+  takes 967 s instead of 598 s.
+- Before -> after (12 threads): no-op 0.1 s -> 0.1 s; runtime `.cpp` 18 s -> 25 s (link ~15 s, ~4000 objects now);
+  `ps2_runtime_core.h` edit (new PS2Runtime member) 46.5 min -> 44 s; `ps2_syscalls.h` edit (full rebuild) -> 56 s;
+  regeneration, identical 28 s -> 25 s, one function merged in `funcmap.csv` 20.7 min -> 41 s; cold full ~46 min ->
+  ~40-45 min. Still a full rebuild (~45 min): real edits to `ps2_guest_abi.h`, `ps2_runtime_macros.h`,
+  `runtime/ps2_address.h`. `gold` links slower than bfd here (28 s vs 10-15 s).
+- Configure through real paths (`/home/.../workspace/PS2Recomp`), not a symlinked checkout: paths end up in every
+  compile command and a different spelling rebuilds everything.
 
 ## Backlog
 GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in the commit message.
@@ -201,10 +217,8 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
 
 ## Next steps (2026-10-22: sharpen the tools before more VU1 work)
 Order is tracked with the `priority: N` labels; the three issues are pinned on GitHub.
-1. #24 (priority 1): build. Overlays rebuild on any core header edit (~33 min), `unity_0` (probably
- `register_functions.cpp`) takes 12 min serially, ccache hits 8.8%. Goal: everyday builds under 1-2 min.
-2. #25 (priority 2): opt-in test mode that skips VU1 + GS rasterization on frames not dumped, so scripts reach the
+1. #25 (priority 2): opt-in test mode that skips VU1 + GS rasterization on frames not dumped, so scripts reach the
  map/duel in minutes. Off for timing runs; run the full script without it now and then and compare dumps.
-3. #13 (priority 3): VU1 recompiler or async VU1.
-4. Then #10 (box glyphs), #14 (display env), #16, #17, #3-#5. Open an issue per new blocker.
-5. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).
+2. #13 (priority 3): VU1 recompiler or async VU1.
+3. Then #10 (box glyphs), #14 (display env), #16, #17, #3-#5. Open an issue per new blocker.
+4. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).
