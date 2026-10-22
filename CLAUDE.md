@@ -152,6 +152,8 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   VBlank ~1800: ~14.1 VBlanks/s (5 s samples 12.6–15.0; 1900–2300 ~14.5) vs ~13.4. Frames 1900/2100/2300
   byte-identical to `test_before`. Tests 444/445 (same pre-existing GS callback failure). Next slice: FMAC
   flag updates on the fast-block path.
+- Patch 0022 (2026-10-22, #30): fast-block MADD/MSUB (vector, broadcast, Q/I) and OPMSUB into VF with SSE (0020/0021
+  did ADD/SUB/MUL). Map samples after VBlank ~1800: ~14.6 VBlanks/s (14.1-15.0) vs ~14.2; dumps byte-identical.
 
 ## Automated test mode (2026-10-21, #18) — agents MUST use this, never manual screenshots
 - `tools/test_run.sh`: hidden window, no audio, uncapped VBlanks, scripted pad, PNG dumps, exit. Default script:

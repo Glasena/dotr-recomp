@@ -1,0 +1,86 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -2161,7 +2161,8 @@
+     const uint64_t budgetEnd = m_cycle + maxCycles;
+     bool programEnded = false;
+ 
+-    // ADD/SUB/MUL, broadcast and Q/I included, on the fast-block path. The interpreter table stays scalar.
++    // ADD/SUB/MUL/MADD/MSUB/OPMSUB into VF, broadcast and Q/I included, on the fast-block path.
++    // The interpreter table stays scalar.
+     auto directAddSubMul = [&](uint32_t word)
+     {
+         m_currentUpperInstruction = word;
+@@ -2169,12 +2170,12 @@
+         float vs[4];
+         for (int c = 0; c < 4; ++c)
+             vs[c] = normalizeOperand(m_state.vf[FS(word)][c]);
+-        const __m128 left = _mm_loadu_ps(vs);
++        __m128 left = _mm_loadu_ps(vs);
+ 
+         __m128 right;
+-        if (op == 0x1Cu || op == 0x20u || op == 0x24u)
++        if (op == 0x1Cu || op == 0x20u || op == 0x24u || op == 0x21u || op == 0x25u)
+             right = _mm_set1_ps(normalizeOperand(m_state.q));
+-        else if (op == 0x1Eu || op == 0x22u || op == 0x26u)
++        else if (op == 0x1Eu || op == 0x22u || op == 0x26u || op == 0x23u || op == 0x27u)
+             right = _mm_set1_ps(normalizeOperand(m_state.i));
+         else
+         {
+@@ -2182,7 +2183,7 @@
+             for (int c = 0; c < 4; ++c)
+                 vt[c] = normalizeOperand(m_state.vf[FT(word)][c]);
+             const __m128 loaded = _mm_loadu_ps(vt);
+-            if (op <= 0x07u || (op >= 0x18u && op <= 0x1Bu))
++            if (op <= 0x0Fu || (op >= 0x18u && op <= 0x1Bu))
+             {
+                 switch (op & 3u)
+                 {
+@@ -2200,10 +2201,34 @@
+                     break;
+                 }
+             }
++            else if (op == 0x2Eu)
++            {
++                // OPMSUB: acc - (vs.yzx * vt.zxy); w is forced to 0 below.
++                left = _mm_shuffle_ps(left, left, _MM_SHUFFLE(3, 0, 2, 1));
++                right = _mm_shuffle_ps(loaded, loaded, _MM_SHUFFLE(3, 1, 0, 2));
++            }
+             else
+                 right = loaded;
+         }
+ 
++        if (isFmacProductSum(op, 0xFFu))
++        {
++            float acc[4];
++            for (int c = 0; c < 4; ++c)
++                acc[c] = normalizeOperand(m_state.acc[c]);
++            const __m128 product = _mm_mul_ps(left, right);
++            const bool productSub = (op >= 0x0Cu && op <= 0x0Fu) || op == 0x25u || op == 0x27u ||
++                                    op == 0x2Du || op == 0x2Eu;
++            const __m128 sum = productSub ? _mm_sub_ps(_mm_loadu_ps(acc), product)
++                                          : _mm_add_ps(_mm_loadu_ps(acc), product);
++            float result[4];
++            _mm_storeu_ps(result, sum);
++            if (op == 0x2Eu)
++                result[3] = 0.0f;
++            applyFmacDest(m_state.vf[FD(word)], result, DEST(word));
++            return;
++        }
++
+         const bool mul = (op >= 0x18u && op <= 0x1Cu) || op == 0x1Eu || op == 0x2Au;
+         const bool sub = (op >= 0x04u && op <= 0x07u) || op == 0x24u || op == 0x26u || op == 0x2Cu;
+         const __m128 wide = mul ? _mm_mul_ps(left, right)
+@@ -2227,9 +2252,9 @@
+             if (directOk)
+             {
+                 const uint16_t id = directIds->upper[directPair];
+-                const bool directFmac = id <= 0x07u || (id >= 0x18u && id <= 0x1Cu) ||
+-                                        id == 0x1Eu || id == 0x20u || id == 0x22u || id == 0x24u || id == 0x26u ||
+-                                        id == 0x28u || id == 0x2Au || id == 0x2Cu;
++                // Not MAX/MINI (0x10-0x17, 0x1D, 0x1F, 0x2B) nor anything past OPMSUB.
++                const bool directFmac = id <= 0x0Fu || (id >= 0x18u && id <= 0x1Cu) ||
++                                        (id >= 0x1Eu && id <= 0x2Eu && id != 0x1Fu && id != 0x2Bu);
+                 if (directFmac)
+                     directAddSubMul(decoded.upper);
+                 else
