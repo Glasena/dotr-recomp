@@ -1,0 +1,2440 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 5078a90..f80a4c5 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -15,6 +15,7 @@
+ #include <filesystem>
+ #include <limits>
+ #include <ps2_log.h>
++#include <unordered_map>
+ 
+ namespace
+ {
+@@ -34,6 +35,14 @@ namespace
+         return static_cast<uint8_t>(1u << (3u - component));
+     }
+ 
++    // Handler ids for each decoded pair, indexed like m_decodedCodeCache. Not on VU1Interpreter:
++    // ps2_vu1.h is included by ps2_runtime.h, and touching it rebuilds every overlay.
++    struct DirectIds
++    {
++        std::vector<uint16_t> upper;
++        std::vector<uint16_t> lower;
++    };
++    std::unordered_map<const VU1Interpreter *, DirectIds> g_directIds;
+ }
+ 
+ void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
+@@ -1754,6 +1763,7 @@ void VU1Interpreter::prepareCodeCache(const uint8_t *vuCode, uint32_t codeSize,
+     if (codeSize / 8u > kMaxDecodedPairs)
+         return;
+     const uint32_t pairCount = codeSize / 8u;
++    bool rebuiltCode = false;
+     const bool tracked = memory != nullptr &&
+                          ((m_unit == Unit::VU1 && vuCode == memory->getVU1Code()) ||
+                           (m_unit == Unit::VU0 && vuCode == memory->getVU0Code()));
+@@ -1768,6 +1778,7 @@ void VU1Interpreter::prepareCodeCache(const uint8_t *vuCode, uint32_t codeSize,
+         if (!(m_decodedCodeCacheValid && m_cachedPairCount == pairCount &&
+               std::memcmp(m_cachedCodeCopy.data(), vuCode, pairCount * 8u) == 0))
+         {
++            rebuiltCode = true;
+             for (uint32_t i = 0; i < pairCount; ++i)
+                 m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
+             std::memcpy(m_cachedCodeCopy.data(), vuCode, pairCount * 8u);
+@@ -1786,6 +1797,18 @@ void VU1Interpreter::prepareCodeCache(const uint8_t *vuCode, uint32_t codeSize,
+         m_fastBlocks.resize(pairCount);
+     }
+     m_codeCachePrepared = true;
++    DirectIds &ids = g_directIds[this];
++    if (rebuiltCode || ids.upper.size() != pairCount)
++    {
++        ids.upper.resize(pairCount);
++        ids.lower.resize(pairCount);
++        for (uint32_t i = 0; i < pairCount; ++i)
++        {
++            const DecodedInstructionPair &decoded = m_decodedCodeCache[i];
++            ids.upper[i] = vu1UpperHandlerId(decoded.upper);
++            ids.lower[i] = decoded.iBit ? kVu1LowerNop : vu1LowerHandlerId(decoded.lower);
++        }
++    }
+ }
+ 
+ const VU1Interpreter::FastBlock *VU1Interpreter::buildFastBlock(uint32_t startPair)
+@@ -2114,17 +2137,54 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     m_activeMemory = memory;
+     prepareCodeCache(vuCode, codeSize, memory);
+ 
++    // Publish the direct-op tables before any pair runs. The dummy ops are NOPs; restore the upper word
++    // so a caller that inspects it across run() sees the same value.
++    {
++        static bool handlersReady = false;
++        if (!handlersReady)
++        {
++            const uint32_t savedUpper = m_currentUpperInstruction;
++            execUpper(0x2FFu);
++            execLower(0u, vuData, dataSize, gs, memory, 0u);
++            m_currentUpperInstruction = savedUpper;
++            handlersReady = true;
++        }
++    }
++    const DirectIds *directIds = nullptr;
++    if (auto found = g_directIds.find(this); found != g_directIds.end() && found->second.upper.size() == m_cachedPairCount)
++        directIds = &found->second;
++    static const bool noDirect = std::getenv("PS2X_VU_NO_DIRECT") != nullptr;
++
+     const int previousRoundingMode = std::fegetround();
+     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+     const uint64_t budgetEnd = m_cycle + maxCycles;
+     bool programEnded = false;
+ 
+     // Executes one pair's upper and lower instructions; register results land in m_state right away.
++    // Fast blocks call the handler recorded for this pair. The interpreter (and PS2X_VU_NO_DIRECT)
++    // still goes through execUpper/execLower.
+     auto executePair = [&](const DecodedInstructionPair &decoded)
+     {
++        const bool direct = m_fastBlock != nullptr && !noDirect && directIds != nullptr;
++        const uint32_t directPair = direct ? m_fastBlock->startPair + m_fastIndex : 0u;
++        const bool directOk = direct && directPair < directIds->upper.size();
++        auto callUpper = [&]()
++        {
++            if (directOk)
++                g_vu1UpperFn[directIds->upper[directPair]](*this, decoded.upper);
++            else
++                execUpper(decoded.upper);
++        };
++        auto callLower = [&]()
++        {
++            if (directOk)
++                g_vu1LowerFn[directIds->lower[directPair]](*this, decoded.lower, vuData, dataSize);
++            else
++                execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
++        };
+         if (decoded.iBit)
+         {
+-            execUpper(decoded.upper);
++            callUpper();
+             float immediate = 0.0f;
+             std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
+             m_state.i = normalizeOperand(immediate);
+@@ -2136,22 +2196,22 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             std::memcpy(oldVf,
+                         m_state.vf[decoded.upperVfShadowReg],
+                         sizeof(oldVf));
+-            execUpper(decoded.upper);
++            callUpper();
+             std::memcpy(upperVf,
+                         m_state.vf[decoded.upperVfShadowReg],
+                         sizeof(upperVf));
+             std::memcpy(m_state.vf[decoded.upperVfShadowReg],
+                         oldVf,
+                         sizeof(oldVf));
+-            execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
++            callLower();
+             std::memcpy(m_state.vf[decoded.upperVfShadowReg],
+                         upperVf,
+                         sizeof(upperVf));
+         }
+         else
+         {
+-            execUpper(decoded.upper);
+-            execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
++            callUpper();
++            callLower();
+         }
+     };
+ 
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h b/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
+index ed0ee71..6e238af 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
+@@ -26,4 +26,54 @@ static inline int16_t IMM15(uint32_t i)
+     return (int16_t)(int32_t)((int32_t)(raw << 17) >> 17);
+ }
+ 
++// Direct handlers for the fast-block path. Ids are stored beside the decoded cache (see ps2_vu1_core.cpp);
++// execUpper/execLower keep their own switches for the interpreter and PS2X_VU_NO_DIRECT.
++#ifndef PS2_VU1_H
++class VU1Interpreter;
++#endif
++
++constexpr uint16_t kVu1UpperReserved = 0xC0;
++constexpr uint16_t kVu1UpperFnCount = kVu1UpperReserved + 1u;
++constexpr uint16_t kVu1LowerNop = 0;
++constexpr uint16_t kVu1LowerReserved = 0x1C0;
++constexpr uint16_t kVu1LowerFnCount = kVu1LowerReserved + 1u;
++
++using Vu1UpperFn = void (*)(VU1Interpreter &self, uint32_t instr);
++using Vu1LowerFn = void (*)(VU1Interpreter &self, uint32_t instr, uint8_t *vuData, uint32_t dataSize);
++
++extern Vu1UpperFn g_vu1UpperFn[kVu1UpperFnCount];
++extern Vu1LowerFn g_vu1LowerFn[kVu1LowerFnCount];
++
++inline uint16_t vu1UpperHandlerId(uint32_t instr)
++{
++    const uint32_t low11 = instr & 0x7FFu;
++    if (low11 == 0x2FFu || low11 == 0x33Cu)
++        return static_cast<uint16_t>(0x40u + ((instr & 0x3u) | ((instr >> 4) & 0x7Cu)));
++    const uint8_t op = static_cast<uint8_t>(instr & 0x3Fu);
++    if (op >= 0x3Cu)
++    {
++        const uint8_t special = static_cast<uint8_t>((instr & 0x3u) | ((instr >> 4) & 0x7Cu));
++        return static_cast<uint16_t>(0x40u + special);
++    }
++    if (op > 0x2Fu)
++        return kVu1UpperReserved;
++    return op;
++}
++
++inline uint16_t vu1LowerHandlerId(uint32_t instr)
++{
++    if (instr == 0u || instr == 0x8000033Cu)
++        return kVu1LowerNop;
++    const uint8_t opHi = static_cast<uint8_t>((instr >> 25) & 0x7Fu);
++    if (opHi != 0x40u)
++        return static_cast<uint16_t>(1u + opHi);
++    const uint8_t funct = static_cast<uint8_t>(instr & 0x3Fu);
++    if (funct >= 0x3Cu)
++    {
++        const uint8_t funct2 = static_cast<uint8_t>((instr & 0x3u) | ((instr >> 4) & 0x7Cu));
++        return static_cast<uint16_t>(0x140u + funct2);
++    }
++    return static_cast<uint16_t>(0x100u + funct);
++}
++
+ #endif
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
+index 94be789..c74bebe 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
+@@ -5,6 +5,7 @@
+ #include "ps2_vu1_detail.h"
+ 
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ 
+@@ -66,724 +67,749 @@ namespace
+     }
+ }
+ 
+-// ============================================================================
+-// Lower instructions
+-// ============================================================================
+-void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr)
++namespace
+ {
+-    (void)upperInstr;
+-    if (instr == 0x00000000 || instr == 0x8000033C) // NOP
+-        return;
++    bool g_vu1LowerReady = false;
+ 
+-    uint8_t opHi = (instr >> 25) & 0x7F;
+-    const uint32_t pcMask = microAddressMask();
+-
+-    // The lower instruction encoding uses bits 31:25 for the primary opcode
+-    switch (opHi)
+-    {
+-    case 0x00: // LQ (Load Quadword from VU data memory)
+-    {
+-        uint8_t it = FT(instr);  // VF destination
+-        uint8_t is = VIS(instr); // VI base
+-        uint8_t dest = (instr >> 21) & 0xF;
+-        int16_t imm = IMM11(instr);
+-        uint32_t addr = ((uint32_t)(int32_t)(m_state.vi[is] + imm)) * 16u;
+-        addr &= (dataSize - 1);
+-        if (addr + 16 <= dataSize)
+-        {
+-            float tmp[4];
+-            std::memcpy(tmp, vuData + addr, 16);
+-            applyDest(m_state.vf[it], tmp, dest);
+-        }
+-        return;
+-    }
+-    case 0x01: // SQ (Store Quadword to VU data memory)
+-    {
+-        uint8_t is = FS(instr);  // VF source
+-        uint8_t it = VIT(instr); // VI base
+-        uint8_t dest = (instr >> 21) & 0xF;
+-        int16_t imm = IMM11(instr);
+-        uint32_t addr = ((uint32_t)(int32_t)(m_state.vi[it] + imm)) * 16u;
+-        addr &= (dataSize - 1);
+-        if (addr + 16 <= dataSize)
+-        {
+-            uint32_t words[4]{};
+-            std::memcpy(words, m_state.vf[is], sizeof(words));
+-            queueStore(addr, words, dest);
+-        }
+-        return;
+-    }
+-    case 0x04: // ILW (Integer Load Word from VU data memory)
+-    {
+-        uint8_t it = VIT(instr); // VI destination
+-        uint8_t is = VIS(instr); // VI base
+-        uint8_t dest = (instr >> 21) & 0xF;
+-        int16_t imm = IMM11(instr);
+-        uint32_t addr = ((uint32_t)(int32_t)(m_state.vi[is] + imm)) * 16u;
+-        addr &= (dataSize - 1);
+-        if (addr + 16 <= dataSize)
+-        {
+-            int comp = 0;
+-            if (dest & 0x8)
+-                comp = 0;
+-            else if (dest & 0x4)
+-                comp = 1;
+-            else if (dest & 0x2)
+-                comp = 2;
+-            else
+-                comp = 3;
+-            uint32_t v;
+-            std::memcpy(&v, vuData + addr + comp * 4, 4);
+-            if (it != 0)
+-                m_state.vi[it] = (int32_t)(int16_t)(v & 0xFFFF);
+-        }
+-        return;
+-    }
+-    case 0x05: // ISW (Integer Store Word to VU data memory)
+-    {
+-        uint8_t it = VIT(instr); // VI source
+-        uint8_t is = VIS(instr); // VI base
+-        uint8_t dest = (instr >> 21) & 0xF;
+-        int16_t imm = IMM11(instr);
+-        uint32_t addr = ((uint32_t)(int32_t)(m_state.vi[is] + imm)) * 16u;
+-        addr &= (dataSize - 1);
+-        if (addr + 16 <= dataSize)
+-        {
+-            const uint32_t val = static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[it] & 0xFFFF));
+-            const uint32_t words[4] = {val, val, val, val};
+-            queueStore(addr, words, dest);
+-        }
+-        return;
+-    }
+-    case 0x08: // IADDIU
++    uint32_t lowerSpecialSample(uint32_t special)
+     {
+-        uint8_t it = VIT(instr);
+-        uint8_t is = VIS(instr);
+-        int16_t imm = (int16_t)(instr & 0x7FF) | ((instr >> 10) & 0x7800);
+-        if (it != 0)
+-            m_state.vi[it] = (int16_t)(m_state.vi[is] + imm);
+-        return;
++        // Bit 11 keeps funct2 0x30 from collapsing to the exact NOP encoding 0x8000033C.
++        return (0x40u << 25) | 0x800u | (special & 3u) | 0x3Cu | (((special >> 2) & 0x1Fu) << 6);
+     }
+-    case 0x09: // ISUBIU
+-    {
+-        uint8_t it = VIT(instr);
+-        uint8_t is = VIS(instr);
+-        int16_t imm = (int16_t)(instr & 0x7FF) | ((instr >> 10) & 0x7800);
+-        if (it != 0)
+-            m_state.vi[it] = (int16_t)(m_state.vi[is] - imm);
+-        return;
+-    }
+-    case 0x10: // FCEQ
+-    {
+-        uint32_t imm24 = instr & 0xFFFFFF;
+-        if (1 != 0)
+-            m_state.vi[1] = ((m_state.clip & 0xFFFFFF) == imm24) ? 1 : 0;
+-        return;
+-    }
+-    case 0x11: // FCSET
+-    {
+-        queueFcset(instr & 0xFFFFFFu);
+-        return;
+-    }
+-    case 0x12: // FCAND
+-    {
+-        uint32_t imm24 = instr & 0xFFFFFF;
+-        if (1 != 0)
+-            m_state.vi[1] = ((m_state.clip & imm24) != 0) ? 1 : 0;
+-        return;
+-    }
+-    case 0x13: // FCOR
+-    {
+-        uint32_t imm24 = instr & 0xFFFFFF;
+-        if (1 != 0)
+-            m_state.vi[1] = ((m_state.clip | imm24) == 0xFFFFFF) ? 1 : 0;
+-        return;
+-    }
+-    case 0x14: // FSEQ
+-    {
+-        const uint8_t it = VIT(instr);
+-        const uint16_t imm12 = static_cast<uint16_t>((((instr >> 21) & 0x1u) << 11) | (instr & 0x7FFu));
+-        if (it != 0)
+-            m_state.vi[it] = ((m_state.status & 0xFFFu) == imm12) ? 1 : 0;
+-        return;
+-    }
+-    case 0x15: // FSSET
+-    {
+-        const uint16_t imm12 = static_cast<uint16_t>((((instr >> 21) & 0x1u) << 11) | (instr & 0x7FFu));
+-        queueFsset(imm12);
+-        return;
+-    }
+-    case 0x16: // FSAND
+-    {
+-        const uint8_t it = VIT(instr);
+-        const uint16_t imm12 = static_cast<uint16_t>((((instr >> 21) & 0x1u) << 11) | (instr & 0x7FFu));
+-        if (it != 0)
+-            m_state.vi[it] = static_cast<int32_t>((m_state.status & 0xFFFu) & imm12);
+-        return;
+-    }
+-    case 0x17: // FSOR
+-    {
+-        const uint8_t it = VIT(instr);
+-        const uint16_t imm12 = static_cast<uint16_t>((((instr >> 21) & 0x1u) << 11) | (instr & 0x7FFu));
+-        if (it != 0)
+-            m_state.vi[it] = static_cast<int32_t>((m_state.status & 0xFFFu) | imm12);
+-        return;
+-    }
+-    case 0x18: // FMEQ
+-    {
+-        uint8_t it = VIT(instr);
+-        uint8_t is = VIS(instr);
+-        if (it != 0)
+-            m_state.vi[it] = ((m_state.mac & 0xFFFF) == (uint32_t)(uint16_t)m_state.vi[is]) ? 1 : 0;
+-        return;
+-    }
+-    case 0x1A: // FMAND
+-    {
+-        uint8_t it = VIT(instr);
+-        uint8_t is = VIS(instr);
+-        if (it != 0)
+-            m_state.vi[it] = (int32_t)(m_state.mac & (uint32_t)(uint16_t)m_state.vi[is]);
+-        return;
+-    }
+-    case 0x1B: // FMOR
+-    {
+-        uint8_t it = VIT(instr);
+-        uint8_t is = VIS(instr);
+-        if (it != 0)
+-            m_state.vi[it] = (int32_t)(m_state.mac | (uint32_t)(uint16_t)m_state.vi[is]);
+-        return;
+-    }
+-    case 0x1C: // FCGET
+-    {
+-        const uint8_t it = VIT(instr);
+-        if (it != 0)
+-            m_state.vi[it] = static_cast<int32_t>(m_state.clip & 0x0FFFu);
+-        return;
+-    }
+-    case 0x20: // B (unconditional branch)
+-    {
+-        int16_t imm = IMM11(instr);
+-        uint32_t target = (m_state.pc + 8 + imm * 8) & pcMask;
+-        m_state.branchPending = true;
+-        m_state.branchTarget = target;
+-        m_state.branchDelay = 1;
+-        return;
+-    }
+-    case 0x21: // BAL (Branch and link)
+-    {
+-        uint8_t it = VIT(instr);
+-        int16_t imm = IMM11(instr);
+-        uint32_t target = (m_state.pc + 8 + imm * 8) & pcMask;
+-        if (it != 0)
+-            m_state.vi[it] = (int32_t)((m_state.pc + 16) / 8);
+-        m_state.branchPending = true;
+-        m_state.branchTarget = target;
+-        m_state.branchDelay = 1;
+-        return;
+-    }
+-    case 0x24: // JR
+-    {
+-        uint8_t is = VIS(instr);
+-        uint32_t target = ((uint32_t)(uint16_t)readBranchVi(is) * 8u) & pcMask;
+-        m_state.branchPending = true;
+-        m_state.branchTarget = target;
+-        m_state.branchDelay = 1;
+-        return;
+-    }
+-    case 0x25: // JALR
+-    {
+-        uint8_t it = VIT(instr);
+-        uint8_t is = VIS(instr);
+-        uint32_t target = ((uint32_t)(uint16_t)readBranchVi(is) * 8u) & pcMask;
+-        if (it != 0)
+-            m_state.vi[it] = (int32_t)((m_state.pc + 16) / 8);
+-        m_state.branchPending = true;
+-        m_state.branchTarget = target;
+-        m_state.branchDelay = 1;
+-        return;
+-    }
+-    case 0x28: // IBEQ
++}
++
++Vu1LowerFn g_vu1LowerFn[kVu1LowerFnCount]{};
++
++void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr)
++{
++    (void)gs;
++    (void)memory;
++    (void)upperInstr;
++    if (!g_vu1LowerReady)
+     {
+-        uint8_t it = VIT(instr);
+-        uint8_t is = VIS(instr);
+-        int16_t imm = IMM11(instr);
+-        if ((int16_t)readBranchVi(is) == (int16_t)readBranchVi(it))
++        bool seen[kVu1LowerFnCount]{};
++        const auto reg = [&](uint32_t sample, Vu1LowerFn fn)
+         {
+-            uint32_t target = (m_state.pc + 8 + imm * 8) & pcMask;
+-            m_state.branchPending = true;
+-            m_state.branchTarget = target;
+-            m_state.branchDelay = 1;
+-        }
+-        return;
+-    }
+-    case 0x29: // IBNE
+-    {
+-        uint8_t it = VIT(instr);
+-        uint8_t is = VIS(instr);
+-        int16_t imm = IMM11(instr);
+-        if ((int16_t)readBranchVi(is) != (int16_t)readBranchVi(it))
++            const uint16_t id = vu1LowerHandlerId(sample);
++            if (id == kVu1LowerNop || id >= kVu1LowerFnCount || id == kVu1LowerReserved || seen[id] || fn == nullptr)
++                std::abort();
++            seen[id] = true;
++            g_vu1LowerFn[id] = fn;
++        };
++        const auto regHi = [&](uint32_t opHi, Vu1LowerFn fn)
+         {
+-            uint32_t target = (m_state.pc + 8 + imm * 8) & pcMask;
+-            m_state.branchPending = true;
+-            m_state.branchTarget = target;
+-            m_state.branchDelay = 1;
+-        }
+-        return;
+-    }
+-    case 0x2C: // IBLTZ
+-    {
+-        uint8_t is = VIS(instr);
+-        int16_t imm = IMM11(instr);
+-        if ((int16_t)readBranchVi(is) < 0)
++            reg((opHi << 25) | (opHi == 0u ? 1u : 0u), fn);
++        };
++        const auto regF = [&](uint32_t funct, Vu1LowerFn fn)
+         {
+-            uint32_t target = (m_state.pc + 8 + imm * 8) & pcMask;
+-            m_state.branchPending = true;
+-            m_state.branchTarget = target;
+-            m_state.branchDelay = 1;
+-        }
+-        return;
+-    }
+-    case 0x2D: // IBGTZ
+-    {
+-        uint8_t is = VIS(instr);
+-        int16_t imm = IMM11(instr);
+-        if ((int16_t)readBranchVi(is) > 0)
++            reg((0x40u << 25) | funct, fn);
++        };
++        const auto regF2 = [&](uint32_t special, Vu1LowerFn fn)
+         {
+-            uint32_t target = (m_state.pc + 8 + imm * 8) & pcMask;
+-            m_state.branchPending = true;
+-            m_state.branchTarget = target;
+-            m_state.branchDelay = 1;
+-        }
+-        return;
+-    }
+-    case 0x2E: // IBLEZ
+-    {
+-        uint8_t is = VIS(instr);
+-        int16_t imm = IMM11(instr);
+-        if ((int16_t)readBranchVi(is) <= 0)
++            reg(lowerSpecialSample(special), fn);
++        };
++
++        const Vu1LowerFn reserved = [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
+         {
+-            uint32_t target = (m_state.pc + 8 + imm * 8) & pcMask;
+-            m_state.branchPending = true;
+-            m_state.branchTarget = target;
+-            m_state.branchDelay = 1;
+-        }
+-        return;
++            self.reportReservedInstruction(false, word);
++        };
++        for (uint32_t i = 0; i < kVu1LowerFnCount; ++i)
++            g_vu1LowerFn[i] = reserved;
++        g_vu1LowerFn[kVu1LowerNop] = [](VU1Interpreter &, uint32_t, uint8_t *, uint32_t) {};
++
++        regHi(0x00, [](VU1Interpreter &self, uint32_t word, uint8_t *data, uint32_t size)
++              {
++                  const uint8_t it = FT(word);
++                  const uint8_t is = VIS(word);
++                  const uint8_t dest = (word >> 21) & 0xF;
++                  const int16_t imm = IMM11(word);
++                  uint32_t addr = (static_cast<uint32_t>(static_cast<int32_t>(self.m_state.vi[is] + imm))) * 16u;
++                  addr &= (size - 1);
++                  if (addr + 16 <= size)
++                  {
++                      float tmp[4];
++                      std::memcpy(tmp, data + addr, 16);
++                      self.applyDest(self.m_state.vf[it], tmp, dest);
++                  }
++              });
++        regHi(0x01, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t size)
++              {
++                  const uint8_t is = FS(word);
++                  const uint8_t it = VIT(word);
++                  const uint8_t dest = (word >> 21) & 0xF;
++                  const int16_t imm = IMM11(word);
++                  uint32_t addr = (static_cast<uint32_t>(static_cast<int32_t>(self.m_state.vi[it] + imm))) * 16u;
++                  addr &= (size - 1);
++                  if (addr + 16 <= size)
++                  {
++                      uint32_t words[4]{};
++                      std::memcpy(words, self.m_state.vf[is], sizeof(words));
++                      self.queueStore(addr, words, dest);
++                  }
++              });
++        regHi(0x04, [](VU1Interpreter &self, uint32_t word, uint8_t *data, uint32_t size)
++              {
++                  const uint8_t it = VIT(word);
++                  const uint8_t is = VIS(word);
++                  const uint8_t dest = (word >> 21) & 0xF;
++                  const int16_t imm = IMM11(word);
++                  uint32_t addr = (static_cast<uint32_t>(static_cast<int32_t>(self.m_state.vi[is] + imm))) * 16u;
++                  addr &= (size - 1);
++                  if (addr + 16 <= size)
++                  {
++                      int comp = 0;
++                      if (dest & 0x8)
++                          comp = 0;
++                      else if (dest & 0x4)
++                          comp = 1;
++                      else if (dest & 0x2)
++                          comp = 2;
++                      else
++                          comp = 3;
++                      uint32_t v;
++                      std::memcpy(&v, data + addr + comp * 4, 4);
++                      if (it != 0)
++                          self.m_state.vi[it] = (int32_t)(int16_t)(v & 0xFFFF);
++                  }
++              });
++        regHi(0x05, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t size)
++              {
++                  const uint8_t it = VIT(word);
++                  const uint8_t is = VIS(word);
++                  const uint8_t dest = (word >> 21) & 0xF;
++                  const int16_t imm = IMM11(word);
++                  uint32_t addr = (static_cast<uint32_t>(static_cast<int32_t>(self.m_state.vi[is] + imm))) * 16u;
++                  addr &= (size - 1);
++                  if (addr + 16 <= size)
++                  {
++                      const uint32_t val = static_cast<uint32_t>(static_cast<uint16_t>(self.m_state.vi[it] & 0xFFFF));
++                      const uint32_t words[4] = {val, val, val, val};
++                      self.queueStore(addr, words, dest);
++                  }
++              });
++        regHi(0x08, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t it = VIT(word);
++                  const uint8_t is = VIS(word);
++                  const int16_t imm = (int16_t)(word & 0x7FF) | ((word >> 10) & 0x7800);
++                  if (it != 0)
++                      self.m_state.vi[it] = (int16_t)(self.m_state.vi[is] + imm);
++              });
++        regHi(0x09, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t it = VIT(word);
++                  const uint8_t is = VIS(word);
++                  const int16_t imm = (int16_t)(word & 0x7FF) | ((word >> 10) & 0x7800);
++                  if (it != 0)
++                      self.m_state.vi[it] = (int16_t)(self.m_state.vi[is] - imm);
++              });
++        regHi(0x10, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint32_t imm24 = word & 0xFFFFFF;
++                  self.m_state.vi[1] = ((self.m_state.clip & 0xFFFFFF) == imm24) ? 1 : 0;
++              });
++        regHi(0x11, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              { self.queueFcset(word & 0xFFFFFFu); });
++        regHi(0x12, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint32_t imm24 = word & 0xFFFFFF;
++                  self.m_state.vi[1] = ((self.m_state.clip & imm24) != 0) ? 1 : 0;
++              });
++        regHi(0x13, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint32_t imm24 = word & 0xFFFFFF;
++                  self.m_state.vi[1] = ((self.m_state.clip | imm24) == 0xFFFFFF) ? 1 : 0;
++              });
++        regHi(0x14, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t it = VIT(word);
++                  const uint16_t imm12 = static_cast<uint16_t>((((word >> 21) & 0x1u) << 11) | (word & 0x7FFu));
++                  if (it != 0)
++                      self.m_state.vi[it] = ((self.m_state.status & 0xFFFu) == imm12) ? 1 : 0;
++              });
++        regHi(0x15, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint16_t imm12 = static_cast<uint16_t>((((word >> 21) & 0x1u) << 11) | (word & 0x7FFu));
++                  self.queueFsset(imm12);
++              });
++        regHi(0x16, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t it = VIT(word);
++                  const uint16_t imm12 = static_cast<uint16_t>((((word >> 21) & 0x1u) << 11) | (word & 0x7FFu));
++                  if (it != 0)
++                      self.m_state.vi[it] = static_cast<int32_t>((self.m_state.status & 0xFFFu) & imm12);
++              });
++        regHi(0x17, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t it = VIT(word);
++                  const uint16_t imm12 = static_cast<uint16_t>((((word >> 21) & 0x1u) << 11) | (word & 0x7FFu));
++                  if (it != 0)
++                      self.m_state.vi[it] = static_cast<int32_t>((self.m_state.status & 0xFFFu) | imm12);
++              });
++        regHi(0x18, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t it = VIT(word);
++                  const uint8_t is = VIS(word);
++                  if (it != 0)
++                      self.m_state.vi[it] = ((self.m_state.mac & 0xFFFF) == (uint32_t)(uint16_t)self.m_state.vi[is]) ? 1 : 0;
++              });
++        regHi(0x1A, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t it = VIT(word);
++                  const uint8_t is = VIS(word);
++                  if (it != 0)
++                      self.m_state.vi[it] = (int32_t)(self.m_state.mac & (uint32_t)(uint16_t)self.m_state.vi[is]);
++              });
++        regHi(0x1B, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t it = VIT(word);
++                  const uint8_t is = VIS(word);
++                  if (it != 0)
++                      self.m_state.vi[it] = (int32_t)(self.m_state.mac | (uint32_t)(uint16_t)self.m_state.vi[is]);
++              });
++        regHi(0x1C, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t it = VIT(word);
++                  if (it != 0)
++                      self.m_state.vi[it] = static_cast<int32_t>(self.m_state.clip & 0x0FFFu);
++              });
++        regHi(0x20, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const int16_t imm = IMM11(word);
++                  const uint32_t target = (self.m_state.pc + 8 + imm * 8) & self.microAddressMask();
++                  self.m_state.branchPending = true;
++                  self.m_state.branchTarget = target;
++                  self.m_state.branchDelay = 1;
++              });
++        regHi(0x21, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t it = VIT(word);
++                  const int16_t imm = IMM11(word);
++                  const uint32_t target = (self.m_state.pc + 8 + imm * 8) & self.microAddressMask();
++                  if (it != 0)
++                      self.m_state.vi[it] = (int32_t)((self.m_state.pc + 16) / 8);
++                  self.m_state.branchPending = true;
++                  self.m_state.branchTarget = target;
++                  self.m_state.branchDelay = 1;
++              });
++        regHi(0x24, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t is = VIS(word);
++                  const uint32_t target = ((uint32_t)(uint16_t)self.readBranchVi(is) * 8u) & self.microAddressMask();
++                  self.m_state.branchPending = true;
++                  self.m_state.branchTarget = target;
++                  self.m_state.branchDelay = 1;
++              });
++        regHi(0x25, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t it = VIT(word);
++                  const uint8_t is = VIS(word);
++                  const uint32_t target = ((uint32_t)(uint16_t)self.readBranchVi(is) * 8u) & self.microAddressMask();
++                  if (it != 0)
++                      self.m_state.vi[it] = (int32_t)((self.m_state.pc + 16) / 8);
++                  self.m_state.branchPending = true;
++                  self.m_state.branchTarget = target;
++                  self.m_state.branchDelay = 1;
++              });
++        regHi(0x28, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t it = VIT(word);
++                  const uint8_t is = VIS(word);
++                  const int16_t imm = IMM11(word);
++                  if ((int16_t)self.readBranchVi(is) == (int16_t)self.readBranchVi(it))
++                  {
++                      const uint32_t target = (self.m_state.pc + 8 + imm * 8) & self.microAddressMask();
++                      self.m_state.branchPending = true;
++                      self.m_state.branchTarget = target;
++                      self.m_state.branchDelay = 1;
++                  }
++              });
++        regHi(0x29, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t it = VIT(word);
++                  const uint8_t is = VIS(word);
++                  const int16_t imm = IMM11(word);
++                  if ((int16_t)self.readBranchVi(is) != (int16_t)self.readBranchVi(it))
++                  {
++                      const uint32_t target = (self.m_state.pc + 8 + imm * 8) & self.microAddressMask();
++                      self.m_state.branchPending = true;
++                      self.m_state.branchTarget = target;
++                      self.m_state.branchDelay = 1;
++                  }
++              });
++        regHi(0x2C, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t is = VIS(word);
++                  const int16_t imm = IMM11(word);
++                  if ((int16_t)self.readBranchVi(is) < 0)
++                  {
++                      const uint32_t target = (self.m_state.pc + 8 + imm * 8) & self.microAddressMask();
++                      self.m_state.branchPending = true;
++                      self.m_state.branchTarget = target;
++                      self.m_state.branchDelay = 1;
++                  }
++              });
++        regHi(0x2D, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t is = VIS(word);
++                  const int16_t imm = IMM11(word);
++                  if ((int16_t)self.readBranchVi(is) > 0)
++                  {
++                      const uint32_t target = (self.m_state.pc + 8 + imm * 8) & self.microAddressMask();
++                      self.m_state.branchPending = true;
++                      self.m_state.branchTarget = target;
++                      self.m_state.branchDelay = 1;
++                  }
++              });
++        regHi(0x2E, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t is = VIS(word);
++                  const int16_t imm = IMM11(word);
++                  if ((int16_t)self.readBranchVi(is) <= 0)
++                  {
++                      const uint32_t target = (self.m_state.pc + 8 + imm * 8) & self.microAddressMask();
++                      self.m_state.branchPending = true;
++                      self.m_state.branchTarget = target;
++                      self.m_state.branchDelay = 1;
++                  }
++              });
++        regHi(0x2F, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t is = VIS(word);
++                  const int16_t imm = IMM11(word);
++                  if ((int16_t)self.readBranchVi(is) >= 0)
++                  {
++                      const uint32_t target = (self.m_state.pc + 8 + imm * 8) & self.microAddressMask();
++                      self.m_state.branchPending = true;
++                      self.m_state.branchTarget = target;
++                      self.m_state.branchDelay = 1;
++                  }
++              });
++        regF(0x30, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++             {
++                 const uint8_t viT = VIT(word);
++                 const uint8_t viS = VIS(word);
++                 const uint8_t viD = VID(word);
++                 if (viD != 0)
++                     self.m_state.vi[viD] = (int16_t)(self.m_state.vi[viS] + self.m_state.vi[viT]);
++             });
++        regF(0x31, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++             {
++                 const uint8_t viT = VIT(word);
++                 const uint8_t viS = VIS(word);
++                 const uint8_t viD = VID(word);
++                 if (viD != 0)
++                     self.m_state.vi[viD] = (int16_t)(self.m_state.vi[viS] - self.m_state.vi[viT]);
++             });
++        regF(0x32, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++             {
++                 const int16_t imm5 = (int16_t)((int32_t)((word >> 6) & 0x1F) << 27 >> 27);
++                 const uint8_t viT = VIT(word);
++                 const uint8_t viS = VIS(word);
++                 if (viT != 0)
++                     self.m_state.vi[viT] = (int16_t)(self.m_state.vi[viS] + imm5);
++             });
++        regF(0x34, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++             {
++                 const uint8_t viT = VIT(word);
++                 const uint8_t viS = VIS(word);
++                 const uint8_t viD = VID(word);
++                 if (viD != 0)
++                     self.m_state.vi[viD] = self.m_state.vi[viS] & self.m_state.vi[viT];
++             });
++        regF(0x35, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++             {
++                 const uint8_t viT = VIT(word);
++                 const uint8_t viS = VIS(word);
++                 const uint8_t viD = VID(word);
++                 if (viD != 0)
++                     self.m_state.vi[viD] = self.m_state.vi[viS] | self.m_state.vi[viT];
++             });
++        regF2(0x30, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfT = FT(word);
++                  const uint8_t vfS = FS(word);
++                  const uint8_t dest = (word >> 21) & 0xF;
++                  float tmp[4];
++                  std::memcpy(tmp, self.m_state.vf[vfS], 16);
++                  self.applyDest(self.m_state.vf[vfT], tmp, dest);
++              });
++        regF2(0x31, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfT = FT(word);
++                  const uint8_t vfS = FS(word);
++                  const uint8_t dest = (word >> 21) & 0xF;
++                  float tmp[4] = {self.m_state.vf[vfS][1], self.m_state.vf[vfS][2], self.m_state.vf[vfS][3], self.m_state.vf[vfS][0]};
++                  self.applyDest(self.m_state.vf[vfT], tmp, dest);
++              });
++        regF2(0x34, [](VU1Interpreter &self, uint32_t word, uint8_t *data, uint32_t size)
++              {
++                  const uint8_t vfT = FT(word);
++                  const uint8_t viS = VIS(word);
++                  const uint8_t dest = (word >> 21) & 0xF;
++                  uint32_t addr = ((uint32_t)(uint16_t)self.m_state.vi[viS]) * 16u;
++                  addr &= (size - 1);
++                  if (addr + 16 <= size)
++                  {
++                      float tmp[4];
++                      std::memcpy(tmp, data + addr, 16);
++                      self.applyDest(self.m_state.vf[vfT], tmp, dest);
++                  }
++                  if (viS != 0)
++                      self.m_state.vi[viS] = (int16_t)(self.m_state.vi[viS] + 1);
++              });
++        regF2(0x35, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t size)
++              {
++                  const uint8_t vfS = FS(word);
++                  const uint8_t viT = VIT(word);
++                  const uint8_t dest = (word >> 21) & 0xF;
++                  uint32_t addr = ((uint32_t)(uint16_t)self.m_state.vi[viT]) * 16u;
++                  addr &= (size - 1);
++                  if (addr + 16 <= size)
++                  {
++                      uint32_t words[4]{};
++                      std::memcpy(words, self.m_state.vf[vfS], sizeof(words));
++                      self.queueStore(addr, words, dest);
++                  }
++                  if (viT != 0)
++                      self.m_state.vi[viT] = (int16_t)(self.m_state.vi[viT] + 1);
++              });
++        regF2(0x36, [](VU1Interpreter &self, uint32_t word, uint8_t *data, uint32_t size)
++              {
++                  const uint8_t vfT = FT(word);
++                  const uint8_t viS = VIS(word);
++                  const uint8_t dest = (word >> 21) & 0xF;
++                  if (viS != 0)
++                      self.m_state.vi[viS] = (int16_t)(self.m_state.vi[viS] - 1);
++                  uint32_t addr = ((uint32_t)(uint16_t)self.m_state.vi[viS]) * 16u;
++                  addr &= (size - 1);
++                  if (addr + 16 <= size)
++                  {
++                      float tmp[4];
++                      std::memcpy(tmp, data + addr, 16);
++                      self.applyDest(self.m_state.vf[vfT], tmp, dest);
++                  }
++              });
++        regF2(0x37, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t size)
++              {
++                  const uint8_t vfS = FS(word);
++                  const uint8_t viT = VIT(word);
++                  const uint8_t dest = (word >> 21) & 0xF;
++                  if (viT != 0)
++                      self.m_state.vi[viT] = (int16_t)(self.m_state.vi[viT] - 1);
++                  uint32_t addr = ((uint32_t)(uint16_t)self.m_state.vi[viT]) * 16u;
++                  addr &= (size - 1);
++                  if (addr + 16 <= size)
++                  {
++                      uint32_t words[4]{};
++                      std::memcpy(words, self.m_state.vf[vfS], sizeof(words));
++                      self.queueStore(addr, words, dest);
++                  }
++              });
++        regF2(0x38, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfT = FT(word);
++                  const uint8_t vfS = FS(word);
++                  const int fsf = (word >> 21) & 0x3;
++                  const int ftf = (word >> 23) & 0x3;
++                  const float num = self.normalizeOperand(self.m_state.vf[vfS][fsf]);
++                  const float den = self.normalizeOperand(self.m_state.vf[vfT][ftf]);
++                  uint32_t statusDi = 0u;
++                  float result = 0.0f;
++                  if (den == 0.0f)
++                  {
++                      statusDi = num == 0.0f ? 0x10u : 0x20u;
++                      result = std::signbit(num) != std::signbit(den)
++                                   ? -std::numeric_limits<float>::max()
++                                   : std::numeric_limits<float>::max();
++                  }
++                  else
++                      result = num / den;
++                  uint32_t ignoredFlags = 0u;
++                  result = self.normalizeResult(result, ignoredFlags);
++                  self.queueQ(result, 7u, statusDi);
++              });
++        regF2(0x39, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfT = FT(word);
++                  const int ftf = (word >> 23) & 0x3;
++                  const float val = self.normalizeOperand(self.m_state.vf[vfT][ftf]);
++                  self.queueQ(std::sqrt(std::fabs(val)), 7u, val < 0.0f ? 0x10u : 0u);
++              });
++        regF2(0x3A, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfT = FT(word);
++                  const uint8_t vfS = FS(word);
++                  const int fsf = (word >> 21) & 0x3;
++                  const int ftf = (word >> 23) & 0x3;
++                  const float num = self.normalizeOperand(self.m_state.vf[vfS][fsf]);
++                  const float radicand = self.normalizeOperand(self.m_state.vf[vfT][ftf]);
++                  const float den = std::sqrt(std::fabs(radicand));
++                  uint32_t statusDi = radicand < 0.0f ? 0x10u : 0u;
++                  float result = 0.0f;
++                  if (den != 0.0f)
++                      result = num / den;
++                  else
++                  {
++                      statusDi = num == 0.0f ? 0x10u : 0x20u;
++                      result = std::signbit(num)
++                                   ? -std::numeric_limits<float>::max()
++                                   : std::numeric_limits<float>::max();
++                  }
++                  uint32_t ignoredFlags = 0u;
++                  result = self.normalizeResult(result, ignoredFlags);
++                  self.queueQ(result, 13u, statusDi);
++              });
++        regF2(0x3B, [](VU1Interpreter &, uint32_t, uint8_t *, uint32_t) {});
++        regF2(0x3C, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfS = FS(word);
++                  const uint8_t viT = VIT(word);
++                  const uint32_t comp = (word >> 21) & 0x3u;
++                  uint32_t fval;
++                  std::memcpy(&fval, &self.m_state.vf[vfS][comp], 4);
++                  if (viT != 0)
++                      self.m_state.vi[viT] = (int32_t)(int16_t)(fval & 0xFFFF);
++              });
++        regF2(0x3D, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfT = FT(word);
++                  const uint8_t viS = VIS(word);
++                  const uint8_t dest = (word >> 21) & 0xF;
++                  float result[4];
++                  const int32_t val = (int32_t)(int16_t)(self.m_state.vi[viS] & 0xFFFF);
++                  std::memcpy(&result[0], &val, 4);
++                  result[1] = result[0];
++                  result[2] = result[0];
++                  result[3] = result[0];
++                  self.applyDest(self.m_state.vf[vfT], result, dest);
++              });
++        regF2(0x3E, [](VU1Interpreter &self, uint32_t word, uint8_t *data, uint32_t size)
++              {
++                  const uint8_t viT = VIT(word);
++                  const uint8_t viS = VIS(word);
++                  const uint8_t dest = (word >> 21) & 0xF;
++                  uint32_t addr = ((uint32_t)(uint16_t)self.m_state.vi[viS]) * 16u;
++                  addr &= (size - 1);
++                  if (addr + 16 <= size)
++                  {
++                      int comp = 0;
++                      if (dest & 0x8)
++                          comp = 0;
++                      else if (dest & 0x4)
++                          comp = 1;
++                      else if (dest & 0x2)
++                          comp = 2;
++                      else
++                          comp = 3;
++                      uint32_t v;
++                      std::memcpy(&v, data + addr + comp * 4, 4);
++                      if (viT != 0)
++                          self.m_state.vi[viT] = (int32_t)(int16_t)(v & 0xFFFF);
++                  }
++              });
++        regF2(0x3F, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t size)
++              {
++                  const uint8_t viT = VIT(word);
++                  const uint8_t viS = VIS(word);
++                  const uint8_t dest = (word >> 21) & 0xF;
++                  uint32_t addr = ((uint32_t)(uint16_t)self.m_state.vi[viS]) * 16u;
++                  addr &= (size - 1);
++                  if (addr + 16 <= size)
++                  {
++                      const uint32_t val = static_cast<uint32_t>(static_cast<uint16_t>(self.m_state.vi[viT] & 0xFFFF));
++                      const uint32_t words[4] = {val, val, val, val};
++                      self.queueStore(addr, words, dest);
++                  }
++              });
++        regF2(0x40, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfT = FT(word);
++                  const uint8_t dest = (word >> 21) & 0xF;
++                  const uint32_t x = (self.m_state.r >> 4) & 1u;
++                  const uint32_t y = (self.m_state.r >> 22) & 1u;
++                  self.m_state.r = ((self.m_state.r << 1) ^ x ^ y) & 0x007FFFFFu;
++                  self.m_state.r |= 0x3F800000u;
++                  float value = 0.0f;
++                  std::memcpy(&value, &self.m_state.r, sizeof(value));
++                  const float result[4] = {value, value, value, value};
++                  self.applyDest(self.m_state.vf[vfT], result, dest);
++              });
++        regF2(0x41, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfT = FT(word);
++                  const uint8_t dest = (word >> 21) & 0xF;
++                  float value = 0.0f;
++                  std::memcpy(&value, &self.m_state.r, sizeof(value));
++                  const float result[4] = {value, value, value, value};
++                  self.applyDest(self.m_state.vf[vfT], result, dest);
++              });
++        regF2(0x42, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfS = FS(word);
++                  const uint32_t component = (word >> 21) & 3u;
++                  uint32_t bits = 0u;
++                  std::memcpy(&bits, &self.m_state.vf[vfS][component], sizeof(bits));
++                  self.m_state.r = 0x3F800000u | (bits & 0x007FFFFFu);
++              });
++        regF2(0x43, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfS = FS(word);
++                  const uint32_t component = (word >> 21) & 3u;
++                  uint32_t bits = 0u;
++                  std::memcpy(&bits, &self.m_state.vf[vfS][component], sizeof(bits));
++                  self.m_state.r = 0x3F800000u | ((self.m_state.r ^ bits) & 0x007FFFFFu);
++              });
++        regF2(0x64, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfT = FT(word);
++                  const uint8_t dest = (word >> 21) & 0xF;
++                  float result[4] = {self.m_state.p, self.m_state.p, self.m_state.p, self.m_state.p};
++                  self.applyDest(self.m_state.vf[vfT], result, dest);
++              });
++        regF2(0x68, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t viT = VIT(word);
++                  if (viT != 0)
++                      self.m_state.vi[viT] = (int32_t)(self.m_state.top & 0x3FFu);
++              });
++        regF2(0x69, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t viT = VIT(word);
++                  if (viT != 0)
++                      self.m_state.vi[viT] = (int32_t)(self.m_state.itop & 0x3FFu);
++              });
++        regF2(0x6C, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t viS = VIS(word);
++                  self.startXgkick(static_cast<uint32_t>(static_cast<uint16_t>(self.m_state.vi[viS])));
++              });
++        regF2(0x70, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfS = FS(word);
++                  const float x = self.normalizeOperand(self.m_state.vf[vfS][0]);
++                  const float y = self.normalizeOperand(self.m_state.vf[vfS][1]);
++                  const float z = self.normalizeOperand(self.m_state.vf[vfS][2]);
++                  self.queueP(x * x + y * y + z * z, 11u);
++              });
++        regF2(0x71, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfS = FS(word);
++                  const float x = self.normalizeOperand(self.m_state.vf[vfS][0]);
++                  const float y = self.normalizeOperand(self.m_state.vf[vfS][1]);
++                  const float z = self.normalizeOperand(self.m_state.vf[vfS][2]);
++                  const float sum = x * x + y * y + z * z;
++                  self.queueP(sum != 0.0f ? 1.0f / sum : sum, 18u);
++              });
++        regF2(0x72, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfS = FS(word);
++                  const float x = self.normalizeOperand(self.m_state.vf[vfS][0]);
++                  const float y = self.normalizeOperand(self.m_state.vf[vfS][1]);
++                  const float z = self.normalizeOperand(self.m_state.vf[vfS][2]);
++                  self.queueP(std::sqrt(x * x + y * y + z * z), 18u);
++              });
++        regF2(0x73, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfS = FS(word);
++                  const float x = self.normalizeOperand(self.m_state.vf[vfS][0]);
++                  const float y = self.normalizeOperand(self.m_state.vf[vfS][1]);
++                  const float z = self.normalizeOperand(self.m_state.vf[vfS][2]);
++                  const float len = std::sqrt(x * x + y * y + z * z);
++                  self.queueP(len != 0.0f ? 1.0f / len : len, 24u);
++              });
++        regF2(0x74, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfS = FS(word);
++                  const float x = self.normalizeOperand(self.m_state.vf[vfS][0]);
++                  const float y = self.normalizeOperand(self.m_state.vf[vfS][1]);
++                  self.queueP(x != 0.0f ? vuEatan(y / x) : 0.0f, 54u);
++              });
++        regF2(0x75, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfS = FS(word);
++                  const float x = self.normalizeOperand(self.m_state.vf[vfS][0]);
++                  const float z = self.normalizeOperand(self.m_state.vf[vfS][2]);
++                  self.queueP(x != 0.0f ? vuEatan(z / x) : 0.0f, 54u);
++              });
++        regF2(0x76, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfS = FS(word);
++                  float sum = 0.0f;
++                  for (uint32_t component = 0; component < 4u; ++component)
++                      sum += self.normalizeOperand(self.m_state.vf[vfS][component]);
++                  self.queueP(sum, 12u);
++              });
++        regF2(0x77, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfS = FS(word);
++                  const uint32_t component = (word >> 21) & 3u;
++                  const float value = self.normalizeOperand(self.m_state.vf[vfS][component]);
++                  float result = value;
++                  if (result >= 0.0f)
++                  {
++                      result = std::sqrt(result);
++                      if (result != 0.0f)
++                          result = 1.0f / result;
++                  }
++                  self.queueP(result, 18u);
++              });
++        regF2(0x78, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfS = FS(word);
++                  const uint32_t component = (word >> 21) & 3u;
++                  const float value = self.normalizeOperand(self.m_state.vf[vfS][component]);
++                  self.queueP(value >= 0.0f ? std::sqrt(value) : value, 12u);
++              });
++        regF2(0x79, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfS = FS(word);
++                  const uint32_t component = (word >> 21) & 3u;
++                  const float value = self.normalizeOperand(self.m_state.vf[vfS][component]);
++                  self.queueP(vuEsin(value), 29u);
++              });
++        regF2(0x7A, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfS = FS(word);
++                  const uint32_t component = (word >> 21) & 3u;
++                  const float value = self.normalizeOperand(self.m_state.vf[vfS][component]);
++                  self.queueP(value != 0.0f ? 1.0f / value : value, 12u);
++              });
++        regF2(0x7B, [](VU1Interpreter &, uint32_t, uint8_t *, uint32_t) {});
++        regF2(0x7C, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfS = FS(word);
++                  const uint32_t component = (word >> 21) & 3u;
++                  self.queueP(vuEatan(self.normalizeOperand(self.m_state.vf[vfS][component])), 54u);
++              });
++        regF2(0x7D, [](VU1Interpreter &self, uint32_t word, uint8_t *, uint32_t)
++              {
++                  const uint8_t vfS = FS(word);
++                  const uint32_t component = (word >> 21) & 3u;
++                  self.queueP(vuEexp(self.normalizeOperand(self.m_state.vf[vfS][component])), 44u);
++              });
++        g_vu1LowerReady = true;
+     }
+-    case 0x2F: // IBGEZ
+-    {
+-        uint8_t is = VIS(instr);
+-        int16_t imm = IMM11(instr);
+-        if ((int16_t)readBranchVi(is) >= 0)
+-        {
+-            uint32_t target = (m_state.pc + 8 + imm * 8) & pcMask;
+-            m_state.branchPending = true;
+-            m_state.branchTarget = target;
+-            m_state.branchDelay = 1;
+-        }
++
++    if (instr == 0x00000000 || instr == 0x8000033C)
+         return;
+-    }
+ 
+-    case 0x40: // Lower1 / lower special. Bit31 set; low 6 bits select integer or special op.
++    const uint8_t opHi = (instr >> 25) & 0x7F;
++    switch (opHi)
+     {
+-        const uint8_t funct = instr & 0x3Fu;
+-        const uint8_t vfT = FT(instr);
+-        const uint8_t vfS = FS(instr);
+-        const uint8_t viT = VIT(instr);
+-        const uint8_t viS = VIS(instr);
+-        const uint8_t viD = VID(instr);
+-        const uint8_t dest = (instr >> 21) & 0xF;
+-
+-        switch (funct)
+-        {
+-        case 0x30: // IADD
+-            if (viD != 0)
+-                m_state.vi[viD] = (int16_t)(m_state.vi[viS] + m_state.vi[viT]);
+-            return;
+-        case 0x31: // ISUB
+-            if (viD != 0)
+-                m_state.vi[viD] = (int16_t)(m_state.vi[viS] - m_state.vi[viT]);
+-            return;
+-        case 0x32: // IADDI
+-        {
+-            int16_t imm5 = (int16_t)((int32_t)((instr >> 6) & 0x1F) << 27 >> 27);
+-            if (viT != 0)
+-                m_state.vi[viT] = (int16_t)(m_state.vi[viS] + imm5);
+-            return;
+-        }
+-        case 0x34: // IAND
+-            if (viD != 0)
+-                m_state.vi[viD] = m_state.vi[viS] & m_state.vi[viT];
+-            return;
+-        case 0x35: // IOR
+-            if (viD != 0)
+-                m_state.vi[viD] = m_state.vi[viS] | m_state.vi[viT];
+-            return;
+-
+-        case 0x3C:
+-        case 0x3D:
+-        case 0x3E:
+-        case 0x3F: // Lower1 special. Dobie decodes this as (instr & 3) | ((instr >> 4) & 0x7C).
+-        {
+-            const uint8_t funct2 = (uint8_t)((instr & 0x3u) | ((instr >> 4) & 0x7Cu));
+-            switch (funct2)
+-            {
+-            case 0x30: // MOVE
+-            {
+-                float tmp[4];
+-                std::memcpy(tmp, m_state.vf[vfS], 16);
+-                applyDest(m_state.vf[vfT], tmp, dest);
+-                return;
+-            }
+-            case 0x31: // MR32 (rotate right by 32 bits = shift xyzw -> yzwx)
+-            {
+-                float tmp[4] = {m_state.vf[vfS][1], m_state.vf[vfS][2], m_state.vf[vfS][3], m_state.vf[vfS][0]};
+-                applyDest(m_state.vf[vfT], tmp, dest);
+-                return;
+-            }
+-            case 0x34: // LQI (Load Quadword, post-increment)
+-            {
+-                uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viS]) * 16u;
+-                addr &= (dataSize - 1);
+-                if (addr + 16 <= dataSize)
+-                {
+-                    float tmp[4];
+-                    std::memcpy(tmp, vuData + addr, 16);
+-                    applyDest(m_state.vf[vfT], tmp, dest);
+-                }
+-                if (viS != 0)
+-                    m_state.vi[viS] = (int16_t)(m_state.vi[viS] + 1);
+-                return;
+-            }
+-            case 0x35: // SQI (Store Quadword, post-increment)
+-            {
+-                uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viT]) * 16u;
+-                addr &= (dataSize - 1);
+-                if (addr + 16 <= dataSize)
+-                {
+-                    uint32_t words[4]{};
+-                    std::memcpy(words, m_state.vf[vfS], sizeof(words));
+-                    queueStore(addr, words, dest);
+-                }
+-                if (viT != 0)
+-                    m_state.vi[viT] = (int16_t)(m_state.vi[viT] + 1);
+-                return;
+-            }
+-            case 0x36: // LQD (Load Quadword, pre-decrement)
+-            {
+-                if (viS != 0)
+-                    m_state.vi[viS] = (int16_t)(m_state.vi[viS] - 1);
+-                uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viS]) * 16u;
+-                addr &= (dataSize - 1);
+-                if (addr + 16 <= dataSize)
+-                {
+-                    float tmp[4];
+-                    std::memcpy(tmp, vuData + addr, 16);
+-                    applyDest(m_state.vf[vfT], tmp, dest);
+-                }
+-                return;
+-            }
+-            case 0x37: // SQD (Store Quadword, pre-decrement)
+-            {
+-                if (viT != 0)
+-                    m_state.vi[viT] = (int16_t)(m_state.vi[viT] - 1);
+-                uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viT]) * 16u;
+-                addr &= (dataSize - 1);
+-                if (addr + 16 <= dataSize)
+-                {
+-                    uint32_t words[4]{};
+-                    std::memcpy(words, m_state.vf[vfS], sizeof(words));
+-                    queueStore(addr, words, dest);
+-                }
+-                return;
+-            }
+-            case 0x38: // DIV
+-            {
+-                int fsf = (instr >> 21) & 0x3;
+-                int ftf = (instr >> 23) & 0x3;
+-                const float num = normalizeOperand(m_state.vf[vfS][fsf]);
+-                const float den = normalizeOperand(m_state.vf[vfT][ftf]);
+-                uint32_t statusDi = 0u;
+-                float result = 0.0f;
+-                if (den == 0.0f)
+-                {
+-                    statusDi = num == 0.0f ? 0x10u : 0x20u;
+-                    result = std::signbit(num) != std::signbit(den)
+-                                 ? -std::numeric_limits<float>::max()
+-                                 : std::numeric_limits<float>::max();
+-                }
+-                else
+-                {
+-                    result = num / den;
+-                }
+-                uint32_t ignoredFlags = 0u;
+-                result = normalizeResult(result, ignoredFlags);
+-                queueQ(result, 7u, statusDi);
+-                return;
+-            }
+-            case 0x39: // SQRT
+-            {
+-                int ftf = (instr >> 23) & 0x3;
+-                const float val = normalizeOperand(m_state.vf[vfT][ftf]);
+-                queueQ(std::sqrt(std::fabs(val)), 7u,
+-                       val < 0.0f ? 0x10u : 0u);
+-                return;
+-            }
+-            case 0x3A: // RSQRT
+-            {
+-                int fsf = (instr >> 21) & 0x3;
+-                int ftf = (instr >> 23) & 0x3;
+-                const float num = normalizeOperand(m_state.vf[vfS][fsf]);
+-                const float radicand = normalizeOperand(m_state.vf[vfT][ftf]);
+-                const float den = std::sqrt(std::fabs(radicand));
+-                uint32_t statusDi = radicand < 0.0f ? 0x10u : 0u;
+-                float result = 0.0f;
+-                if (den != 0.0f)
+-                    result = num / den;
+-                else
+-                {
+-                    statusDi = num == 0.0f ? 0x10u : 0x20u;
+-                    result = std::signbit(num)
+-                                 ? -std::numeric_limits<float>::max()
+-                                 : std::numeric_limits<float>::max();
+-                }
+-                uint32_t ignoredFlags = 0u;
+-                result = normalizeResult(result, ignoredFlags);
+-                queueQ(result, 13u, statusDi);
+-                return;
+-            }
+-            case 0x3B: // WAITQ
+-                return;
+-            case 0x3C: // MTIR (Move To Integer Register)
+-            {
+-                // MTIR encodes a two-bit fsf component selector in bits
+-                // 22:21. It is not a four-bit destination mask.
+-                const uint32_t comp = (instr >> 21) & 0x3u;
+-                uint32_t fval;
+-                std::memcpy(&fval, &m_state.vf[vfS][comp], 4);
+-                if (viT != 0)
+-                    m_state.vi[viT] = (int32_t)(int16_t)(fval & 0xFFFF);
+-                return;
+-            }
+-            case 0x3D: // MFIR (Move From Integer Register)
+-            {
+-                float result[4];
+-                int32_t val = (int32_t)(int16_t)(m_state.vi[viS] & 0xFFFF);
+-                std::memcpy(&result[0], &val, 4);
+-                result[1] = result[0];
+-                result[2] = result[0];
+-                result[3] = result[0];
+-                applyDest(m_state.vf[vfT], result, dest);
+-                return;
+-            }
+-            case 0x3E: // ILWR - integer load word from address in VI[is]
+-            {
+-                uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viS]) * 16u;
+-                addr &= (dataSize - 1);
+-                if (addr + 16 <= dataSize)
+-                {
+-                    int comp = 0;
+-                    if (dest & 0x8)
+-                        comp = 0;
+-                    else if (dest & 0x4)
+-                        comp = 1;
+-                    else if (dest & 0x2)
+-                        comp = 2;
+-                    else
+-                        comp = 3;
+-                    uint32_t v;
+-                    std::memcpy(&v, vuData + addr + comp * 4, 4);
+-                    if (viT != 0)
+-                        m_state.vi[viT] = (int32_t)(int16_t)(v & 0xFFFF);
+-                }
+-                return;
+-            }
+-            case 0x3F: // ISWR - integer store word to address in VI[is]
+-            {
+-                uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viS]) * 16u;
+-                addr &= (dataSize - 1);
+-                if (addr + 16 <= dataSize)
+-                {
+-                    const uint32_t val =
+-                        static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[viT] & 0xFFFF));
+-                    const uint32_t words[4] = {val, val, val, val};
+-                    queueStore(addr, words, dest);
+-                }
+-                return;
+-            }
+-            case 0x40: // RNEXT
+-            {
+-                const uint32_t x = (m_state.r >> 4) & 1u;
+-                const uint32_t y = (m_state.r >> 22) & 1u;
+-                m_state.r = ((m_state.r << 1) ^ x ^ y) & 0x007FFFFFu;
+-                m_state.r |= 0x3F800000u;
+-                float value = 0.0f;
+-                std::memcpy(&value, &m_state.r, sizeof(value));
+-                const float result[4] = {value, value, value, value};
+-                applyDest(m_state.vf[vfT], result, dest);
+-                return;
+-            }
+-            case 0x41: // RGET
+-            {
+-                float value = 0.0f;
+-                std::memcpy(&value, &m_state.r, sizeof(value));
+-                const float result[4] = {value, value, value, value};
+-                applyDest(m_state.vf[vfT], result, dest);
+-                return;
+-            }
+-            case 0x42: // RINIT
+-            {
+-                const uint32_t component = (instr >> 21) & 3u;
+-                uint32_t bits = 0u;
+-                std::memcpy(&bits, &m_state.vf[vfS][component], sizeof(bits));
+-                m_state.r = 0x3F800000u | (bits & 0x007FFFFFu);
+-                return;
+-            }
+-            case 0x43: // RXOR
+-            {
+-                const uint32_t component = (instr >> 21) & 3u;
+-                uint32_t bits = 0u;
+-                std::memcpy(&bits, &m_state.vf[vfS][component], sizeof(bits));
+-                m_state.r = 0x3F800000u | ((m_state.r ^ bits) & 0x007FFFFFu);
+-                return;
+-            }
+-            case 0x64: // MFP (Move From P register)
+-            {
+-                float result[4] = {m_state.p, m_state.p, m_state.p, m_state.p};
+-                applyDest(m_state.vf[vfT], result, dest);
+-                return;
+-            }
+-            case 0x68: // XTOP - move current VIF1 TOP into VI register
+-            {
+-                if (viT != 0)
+-                    m_state.vi[viT] = (int32_t)(m_state.top & 0x3FFu);
+-                return;
+-            }
+-            case 0x69: // XITOP - move current VIF1 ITOP into VI register
+-            {
+-                if (viT != 0)
+-                    m_state.vi[viT] = (int32_t)(m_state.itop & 0x3FFu);
+-                return;
+-            }
+-            case 0x6C: // XGKICK - send GIF packet from VU1 data memory
+-                startXgkick(static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[viS])));
+-                return;
+-            case 0x70: // ESADD
+-            {
+-                const float x = normalizeOperand(m_state.vf[vfS][0]);
+-                const float y = normalizeOperand(m_state.vf[vfS][1]);
+-                const float z = normalizeOperand(m_state.vf[vfS][2]);
+-                queueP(x * x + y * y + z * z, 11u);
+-                return;
+-            }
+-            case 0x71: // ERSADD
+-            {
+-                const float x = normalizeOperand(m_state.vf[vfS][0]);
+-                const float y = normalizeOperand(m_state.vf[vfS][1]);
+-                const float z = normalizeOperand(m_state.vf[vfS][2]);
+-                const float sum = x * x + y * y + z * z;
+-                queueP(sum != 0.0f ? 1.0f / sum : sum, 18u);
+-                return;
+-            }
+-            case 0x72: // ELENG
+-            {
+-                const float x = normalizeOperand(m_state.vf[vfS][0]);
+-                const float y = normalizeOperand(m_state.vf[vfS][1]);
+-                const float z = normalizeOperand(m_state.vf[vfS][2]);
+-                queueP(std::sqrt(x * x + y * y + z * z), 18u);
+-                return;
+-            }
+-            case 0x73: // ERLENG
+-            {
+-                const float x = normalizeOperand(m_state.vf[vfS][0]);
+-                const float y = normalizeOperand(m_state.vf[vfS][1]);
+-                const float z = normalizeOperand(m_state.vf[vfS][2]);
+-                const float len = std::sqrt(x * x + y * y + z * z);
+-                queueP(len != 0.0f ? 1.0f / len : len, 24u);
+-                return;
+-            }
+-            case 0x74: // EATANxy
+-            {
+-                const float x = normalizeOperand(m_state.vf[vfS][0]);
+-                const float y = normalizeOperand(m_state.vf[vfS][1]);
+-                queueP(x != 0.0f ? vuEatan(y / x) : 0.0f, 54u);
+-                return;
+-            }
+-            case 0x75: // EATANxz
+-            {
+-                const float x = normalizeOperand(m_state.vf[vfS][0]);
+-                const float z = normalizeOperand(m_state.vf[vfS][2]);
+-                queueP(x != 0.0f ? vuEatan(z / x) : 0.0f, 54u);
+-                return;
+-            }
+-            case 0x76: // ESUM
+-            {
+-                float sum = 0.0f;
+-                for (uint32_t component = 0; component < 4u; ++component)
+-                    sum += normalizeOperand(m_state.vf[vfS][component]);
+-                queueP(sum, 12u);
+-                return;
+-            }
+-            case 0x77: // ERSQRT
+-            {
+-                const uint32_t component = (instr >> 21) & 3u;
+-                const float value = normalizeOperand(m_state.vf[vfS][component]);
+-                float result = value;
+-                if (result >= 0.0f)
+-                {
+-                    result = std::sqrt(result);
+-                    if (result != 0.0f)
+-                        result = 1.0f / result;
+-                }
+-                queueP(result, 18u);
+-                return;
+-            }
+-            case 0x78: // ESQRT
+-            {
+-                const uint32_t component = (instr >> 21) & 3u;
+-                const float value = normalizeOperand(m_state.vf[vfS][component]);
+-                queueP(value >= 0.0f ? std::sqrt(value) : value, 12u);
+-                return;
+-            }
+-            case 0x79: // ESIN
+-            {
+-                const uint32_t component = (instr >> 21) & 3u;
+-                const float value = normalizeOperand(m_state.vf[vfS][component]);
+-                queueP(vuEsin(value), 29u);
+-                return;
+-            }
+-            case 0x7A: // ERCPR
+-            {
+-                const uint32_t component = (instr >> 21) & 3u;
+-                const float value = normalizeOperand(m_state.vf[vfS][component]);
+-                queueP(value != 0.0f ? 1.0f / value : value, 12u);
+-                return;
+-            }
+-            case 0x7B: // WAITP
+-                return;
+-            case 0x7C: // EATAN
+-            {
+-                const uint32_t component = (instr >> 21) & 3u;
+-                queueP(vuEatan(normalizeOperand(m_state.vf[vfS][component])), 54u);
+-                return;
+-            }
+-            case 0x7D: // EEXP
+-            {
+-                const uint32_t component = (instr >> 21) & 3u;
+-                queueP(vuEexp(normalizeOperand(m_state.vf[vfS][component])), 44u);
+-                return;
+-            }
+-            default:
+-                reportReservedInstruction(false, instr);
+-                return;
+-            }
+-        }
+-        default:
+-            reportReservedInstruction(false, instr);
+-            return;
+-        }
+-    }
++    case 0x00: case 0x01: case 0x04: case 0x05:
++    case 0x08: case 0x09:
++    case 0x10: case 0x11: case 0x12: case 0x13:
++    case 0x14: case 0x15: case 0x16: case 0x17:
++    case 0x18: case 0x1A: case 0x1B: case 0x1C:
++    case 0x20: case 0x21: case 0x24: case 0x25:
++    case 0x28: case 0x29:
++    case 0x2C: case 0x2D: case 0x2E: case 0x2F:
++    case 0x40:
++        g_vu1LowerFn[vu1LowerHandlerId(instr)](*this, instr, vuData, dataSize);
++        return;
+     default:
+-        reportReservedInstruction(false, instr);
+-        break;
++        g_vu1LowerFn[kVu1LowerReserved](*this, instr, vuData, dataSize);
++        return;
+     }
+ }
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+index f72b9e0..5c85f45 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+@@ -2,6 +2,7 @@
+ #include "ps2_vu1_detail.h"
+ 
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ 
+@@ -18,491 +19,292 @@ namespace
+     }
+ }
+ 
+-// ============================================================================
+-// Upper instructions (FMAC pipeline)
+-// ============================================================================
+-void VU1Interpreter::execUpper(uint32_t instr)
++namespace
+ {
+-    m_currentUpperInstruction = instr;
+-    if ((instr & 0x7FFu) == 0x2FFu || (instr & 0x7FFu) == 0x33Cu)
+-        return; // NOP (special 0x2F/0x30): skip the operand normalization below
+-    uint8_t dest = DEST(instr);
+-    uint8_t ft = FT(instr);
+-    uint8_t fs = FS(instr);
+-    uint8_t fd = FD(instr);
+-    uint8_t op = instr & 0x3F;
+-
+-    float *vd = m_state.vf[fd];
+-    float normalizedVs[4];
+-    float normalizedVt[4];
+-    float normalizedAcc[4];
+-    for (uint32_t component = 0; component < 4u; ++component)
++    struct UOp
+     {
+-        normalizedVs[component] = normalizeOperand(m_state.vf[fs][component]);
+-        normalizedVt[component] = normalizeOperand(m_state.vf[ft][component]);
+-        normalizedAcc[component] = normalizeOperand(m_state.acc[component]);
+-    }
+-    const float *vs = normalizedVs;
+-    const float *vt = normalizedVt;
+-    const float *acc = normalizedAcc;
+-    const float q = normalizeOperand(m_state.q);
+-    const float i = normalizeOperand(m_state.i);
+-    float result[4];
++        uint8_t dest = 0;
++        uint8_t ft = 0;
++        uint8_t fs = 0;
++        uint8_t fd = 0;
++        float *vd = nullptr;
++        float vs[4]{};
++        float vt[4]{};
++        float acc[4]{};
++        float q = 0.0f;
++        float i = 0.0f;
++        float result[4]{};
++    };
+ 
+-    // Upper opcode decoding (bits 5:0 of upper word)
+-    switch (op)
+-    {
+-    case 0x00:
+-    case 0x01:
+-    case 0x02:
+-    case 0x03: // ADDbc
+-    {
+-        float bc = broadcast(vt, op & 3);
+-        for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] + bc;
+-        applyFmacDest(vd, result, dest);
+-        return;
+-    }
+-    case 0x04:
+-    case 0x05:
+-    case 0x06:
+-    case 0x07: // SUBbc
+-    {
+-        float bc = broadcast(vt, op & 3);
+-        for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] - bc;
+-        applyFmacDest(vd, result, dest);
+-        return;
+-    }
+-    case 0x08:
+-    case 0x09:
+-    case 0x0A:
+-    case 0x0B: // MADDbc
+-    {
+-        float bc = broadcast(vt, op & 3);
+-        for (int c = 0; c < 4; c++)
+-            result[c] = acc[c] + vs[c] * bc;
+-        applyFmacDest(vd, result, dest);
+-        return;
+-    }
+-    case 0x0C:
+-    case 0x0D:
+-    case 0x0E:
+-    case 0x0F: // MSUBbc
+-    {
+-        float bc = broadcast(vt, op & 3);
+-        for (int c = 0; c < 4; c++)
+-            result[c] = acc[c] - vs[c] * bc;
+-        applyFmacDest(vd, result, dest);
+-        return;
+-    }
+-    case 0x10:
+-    case 0x11:
+-    case 0x12:
+-    case 0x13: // MAXbc
+-    {
+-        float bc = broadcast(vt, op & 3);
+-        for (int c = 0; c < 4; c++)
+-            result[c] = (vs[c] > bc) ? vs[c] : bc;
+-        applyDest(vd, result, dest);
+-        return;
+-    }
+-    case 0x14:
+-    case 0x15:
+-    case 0x16:
+-    case 0x17: // MINIbc
+-    {
+-        float bc = broadcast(vt, op & 3);
+-        for (int c = 0; c < 4; c++)
+-            result[c] = (vs[c] < bc) ? vs[c] : bc;
+-        applyDest(vd, result, dest);
+-        return;
+-    }
+-    case 0x18:
+-    case 0x19:
+-    case 0x1A:
+-    case 0x1B: // MULbc
++    void (*g_loadUpper)(VU1Interpreter &, uint32_t, UOp &) = nullptr;
++    bool g_vu1UpperReady = false;
++
++    uint32_t upperSpecialSample(uint32_t special)
+     {
+-        float bc = broadcast(vt, op & 3);
+-        for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] * bc;
+-        applyFmacDest(vd, result, dest);
+-        return;
++        return (special & 3u) | 0x3Cu | (((special >> 2) & 0x1Fu) << 6);
+     }
+-    case 0x1C: // MULq
+-        for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] * q;
+-        applyFmacDest(vd, result, dest);
+-        return;
+-    case 0x1D: // MAXi
+-        for (int c = 0; c < 4; c++)
+-            result[c] = (vs[c] > i) ? vs[c] : i;
+-        applyDest(vd, result, dest);
+-        return;
+-    case 0x1E: // MULi
+-        for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] * i;
+-        applyFmacDest(vd, result, dest);
+-        return;
+-    case 0x1F: // MINIi
+-        for (int c = 0; c < 4; c++)
+-            result[c] = (vs[c] < i) ? vs[c] : i;
+-        applyDest(vd, result, dest);
+-        return;
+-    case 0x20: // ADDq
+-        for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] + q;
+-        applyFmacDest(vd, result, dest);
+-        return;
+-    case 0x21: // MADDq
+-        for (int c = 0; c < 4; c++)
+-            result[c] = acc[c] + vs[c] * q;
+-        applyFmacDest(vd, result, dest);
+-        return;
+-    case 0x22: // ADDi
+-        for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] + i;
+-        applyFmacDest(vd, result, dest);
+-        return;
+-    case 0x23: // MADDi
+-        for (int c = 0; c < 4; c++)
+-            result[c] = acc[c] + vs[c] * i;
+-        applyFmacDest(vd, result, dest);
+-        return;
+-    case 0x24: // SUBq
+-        for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] - q;
+-        applyFmacDest(vd, result, dest);
+-        return;
+-    case 0x25: // MSUBq
+-        for (int c = 0; c < 4; c++)
+-            result[c] = acc[c] - vs[c] * q;
+-        applyFmacDest(vd, result, dest);
+-        return;
+-    case 0x26: // SUBi
+-        for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] - i;
+-        applyFmacDest(vd, result, dest);
+-        return;
+-    case 0x27: // MSUBi
+-        for (int c = 0; c < 4; c++)
+-            result[c] = acc[c] - vs[c] * i;
+-        applyFmacDest(vd, result, dest);
+-        return;
+-    case 0x28: // ADD
+-        for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] + vt[c];
+-        applyFmacDest(vd, result, dest);
+-        return;
+-    case 0x29: // MADD
+-        for (int c = 0; c < 4; c++)
+-            result[c] = acc[c] + vs[c] * vt[c];
+-        applyFmacDest(vd, result, dest);
+-        return;
+-    case 0x2A: // MUL
+-        for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] * vt[c];
+-        applyFmacDest(vd, result, dest);
+-        return;
+-    case 0x2B: // MAX
+-        for (int c = 0; c < 4; c++)
+-            result[c] = (vs[c] > vt[c]) ? vs[c] : vt[c];
+-        applyDest(vd, result, dest);
+-        return;
+-    case 0x2C: // SUB
+-        for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] - vt[c];
+-        applyFmacDest(vd, result, dest);
+-        return;
+-    case 0x2D: // MSUB
+-        for (int c = 0; c < 4; c++)
+-            result[c] = acc[c] - vs[c] * vt[c];
+-        applyFmacDest(vd, result, dest);
+-        return;
+-    case 0x2E: // OPMSUB
+-        result[0] = acc[0] - vs[1] * vt[2];
+-        result[1] = acc[1] - vs[2] * vt[0];
+-        result[2] = acc[2] - vs[0] * vt[1];
+-        result[3] = 0.0f;
+-        applyFmacDest(vd, result, dest);
+-        return;
+-    case 0x2F: // MINI
+-        for (int c = 0; c < 4; c++)
+-            result[c] = (vs[c] < vt[c]) ? vs[c] : vt[c];
+-        applyDest(vd, result, dest);
+-        return;
++}
+ 
+-    // Upper special group (low op 0x3C..0x3F).
+-    // Like lower1 special, the real selector is not just bits 5:0.  Dobie decodes:
+-    //   op = (instr & 0x3) | ((instr >> 4) & 0x7C)
+-    // Several instructions in this group also use FT as the destination, not FD.
+-    case 0x3C:
+-    case 0x3D:
+-    case 0x3E:
+-    case 0x3F:
+-    {
+-        const uint8_t specialOp = static_cast<uint8_t>((instr & 0x3u) | ((instr >> 4) & 0x7Cu));
+-        float *vtDest = m_state.vf[ft];
++Vu1UpperFn g_vu1UpperFn[kVu1UpperFnCount]{};
+ 
+-        switch (specialOp)
++void VU1Interpreter::execUpper(uint32_t instr)
++{
++    if (!g_vu1UpperReady)
++    {
++        g_loadUpper = [](VU1Interpreter &self, uint32_t word, UOp &o)
+         {
+-        case 0x00:
+-        case 0x01:
+-        case 0x02:
+-        case 0x03: // ADDAbc
++            self.m_currentUpperInstruction = word;
++            o.dest = DEST(word);
++            o.ft = FT(word);
++            o.fs = FS(word);
++            o.fd = FD(word);
++            o.vd = self.m_state.vf[o.fd];
++            for (uint32_t component = 0; component < 4u; ++component)
++            {
++                o.vs[component] = self.normalizeOperand(self.m_state.vf[o.fs][component]);
++                o.vt[component] = self.normalizeOperand(self.m_state.vf[o.ft][component]);
++                o.acc[component] = self.normalizeOperand(self.m_state.acc[component]);
++            }
++            o.q = self.normalizeOperand(self.m_state.q);
++            o.i = self.normalizeOperand(self.m_state.i);
++        };
++
++        bool seen[kVu1UpperFnCount]{};
++        const auto reg = [&](uint32_t sample, Vu1UpperFn fn)
+         {
+-            float bc = broadcast(vt, specialOp & 3);
+-            for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] + bc;
+-            applyFmacDestAcc(result, dest);
+-            return;
+-        }
+-        case 0x04:
+-        case 0x05:
+-        case 0x06:
+-        case 0x07: // SUBAbc
++            const uint16_t id = vu1UpperHandlerId(sample);
++            if (id >= kVu1UpperFnCount || id == kVu1UpperReserved || seen[id] || fn == nullptr)
++                std::abort();
++            seen[id] = true;
++            g_vu1UpperFn[id] = fn;
++        };
++        const auto reg4 = [&](uint32_t base, Vu1UpperFn fn)
+         {
+-            float bc = broadcast(vt, specialOp & 3);
+-            for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] - bc;
+-            applyFmacDestAcc(result, dest);
+-            return;
+-        }
+-        case 0x08:
+-        case 0x09:
+-        case 0x0A:
+-        case 0x0B: // MADDAbc
++            for (uint32_t i = 0; i < 4u; ++i)
++                reg(base + i, fn);
++        };
++        const auto regS = [&](uint32_t special, Vu1UpperFn fn)
+         {
+-            float bc = broadcast(vt, specialOp & 3);
+-            for (int c = 0; c < 4; c++)
+-                result[c] = acc[c] + vs[c] * bc;
+-            applyFmacDestAcc(result, dest);
+-            return;
+-        }
+-        case 0x0C:
+-        case 0x0D:
+-        case 0x0E:
+-        case 0x0F: // MSUBAbc
++            reg(upperSpecialSample(special), fn);
++        };
++        const auto regS4 = [&](uint32_t base, Vu1UpperFn fn)
+         {
+-            float bc = broadcast(vt, specialOp & 3);
+-            for (int c = 0; c < 4; c++)
+-                result[c] = acc[c] - vs[c] * bc;
+-            applyFmacDestAcc(result, dest);
+-            return;
+-        }
+-        case 0x10: // ITOF0
+-            for (int c = 0; c < 4; c++)
+-            {
+-                int32_t iv;
+-                std::memcpy(&iv, &m_state.vf[fs][c], 4);
+-                result[c] = static_cast<float>(iv);
+-            }
+-            applyDest(vtDest, result, dest);
+-            return;
+-        case 0x11: // ITOF4
+-            for (int c = 0; c < 4; c++)
+-            {
+-                int32_t iv;
+-                std::memcpy(&iv, &m_state.vf[fs][c], 4);
+-                result[c] = static_cast<float>(iv) / 16.0f;
+-            }
+-            applyDest(vtDest, result, dest);
+-            return;
+-        case 0x12: // ITOF12
+-            for (int c = 0; c < 4; c++)
+-            {
+-                int32_t iv;
+-                std::memcpy(&iv, &m_state.vf[fs][c], 4);
+-                result[c] = static_cast<float>(iv) / 4096.0f;
+-            }
+-            applyDest(vtDest, result, dest);
+-            return;
+-        case 0x13: // ITOF15
+-            for (int c = 0; c < 4; c++)
+-            {
+-                int32_t iv;
+-                std::memcpy(&iv, &m_state.vf[fs][c], 4);
+-                result[c] = static_cast<float>(iv) / 32768.0f;
+-            }
+-            applyDest(vtDest, result, dest);
+-            return;
+-        case 0x14: // FTOI0
+-            for (int c = 0; c < 4; c++)
+-            {
+-                int32_t iv = vuFloatToInt(vs[c], 1.0f);
+-                std::memcpy(&result[c], &iv, 4);
+-            }
+-            applyDest(vtDest, result, dest);
+-            return;
+-        case 0x15: // FTOI4
+-            for (int c = 0; c < 4; c++)
+-            {
+-                int32_t iv = vuFloatToInt(vs[c], 16.0f);
+-                std::memcpy(&result[c], &iv, 4);
+-            }
+-            applyDest(vtDest, result, dest);
+-            return;
+-        case 0x16: // FTOI12
+-            for (int c = 0; c < 4; c++)
+-            {
+-                int32_t iv = vuFloatToInt(vs[c], 4096.0f);
+-                std::memcpy(&result[c], &iv, 4);
+-            }
+-            applyDest(vtDest, result, dest);
+-            return;
+-        case 0x17: // FTOI15
+-            for (int c = 0; c < 4; c++)
+-            {
+-                int32_t iv = vuFloatToInt(vs[c], 32768.0f);
+-                std::memcpy(&result[c], &iv, 4);
+-            }
+-            applyDest(vtDest, result, dest);
+-            return;
+-        case 0x18:
+-        case 0x19:
+-        case 0x1A:
+-        case 0x1B: // MULAbc
++            for (uint32_t i = 0; i < 4u; ++i)
++                regS(base + i, fn);
++        };
++
++        const Vu1UpperFn reserved = [](VU1Interpreter &self, uint32_t word)
+         {
+-            float bc = broadcast(vt, specialOp & 3);
+-            for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] * bc;
+-            applyFmacDestAcc(result, dest);
+-            return;
+-        }
+-        case 0x1C: // MULAq
+-            for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] * q;
+-            applyFmacDestAcc(result, dest);
+-            return;
+-        case 0x1D: // ABS
+-            for (int c = 0; c < 4; c++)
+-                result[c] = std::fabs(vs[c]);
+-            applyDest(vtDest, result, dest);
+-            return;
+-        case 0x1E: // MULAi
+-            for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] * i;
+-            applyFmacDestAcc(result, dest);
+-            return;
+-        case 0x1F: // CLIP
++            UOp o;
++            g_loadUpper(self, word, o);
++            self.reportReservedInstruction(true, word);
++        };
++        for (uint32_t i = 0; i < kVu1UpperFnCount; ++i)
++            g_vu1UpperFn[i] = reserved;
++
++        const Vu1UpperFn nop = [](VU1Interpreter &self, uint32_t word)
+         {
+-            uint32_t wBits = 0u;
+-            std::memcpy(&wBits, &m_state.vf[ft][3], sizeof(wBits));
+-            const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
++            self.m_currentUpperInstruction = word;
++        };
++        regS(0x2F, nop);
++        regS(0x30, nop);
++
++#define U_BC(expr, applyCall)                                                         \
++    [](VU1Interpreter &self, uint32_t word)                                           \
++    {                                                                                 \
++        UOp o;                                                                        \
++        g_loadUpper(self, word, o);                                                   \
++        const float bc = self.broadcast(o.vt, word & 3u);                             \
++        for (int c = 0; c < 4; ++c)                                                   \
++            o.result[c] = (expr);                                                     \
++        applyCall;                                                                    \
++    }
++#define U_VV(expr, applyCall)                                                         \
++    [](VU1Interpreter &self, uint32_t word)                                           \
++    {                                                                                 \
++        UOp o;                                                                        \
++        g_loadUpper(self, word, o);                                                   \
++        for (int c = 0; c < 4; ++c)                                                   \
++            o.result[c] = (expr);                                                     \
++        applyCall;                                                                    \
++    }
++
++        reg4(0x00, U_BC(o.vs[c] + bc, self.applyFmacDest(o.vd, o.result, o.dest)));
++        reg4(0x04, U_BC(o.vs[c] - bc, self.applyFmacDest(o.vd, o.result, o.dest)));
++        reg4(0x08, U_BC(o.acc[c] + o.vs[c] * bc, self.applyFmacDest(o.vd, o.result, o.dest)));
++        reg4(0x0C, U_BC(o.acc[c] - o.vs[c] * bc, self.applyFmacDest(o.vd, o.result, o.dest)));
++        reg4(0x10, U_BC((o.vs[c] > bc) ? o.vs[c] : bc, self.applyDest(o.vd, o.result, o.dest)));
++        reg4(0x14, U_BC((o.vs[c] < bc) ? o.vs[c] : bc, self.applyDest(o.vd, o.result, o.dest)));
++        reg4(0x18, U_BC(o.vs[c] * bc, self.applyFmacDest(o.vd, o.result, o.dest)));
+ 
+-            const auto exceedsClipPlane = [limit](float value, uint32_t signMask)
++        reg(0x1C, U_VV(o.vs[c] * o.q, self.applyFmacDest(o.vd, o.result, o.dest)));
++        reg(0x1D, U_VV((o.vs[c] > o.i) ? o.vs[c] : o.i, self.applyDest(o.vd, o.result, o.dest)));
++        reg(0x1E, U_VV(o.vs[c] * o.i, self.applyFmacDest(o.vd, o.result, o.dest)));
++        reg(0x1F, U_VV((o.vs[c] < o.i) ? o.vs[c] : o.i, self.applyDest(o.vd, o.result, o.dest)));
++        reg(0x20, U_VV(o.vs[c] + o.q, self.applyFmacDest(o.vd, o.result, o.dest)));
++        reg(0x21, U_VV(o.acc[c] + o.vs[c] * o.q, self.applyFmacDest(o.vd, o.result, o.dest)));
++        reg(0x22, U_VV(o.vs[c] + o.i, self.applyFmacDest(o.vd, o.result, o.dest)));
++        reg(0x23, U_VV(o.acc[c] + o.vs[c] * o.i, self.applyFmacDest(o.vd, o.result, o.dest)));
++        reg(0x24, U_VV(o.vs[c] - o.q, self.applyFmacDest(o.vd, o.result, o.dest)));
++        reg(0x25, U_VV(o.acc[c] - o.vs[c] * o.q, self.applyFmacDest(o.vd, o.result, o.dest)));
++        reg(0x26, U_VV(o.vs[c] - o.i, self.applyFmacDest(o.vd, o.result, o.dest)));
++        reg(0x27, U_VV(o.acc[c] - o.vs[c] * o.i, self.applyFmacDest(o.vd, o.result, o.dest)));
++        reg(0x28, U_VV(o.vs[c] + o.vt[c], self.applyFmacDest(o.vd, o.result, o.dest)));
++        reg(0x29, U_VV(o.acc[c] + o.vs[c] * o.vt[c], self.applyFmacDest(o.vd, o.result, o.dest)));
++        reg(0x2A, U_VV(o.vs[c] * o.vt[c], self.applyFmacDest(o.vd, o.result, o.dest)));
++        reg(0x2B, U_VV((o.vs[c] > o.vt[c]) ? o.vs[c] : o.vt[c], self.applyDest(o.vd, o.result, o.dest)));
++        reg(0x2C, U_VV(o.vs[c] - o.vt[c], self.applyFmacDest(o.vd, o.result, o.dest)));
++        reg(0x2D, U_VV(o.acc[c] - o.vs[c] * o.vt[c], self.applyFmacDest(o.vd, o.result, o.dest)));
++        reg(0x2E, [](VU1Interpreter &self, uint32_t word)
+             {
+-                uint32_t bits = 0u;
+-                std::memcpy(&bits, &value, sizeof(bits));
+-                bits ^= signMask;
+-                int32_t orderedBits = 0;
+-                std::memcpy(&orderedBits, &bits, sizeof(orderedBits));
+-                return orderedBits > limit;
+-            };
++                UOp o;
++                g_loadUpper(self, word, o);
++                o.result[0] = o.acc[0] - o.vs[1] * o.vt[2];
++                o.result[1] = o.acc[1] - o.vs[2] * o.vt[0];
++                o.result[2] = o.acc[2] - o.vs[0] * o.vt[1];
++                o.result[3] = 0.0f;
++                self.applyFmacDest(o.vd, o.result, o.dest);
++            });
++        reg(0x2F, U_VV((o.vs[c] < o.vt[c]) ? o.vs[c] : o.vt[c], self.applyDest(o.vd, o.result, o.dest)));
+ 
+-            uint32_t flags = 0u;
+-            if (exceedsClipPlane(m_state.vf[fs][0], 0x00000000u))
+-                flags |= 0x01u;
+-            if (exceedsClipPlane(m_state.vf[fs][0], 0x80000000u))
+-                flags |= 0x02u;
+-            if (exceedsClipPlane(m_state.vf[fs][1], 0x00000000u))
+-                flags |= 0x04u;
+-            if (exceedsClipPlane(m_state.vf[fs][1], 0x80000000u))
+-                flags |= 0x08u;
+-            if (exceedsClipPlane(m_state.vf[fs][2], 0x00000000u))
+-                flags |= 0x10u;
+-            if (exceedsClipPlane(m_state.vf[fs][2], 0x80000000u))
+-                flags |= 0x20u;
+-            queueClip(flags);
+-            return;
+-        }
+-        case 0x20: // ADDAq
+-            for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] + q;
+-            applyFmacDestAcc(result, dest);
+-            return;
+-        case 0x21: // MADDAq
+-            for (int c = 0; c < 4; c++)
+-                result[c] = acc[c] + vs[c] * q;
+-            applyFmacDestAcc(result, dest);
+-            return;
+-        case 0x22: // ADDAi
+-            for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] + i;
+-            applyFmacDestAcc(result, dest);
+-            return;
+-        case 0x23: // MADDAi
+-            for (int c = 0; c < 4; c++)
+-                result[c] = acc[c] + vs[c] * i;
+-            applyFmacDestAcc(result, dest);
+-            return;
+-        case 0x24: // SUBAq
+-            for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] - q;
+-            applyFmacDestAcc(result, dest);
+-            return;
+-        case 0x25: // MSUBAq
+-            for (int c = 0; c < 4; c++)
+-                result[c] = acc[c] - vs[c] * q;
+-            applyFmacDestAcc(result, dest);
+-            return;
+-        case 0x26: // SUBAi
+-            for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] - i;
+-            applyFmacDestAcc(result, dest);
+-            return;
+-        case 0x27: // MSUBAi
+-            for (int c = 0; c < 4; c++)
+-                result[c] = acc[c] - vs[c] * i;
+-            applyFmacDestAcc(result, dest);
+-            return;
+-        case 0x28: // ADDA
+-            for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] + vt[c];
+-            applyFmacDestAcc(result, dest);
+-            return;
+-        case 0x29: // MADDA
+-            for (int c = 0; c < 4; c++)
+-                result[c] = acc[c] + vs[c] * vt[c];
+-            applyFmacDestAcc(result, dest);
+-            return;
+-        case 0x2A: // MULA
+-            for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] * vt[c];
+-            applyFmacDestAcc(result, dest);
+-            return;
+-        case 0x2C: // SUBA
+-            for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] - vt[c];
+-            applyFmacDestAcc(result, dest);
+-            return;
+-        case 0x2D: // MSUBA
+-            for (int c = 0; c < 4; c++)
+-                result[c] = acc[c] - vs[c] * vt[c];
+-            applyFmacDestAcc(result, dest);
+-            return;
+-        case 0x2E: // OPMULA
+-            result[0] = vs[1] * vt[2];
+-            result[1] = vs[2] * vt[0];
+-            result[2] = vs[0] * vt[1];
+-            result[3] = 0.0f;
+-            applyFmacDestAcc(result, dest);
+-            return;
+-        case 0x2F:
+-        case 0x30: // NOP
+-            return;
+-        default:
+-            reportReservedInstruction(true, instr);
+-            return;
+-        }
++        regS4(0x00, U_BC(o.vs[c] + bc, self.applyFmacDestAcc(o.result, o.dest)));
++        regS4(0x04, U_BC(o.vs[c] - bc, self.applyFmacDestAcc(o.result, o.dest)));
++        regS4(0x08, U_BC(o.acc[c] + o.vs[c] * bc, self.applyFmacDestAcc(o.result, o.dest)));
++        regS4(0x0C, U_BC(o.acc[c] - o.vs[c] * bc, self.applyFmacDestAcc(o.result, o.dest)));
++
++#define U_ITOF(divExpr)                                                               \
++    [](VU1Interpreter &self, uint32_t word)                                           \
++    {                                                                                 \
++        UOp o;                                                                        \
++        g_loadUpper(self, word, o);                                                   \
++        float *vtDest = self.m_state.vf[o.ft];                                        \
++        for (int c = 0; c < 4; ++c)                                                   \
++        {                                                                             \
++            int32_t iv;                                                               \
++            std::memcpy(&iv, &self.m_state.vf[o.fs][c], 4);                           \
++            o.result[c] = (divExpr);                                                  \
++        }                                                                             \
++        self.applyDest(vtDest, o.result, o.dest);                                     \
++    }
++#define U_FTOI(scale)                                                                 \
++    [](VU1Interpreter &self, uint32_t word)                                           \
++    {                                                                                 \
++        UOp o;                                                                        \
++        g_loadUpper(self, word, o);                                                   \
++        float *vtDest = self.m_state.vf[o.ft];                                        \
++        for (int c = 0; c < 4; ++c)                                                   \
++        {                                                                             \
++            int32_t iv = vuFloatToInt(o.vs[c], scale);                                \
++            std::memcpy(&o.result[c], &iv, 4);                                        \
++        }                                                                             \
++        self.applyDest(vtDest, o.result, o.dest);                                     \
++    }
++
++        regS(0x10, U_ITOF(static_cast<float>(iv)));
++        regS(0x11, U_ITOF(static_cast<float>(iv) / 16.0f));
++        regS(0x12, U_ITOF(static_cast<float>(iv) / 4096.0f));
++        regS(0x13, U_ITOF(static_cast<float>(iv) / 32768.0f));
++        regS(0x14, U_FTOI(1.0f));
++        regS(0x15, U_FTOI(16.0f));
++        regS(0x16, U_FTOI(4096.0f));
++        regS(0x17, U_FTOI(32768.0f));
++        regS4(0x18, U_BC(o.vs[c] * bc, self.applyFmacDestAcc(o.result, o.dest)));
++        regS(0x1C, U_VV(o.vs[c] * o.q, self.applyFmacDestAcc(o.result, o.dest)));
++        regS(0x1D, [](VU1Interpreter &self, uint32_t word)
++             {
++                 UOp o;
++                 g_loadUpper(self, word, o);
++                 float *vtDest = self.m_state.vf[o.ft];
++                 for (int c = 0; c < 4; ++c)
++                     o.result[c] = std::fabs(o.vs[c]);
++                 self.applyDest(vtDest, o.result, o.dest);
++             });
++        regS(0x1E, U_VV(o.vs[c] * o.i, self.applyFmacDestAcc(o.result, o.dest)));
++        regS(0x1F, [](VU1Interpreter &self, uint32_t word)
++             {
++                 UOp o;
++                 g_loadUpper(self, word, o);
++                 uint32_t wBits = 0u;
++                 std::memcpy(&wBits, &self.m_state.vf[o.ft][3], sizeof(wBits));
++                 const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
++                 const auto exceedsClipPlane = [limit](float value, uint32_t signMask)
++                 {
++                     uint32_t bits = 0u;
++                     std::memcpy(&bits, &value, sizeof(bits));
++                     bits ^= signMask;
++                     int32_t orderedBits = 0;
++                     std::memcpy(&orderedBits, &bits, sizeof(orderedBits));
++                     return orderedBits > limit;
++                 };
++                 uint32_t flags = 0u;
++                 if (exceedsClipPlane(self.m_state.vf[o.fs][0], 0x00000000u))
++                     flags |= 0x01u;
++                 if (exceedsClipPlane(self.m_state.vf[o.fs][0], 0x80000000u))
++                     flags |= 0x02u;
++                 if (exceedsClipPlane(self.m_state.vf[o.fs][1], 0x00000000u))
++                     flags |= 0x04u;
++                 if (exceedsClipPlane(self.m_state.vf[o.fs][1], 0x80000000u))
++                     flags |= 0x08u;
++                 if (exceedsClipPlane(self.m_state.vf[o.fs][2], 0x00000000u))
++                     flags |= 0x10u;
++                 if (exceedsClipPlane(self.m_state.vf[o.fs][2], 0x80000000u))
++                     flags |= 0x20u;
++                 self.queueClip(flags);
++             });
++        regS(0x20, U_VV(o.vs[c] + o.q, self.applyFmacDestAcc(o.result, o.dest)));
++        regS(0x21, U_VV(o.acc[c] + o.vs[c] * o.q, self.applyFmacDestAcc(o.result, o.dest)));
++        regS(0x22, U_VV(o.vs[c] + o.i, self.applyFmacDestAcc(o.result, o.dest)));
++        regS(0x23, U_VV(o.acc[c] + o.vs[c] * o.i, self.applyFmacDestAcc(o.result, o.dest)));
++        regS(0x24, U_VV(o.vs[c] - o.q, self.applyFmacDestAcc(o.result, o.dest)));
++        regS(0x25, U_VV(o.acc[c] - o.vs[c] * o.q, self.applyFmacDestAcc(o.result, o.dest)));
++        regS(0x26, U_VV(o.vs[c] - o.i, self.applyFmacDestAcc(o.result, o.dest)));
++        regS(0x27, U_VV(o.acc[c] - o.vs[c] * o.i, self.applyFmacDestAcc(o.result, o.dest)));
++        regS(0x28, U_VV(o.vs[c] + o.vt[c], self.applyFmacDestAcc(o.result, o.dest)));
++        regS(0x29, U_VV(o.acc[c] + o.vs[c] * o.vt[c], self.applyFmacDestAcc(o.result, o.dest)));
++        regS(0x2A, U_VV(o.vs[c] * o.vt[c], self.applyFmacDestAcc(o.result, o.dest)));
++        regS(0x2C, U_VV(o.vs[c] - o.vt[c], self.applyFmacDestAcc(o.result, o.dest)));
++        regS(0x2D, U_VV(o.acc[c] - o.vs[c] * o.vt[c], self.applyFmacDestAcc(o.result, o.dest)));
++        regS(0x2E, [](VU1Interpreter &self, uint32_t word)
++             {
++                 UOp o;
++                 g_loadUpper(self, word, o);
++                 o.result[0] = o.vs[1] * o.vt[2];
++                 o.result[1] = o.vs[2] * o.vt[0];
++                 o.result[2] = o.vs[0] * o.vt[1];
++                 o.result[3] = 0.0f;
++                 self.applyFmacDestAcc(o.result, o.dest);
++             });
++#undef U_BC
++#undef U_VV
++#undef U_ITOF
++#undef U_FTOI
++        g_vu1UpperReady = true;
+     }
+ 
+-    case 0x30:
+-    case 0x31:
+-    case 0x32:
+-    case 0x33:
++    m_currentUpperInstruction = instr;
++    if ((instr & 0x7FFu) == 0x2FFu || (instr & 0x7FFu) == 0x33Cu)
++        return;
++
++    const uint8_t op = static_cast<uint8_t>(instr & 0x3Fu);
++    switch (op)
++    {
++    case 0x00: case 0x01: case 0x02: case 0x03:
++    case 0x04: case 0x05: case 0x06: case 0x07:
++    case 0x08: case 0x09: case 0x0A: case 0x0B:
++    case 0x0C: case 0x0D: case 0x0E: case 0x0F:
++    case 0x10: case 0x11: case 0x12: case 0x13:
++    case 0x14: case 0x15: case 0x16: case 0x17:
++    case 0x18: case 0x19: case 0x1A: case 0x1B:
++    case 0x1C: case 0x1D: case 0x1E: case 0x1F:
++    case 0x20: case 0x21: case 0x22: case 0x23:
++    case 0x24: case 0x25: case 0x26: case 0x27:
++    case 0x28: case 0x29: case 0x2A: case 0x2B:
++    case 0x2C: case 0x2D: case 0x2E: case 0x2F:
++    case 0x3C: case 0x3D: case 0x3E: case 0x3F:
++        g_vu1UpperFn[vu1UpperHandlerId(instr)](*this, instr);
++        return;
+     default:
+-        reportReservedInstruction(true, instr);
++        g_vu1UpperFn[kVu1UpperReserved](*this, instr);
+         return;
+     }
+ }
