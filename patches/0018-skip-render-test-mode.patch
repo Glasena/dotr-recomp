@@ -1,0 +1,175 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_test_mode.h b/ps2xRuntime/include/runtime/ps2_test_mode.h
+--- a/ps2xRuntime/include/runtime/ps2_test_mode.h
++++ b/ps2xRuntime/include/runtime/ps2_test_mode.h
+@@ -11,10 +11,17 @@
+ //   PS2X_DUMP_FRAMES=...   "300,900": write the displayed frame as PNG at those VBlanks
+ //   PS2X_DUMP_DIR=dir      where dumps go (default "."), as frame_<N>.png
+ //   PS2X_EXIT_AT=N         exit the process at VBlank N
++//   PS2X_SKIP_RENDER=1     skip VU1 microprograms and GS primitive raster / clears
++//                          except for the warmup vblanks before each dumped frame.
++//                          Off for timing runs.
++//   PS2X_SKIP_RENDER_WARMUP=N
++//                          real frames immediately before each dump (default 3)
+ namespace ps2x::test
+ {
+     bool headless();
+     bool uncapped();
++    // True when this vblank should not run VU1 or rasterize. Always false if the flag is off.
++    bool skipRender();
+     // PS2 pad button bits (active high) the script holds at the current VBlank.
+     uint16_t scriptedButtons();
+     // Called by the EE scheduler on every VBlankStart, after the tick is incremented.
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1,5 +1,6 @@
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/gs_cpu_backend.h"
++#include "runtime/ps2_test_mode.h"
+ #include "ps2_log.h"
+ #include "runtime/ps2_memory.h"
+ #include <atomic>
+@@ -1588,8 +1589,12 @@
+     {
+         GSPrimitiveBatch batch = buildDrawBatch(needed);
+         updatePreferredDisplaySourceForDraw(batch);
+-        m_backend->Submit(batch);
+-        recordDrawDebugEventUnlocked(needed);
++        // Register writes and IMAGE/CLUT uploads still run; only the pixel fill is skipped.
++        if (!ps2x::test::skipRender())
++        {
++            m_backend->Submit(batch);
++            recordDrawDebugEventUnlocked(needed);
++        }
+     }
+ 
+     switch (m_prim.type)
+@@ -1628,12 +1633,16 @@
+ 
+ bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
+ {
++    if (ps2x::test::skipRender())
++        return true;
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     return m_backend && m_backend->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
+ }
+ 
+ bool GS::clearActiveFramebuffer(uint32_t rgba)
+ {
++    if (ps2x::test::skipRender())
++        return true;
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_test_mode.cpp b/ps2xRuntime/src/lib/ps2_test_mode.cpp
+--- a/ps2xRuntime/src/lib/ps2_test_mode.cpp
++++ b/ps2xRuntime/src/lib/ps2_test_mode.cpp
+@@ -40,6 +40,12 @@
+     {
+         bool headless = envFlag("PS2X_HEADLESS");
+         bool uncapped = envFlag("PS2X_UNCAPPED");
++        bool skipRender = envFlag("PS2X_SKIP_RENDER");
++        // VBlanks of real VU1+GS immediately before each dump. The dump latches the buffer
++        // produced on an earlier tick (double-buffered), so a few real frames are required.
++        uint64_t warmup = std::getenv("PS2X_SKIP_RENDER_WARMUP")
++                              ? std::strtoull(std::getenv("PS2X_SKIP_RENDER_WARMUP"), nullptr, 10)
++                              : 3u;
+         std::vector<std::pair<uint64_t, uint16_t>> presses; // (start VBlank, button bit)
+         std::set<uint64_t> dumps;
+         std::string dumpDir = std::getenv("PS2X_DUMP_DIR") ? std::getenv("PS2X_DUMP_DIR") : ".";
+@@ -93,6 +99,18 @@
+     bool headless() { return config().headless; }
+     bool uncapped() { return config().uncapped; }
+ 
++    bool skipRender()
++    {
++        const Config &c = config();
++        if (!c.skipRender)
++            return false;
++        const uint64_t tick = g_tick.load(std::memory_order_relaxed);
++        // Drawing after onVBlank(tick) is what a later vblank latches. Keep the `warmup`
++        // ticks before each dump (tick < dump && dump - tick <= warmup).
++        const auto it = c.dumps.lower_bound(tick + 1u);
++        return it == c.dumps.end() || *it - tick > c.warmup;
++    }
++
+     uint16_t scriptedButtons()
+     {
+         const uint64_t tick = g_tick.load(std::memory_order_relaxed);
+@@ -107,6 +125,15 @@
+     {
+         g_tick.store(tick, std::memory_order_relaxed);
+         const Config &c = config();
++        if (c.skipRender)
++        {
++            static bool logged = false;
++            if (!logged)
++            {
++                logged = true;
++                std::cerr << "[test] skip render on, warmup " << c.warmup << " vblanks before each dump" << std::endl;
++            }
++        }
+         if (c.dumps.count(tick))
+             dumpFrame(runtime, tick);
+         if (c.exitAt != 0u && tick >= c.exitAt)
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -2,6 +2,7 @@
+ #include "runtime/gs/ps2_gif_arbiter.h"
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/ps2_memory.h"
++#include "runtime/ps2_test_mode.h"
+ #include "ps2_vu1_detail.h"
+ 
+ #include <bit>
+@@ -1680,12 +1681,35 @@
+     m_stopRequested = true;
+ }
+ 
++namespace
++{
++    // VIF runs MSCAL/MSCNT synchronously, so returning here already reports VU1 idle
++    // (VPU_STAT VDS1/VTS1 stay clear). The microprogram's PATH1 GIF packet never runs,
++    // so its FINISH write would not either; set CSR FINISH the way that packet would.
++    bool skippedVu1(VU1Interpreter::Unit unit, GS &gs)
++    {
++        if (unit != VU1Interpreter::Unit::VU1 || !ps2x::test::skipRender())
++            return false;
++        gs.writeRegister(GS_REG_FINISH, 0);
++        return true;
++    }
++}
++
+ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+                              uint8_t *vuData, uint32_t dataSize,
+                              GS &gs, PS2Memory *memory,
+                              uint32_t startPC, uint32_t top, uint32_t itop,
+                              uint32_t maxCycles)
+ {
++    if (skippedVu1(m_unit, gs))
++    {
++        m_state.stoppedByD = false;
++        m_state.stoppedByT = false;
++        m_state.ebit = true;
++        m_state.top = top;
++        m_state.itop = itop;
++        return;
++    }
+     resetScheduler();
+     m_state.pc = startPC & microAddressMask();
+     m_state.ebit = false;
+@@ -1709,6 +1733,13 @@
+                             GS &gs, PS2Memory *memory,
+                             uint32_t top, uint32_t itop, uint32_t maxCycles)
+ {
++    if (skippedVu1(m_unit, gs))
++    {
++        m_state.stoppedByD = false;
++        m_state.stoppedByT = false;
++        m_state.ebit = true;
++        return;
++    }
+     m_state.top = top;
+     m_state.itop = itop;
+     m_state.stoppedByD = false;

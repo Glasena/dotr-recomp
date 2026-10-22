@@ -106,6 +106,13 @@ not through a symlink: every compile command holds absolute paths.
 `ps2_log.txt` (gigabytes in minutes) and slows the whole game, so keep it OFF unless you need that trace. The runtime
 prints `[perf] vblank/s=… swap/s=…` to stderr every 5 s (60 VBlanks/s is full speed; DotR swaps at 30/s).
 
+`tools/test_run.sh` is a headless scripted run (hidden window, no audio, uncapped VBlanks, pad script, PNG dumps).
+It sets `PS2X_HEADLESS`, `PS2X_UNCAPPED`, `PS2X_INPUT_SCRIPT`, `PS2X_DUMP_FRAMES`, `PS2X_DUMP_DIR` and `PS2X_EXIT_AT`;
+override any of them from the environment. `PS2X_SKIP_RENDER=1` (off by default; leave it off for timing runs) skips
+VU1 microprograms and GS primitive rasterization / framebuffer clears on vblanks that are not among the
+`PS2X_SKIP_RENDER_WARMUP` (default 3) vblanks before a dumped frame. VIF unpacks, GIF register writes and VRAM
+uploads still run, and a skipped VU1 program reports CSR FINISH so the game does not wait on the packet it never sent.
+
 The runtime finds FFmpeg through pkg-config, which searches `CMAKE_PREFIX_PATH`; the binary gets an RPATH to
 `../deps/ffmpeg/lib`, so no `LD_LIBRARY_PATH` is needed. Without FFmpeg, pass `-DPS2X_ENABLE_FFMPEG=OFF` instead:
 movies are then skipped with blank frames (patch 0006). In-game, Start (keyboard Enter) skips the intro movie.

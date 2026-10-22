@@ -3,6 +3,8 @@
 # Default script: boot -> skip intro movie (Start) -> title -> menu (Start) -> New Game (Cross) -> "NOW LOADING".
 # Override any PS2X_* variable from the environment, e.g.
 #   PS2X_INPUT_SCRIPT=start@1000,start@1400,down@1500 PS2X_DUMP_FRAMES=1600 PS2X_EXIT_AT=1600 tools/test_run.sh
+# PS2X_SKIP_RENDER=1 skips VU1 and GS rasterization except for PS2X_SKIP_RENDER_WARMUP vblanks
+# (default 3) before each dumped frame. Leave it unset for timing runs.
 # Dumps: $PS2X_DUMP_DIR/frame_<vblank>.png (default ../dotr/test). Log: ../dotr/test_run.log.
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"

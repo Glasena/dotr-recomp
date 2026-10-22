@@ -215,10 +215,27 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
 - Missing functions show at runtime as `[guest-branch:missing-target] … target=0x…`; fix = improve
   find_functions.py, regenerate, full rebuild.
 
+## Skip-render test mode (2026-10-22, #25)
+- Patch 0018, off by default: `PS2X_SKIP_RENDER=1`. On vblanks that are not among the
+  `PS2X_SKIP_RENDER_WARMUP` (default 3) ticks before a `PS2X_DUMP_FRAMES` entry, VU1 `execute`/`resume` return
+  immediately and GS primitive submits / framebuffer clears are skipped. VIF unpacks, MPG, DIRECT, GIF register
+  writes and IMAGE/CLUT uploads still run. Leave the flag off for timing runs (#13).
+- Waits: VIF and VU1 are synchronous, so a skipped program is already idle when the EE resumes (VPU_STAT VDS1/VTS1
+  stay clear). Each skipped program also sets GS CSR FINISH, because the PATH1 packet that would have written it
+  never runs. SIGNAL is not synthesized (it carries an id). DotR's story path does not stall on these.
+- Flag off: default `tools/test_run.sh` dumps (1200, 1500, 1700) are bit-identical to the pre-change runner.
+- Flag on, same script: 1200 and 1700 bit-identical; 1500 differs by 352 pixels (menu cursor jewels). Wall clock
+  21 s → 13 s. Raising warmup to 30 or 120 does not change that frame; warmup 5000 (nothing skipped before the
+  dump) matches. The jewel colors are chosen from state built on skipped frames.
+- Long script (CLAUDE's New Game → practice duel presses) with the flag on reaches VBlank 10600 in 110 s
+  (~70–140 VBlank/s; the same script without the flag takes 290 s just to VBlank 5010, ~12 VBlank/s once the 3D
+  scene starts). Dumps: story text at 2300 (same sentence; 6102 pixels of the blue field differ), name prompt at
+  5000 (same dialogue; the Stonehenge background is missing, 35% of pixels), duel UI at 10500 (LP, Dark Magician
+  card, empty 3D view). Warmup 30 is byte-identical to warmup 3 on those three frames: a few real frames do not
+  rebuild a VU-rendered layer that was produced on skipped frames. Not for performance numbers.
+
 ## Next steps (2026-10-22: sharpen the tools before more VU1 work)
 Order is tracked with the `priority: N` labels; the three issues are pinned on GitHub.
-1. #25 (priority 2): opt-in test mode that skips VU1 + GS rasterization on frames not dumped, so scripts reach the
- map/duel in minutes. Off for timing runs; run the full script without it now and then and compare dumps.
-2. #13 (priority 3): VU1 recompiler or async VU1.
-3. Then #10 (box glyphs), #14 (display env), #16, #17, #3-#5. Open an issue per new blocker.
-4. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).
+1. #13 (priority 3): VU1 recompiler or async VU1.
+2. Then #10 (box glyphs), #14 (display env), #16, #17, #3-#5. Open an issue per new blocker.
+3. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).
