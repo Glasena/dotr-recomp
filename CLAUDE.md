@@ -199,9 +199,12 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
 - Missing functions show at runtime as `[guest-branch:missing-target] … target=0x…`; fix = improve
   find_functions.py, regenerate, full rebuild.
 
-## Next steps
-1. #10 (box glyphs), #13 (VU1 still the 3D ceiling), #14 (display env), #16,
-   #17. Open an issue per new blocker.
-2. Possible patch: compile `register_functions.cpp` at -O0 outside the unity build (it only runs at startup).
-3. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).
-4. Open issues #3–#5.
+## Next steps (2026-10-22: sharpen the tools before more VU1 work)
+Order is tracked with the `priority: N` labels; the three issues are pinned on GitHub.
+1. #24 (priority 1): build. Overlays rebuild on any core header edit (~33 min), `unity_0` (probably
+ `register_functions.cpp`) takes 12 min serially, ccache hits 8.8%. Goal: everyday builds under 1-2 min.
+2. #25 (priority 2): opt-in test mode that skips VU1 + GS rasterization on frames not dumped, so scripts reach the
+ map/duel in minutes. Off for timing runs; run the full script without it now and then and compare dumps.
+3. #13 (priority 3): VU1 recompiler or async VU1.
+4. Then #10 (box glyphs), #14 (display env), #16, #17, #3-#5. Open an issue per new blocker.
+5. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).
