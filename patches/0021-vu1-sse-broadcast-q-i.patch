@@ -1,0 +1,80 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp	2026-10-22 16:30:47.192175374 -0300
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp	2026-10-22 16:30:47.193175371 -0300
+@@ -2161,23 +2161,54 @@
+     const uint64_t budgetEnd = m_cycle + maxCycles;
+     bool programEnded = false;
+ 
+-    // ADD/SUB/MUL on the fast-block path. The interpreter table stays scalar.
++    // ADD/SUB/MUL, broadcast and Q/I included, on the fast-block path. The interpreter table stays scalar.
+     auto directAddSubMul = [&](uint32_t word)
+     {
+         m_currentUpperInstruction = word;
++        const uint8_t op = static_cast<uint8_t>(word & 0x3Fu);
+         float vs[4];
+-        float vt[4];
+         for (int c = 0; c < 4; ++c)
+-        {
+             vs[c] = normalizeOperand(m_state.vf[FS(word)][c]);
+-            vt[c] = normalizeOperand(m_state.vf[FT(word)][c]);
+-        }
+         const __m128 left = _mm_loadu_ps(vs);
+-        const __m128 right = _mm_loadu_ps(vt);
+-        const uint8_t op = static_cast<uint8_t>(word & 0x3Fu);
+-        const __m128 wide = op == 0x28u ? _mm_add_ps(left, right)
+-                          : op == 0x2Au ? _mm_mul_ps(left, right)
+-                                        : _mm_sub_ps(left, right);
++
++        __m128 right;
++        if (op == 0x1Cu || op == 0x20u || op == 0x24u)
++            right = _mm_set1_ps(normalizeOperand(m_state.q));
++        else if (op == 0x1Eu || op == 0x22u || op == 0x26u)
++            right = _mm_set1_ps(normalizeOperand(m_state.i));
++        else
++        {
++            float vt[4];
++            for (int c = 0; c < 4; ++c)
++                vt[c] = normalizeOperand(m_state.vf[FT(word)][c]);
++            const __m128 loaded = _mm_loadu_ps(vt);
++            if (op <= 0x07u || (op >= 0x18u && op <= 0x1Bu))
++            {
++                switch (op & 3u)
++                {
++                case 0:
++                    right = _mm_shuffle_ps(loaded, loaded, _MM_SHUFFLE(0, 0, 0, 0));
++                    break;
++                case 1:
++                    right = _mm_shuffle_ps(loaded, loaded, _MM_SHUFFLE(1, 1, 1, 1));
++                    break;
++                case 2:
++                    right = _mm_shuffle_ps(loaded, loaded, _MM_SHUFFLE(2, 2, 2, 2));
++                    break;
++                default:
++                    right = _mm_shuffle_ps(loaded, loaded, _MM_SHUFFLE(3, 3, 3, 3));
++                    break;
++                }
++            }
++            else
++                right = loaded;
++        }
++
++        const bool mul = (op >= 0x18u && op <= 0x1Cu) || op == 0x1Eu || op == 0x2Au;
++        const bool sub = (op >= 0x04u && op <= 0x07u) || op == 0x24u || op == 0x26u || op == 0x2Cu;
++        const __m128 wide = mul ? _mm_mul_ps(left, right)
++                          : sub ? _mm_sub_ps(left, right)
++                                : _mm_add_ps(left, right);
+         float result[4];
+         _mm_storeu_ps(result, wide);
+         applyFmacDest(m_state.vf[FD(word)], result, DEST(word));
+@@ -2196,7 +2227,10 @@
+             if (directOk)
+             {
+                 const uint16_t id = directIds->upper[directPair];
+-                if (id == 0x28u || id == 0x2Au || id == 0x2Cu)
++                const bool directFmac = id <= 0x07u || (id >= 0x18u && id <= 0x1Cu) ||
++                                        id == 0x1Eu || id == 0x20u || id == 0x22u || id == 0x24u || id == 0x26u ||
++                                        id == 0x28u || id == 0x2Au || id == 0x2Cu;
++                if (directFmac)
+                     directAddSubMul(decoded.upper);
+                 else
+                     g_vu1UpperFn[id](*this, decoded.upper);

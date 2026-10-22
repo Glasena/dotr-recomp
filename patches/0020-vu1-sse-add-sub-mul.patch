@@ -1,0 +1,55 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp	2026-10-22 16:22:13.327546279 -0300
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp	2026-10-22 16:20:02.951987994 -0300
+@@ -16,6 +16,7 @@
+ #include <limits>
+ #include <ps2_log.h>
+ #include <unordered_map>
++#include <xmmintrin.h>
+ 
+ namespace
+ {
+@@ -2160,6 +2161,28 @@
+     const uint64_t budgetEnd = m_cycle + maxCycles;
+     bool programEnded = false;
+ 
++    // ADD/SUB/MUL on the fast-block path. The interpreter table stays scalar.
++    auto directAddSubMul = [&](uint32_t word)
++    {
++        m_currentUpperInstruction = word;
++        float vs[4];
++        float vt[4];
++        for (int c = 0; c < 4; ++c)
++        {
++            vs[c] = normalizeOperand(m_state.vf[FS(word)][c]);
++            vt[c] = normalizeOperand(m_state.vf[FT(word)][c]);
++        }
++        const __m128 left = _mm_loadu_ps(vs);
++        const __m128 right = _mm_loadu_ps(vt);
++        const uint8_t op = static_cast<uint8_t>(word & 0x3Fu);
++        const __m128 wide = op == 0x28u ? _mm_add_ps(left, right)
++                          : op == 0x2Au ? _mm_mul_ps(left, right)
++                                        : _mm_sub_ps(left, right);
++        float result[4];
++        _mm_storeu_ps(result, wide);
++        applyFmacDest(m_state.vf[FD(word)], result, DEST(word));
++    };
++
+     // Executes one pair's upper and lower instructions; register results land in m_state right away.
+     // Fast blocks call the handler recorded for this pair. The interpreter (and PS2X_VU_NO_DIRECT)
+     // still goes through execUpper/execLower.
+@@ -2171,7 +2194,13 @@
+         auto callUpper = [&]()
+         {
+             if (directOk)
+-                g_vu1UpperFn[directIds->upper[directPair]](*this, decoded.upper);
++            {
++                const uint16_t id = directIds->upper[directPair];
++                if (id == 0x28u || id == 0x2Au || id == 0x2Cu)
++                    directAddSubMul(decoded.upper);
++                else
++                    g_vu1UpperFn[id](*this, decoded.upper);
++            }
+             else
+                 execUpper(decoded.upper);
+         };
