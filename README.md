@@ -102,6 +102,11 @@ PCH are off: batches shift when a function is added, and ccache never hits on CM
 or reverted files are cache hits (a touch of `ps2_runtime_macros.h` rebuilds in ~35 s). Configure with real paths,
 not through a symlink: every compile command holds absolute paths.
 
+Day-to-day work stays on that fast path. Change a runtime `.cpp` (~25 s) and check with `ninja -n` before building.
+The ~45 min rebuild is only for a real edit to `ps2_guest_abi.h`, `ps2_runtime_macros.h` or `runtime/ps2_address.h`.
+`PS2X_SKIP_RENDER=1` is how a script reaches a late frame in about a minute; turn it off to read `[perf]` or to
+compare dumps. One build at a time.
+
 `PS2X_ENABLE_AGRESSIVE_LOGS` defaults to ON upstream: it makes every recompiled function write and flush a line to
 `ps2_log.txt` (gigabytes in minutes) and slows the whole game, so keep it OFF unless you need that trace. The runtime
 prints `[perf] vblank/s=… swap/s=…` to stderr every 5 s (60 VBlanks/s is full speed; DotR swaps at 30/s).

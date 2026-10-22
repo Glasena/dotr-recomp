@@ -11,6 +11,11 @@ Everything in the repo (code, comments, docs, commit messages) is written in Eng
   of War they were ordinary `sw` into WAX `.data` and broke loading. DotR's 21 were already removed from
   `config/dotr.toml`.
 - Commits must not expose the author's personal email: the repo-local `user.email` is a GitHub noreply address.
+- Iterate on the fast path from #24 and #25. A runtime `.cpp` edit rebuilds that file and the link (~25 s).
+  `ninja -n` first: if `ov_*.cpp` or the generated runner would rebuild, move the change into a `.cpp`. Editing
+  `ps2_guest_abi.h`, `ps2_runtime_macros.h` or `runtime/ps2_address.h` is the slow path (~45 min) and only when the
+  change cannot live anywhere else. One build at a time. `PS2X_SKIP_RENDER=1` only to reach a later frame; timing
+  and dump comparisons leave it off (`PS2X_DUMP_FRAMES=1900,2100,2300 PS2X_EXIT_AT=2300` is about a minute).
 
 ## What is known about the ELF (2026-10-20)
 - Entry 0x100008. Code+data in one PT_LOAD at 0x100000 (file offset 0x6900), filesz 0x20FF00, memsz 0x251300.
@@ -239,8 +244,12 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
   card, empty 3D view). Warmup 30 is byte-identical to warmup 3 on those three frames: a few real frames do not
   rebuild a VU-rendered layer that was produced on skipped frames. Not for performance numbers.
 
-## Next steps (2026-10-22: sharpen the tools before more VU1 work)
-Order is tracked with the `priority: N` labels; the three issues are pinned on GitHub.
-1. #13 (priority 3): VU1 recompiler or async VU1.
+## Next steps (2026-10-22)
+Order is tracked with the `priority: N` labels; #13 is pinned on GitHub.
+1. #13 (priority 3) is the parent. #22 (async VU1) did not help: the EE waits on the kick. #23 (patch 0016) and
+   patch 0019 are in (~14.1 VBlanks/s). #27 keeps the interpreter and runs FMAC blocks with SSE, split so each
+   child fits one session: #28 vector ADD/SUB/MUL (builds the path), then #29 broadcast and Q/I, #30 MADD/MSUB
+   into VF, #31 the same ops writing ACC. Do not port PCSX2 microVU. Do not start a later child before the
+   previous one has matching dumps.
 2. Then #10 (box glyphs), #14 (display env), #16, #17, #3-#5. Open an issue per new blocker.
 3. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).
