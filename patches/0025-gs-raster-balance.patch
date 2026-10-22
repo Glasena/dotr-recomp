@@ -1,0 +1,220 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -5,6 +5,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <condition_variable>
+ #include <cstdint>
+ #include <mutex>
+@@ -47,9 +48,10 @@
+ 
+     void DrawPrimitive(const GSPrimitiveBatch &batch);
+     void DrawPrimitiveParallel(const GSPrimitiveBatch *batches, size_t count);
+-    void DeferPrimitive(const GSPrimitiveBatch &batch);
++    void DeferPrimitive(const GSPrimitiveBatch &batch, bool large);
+     void FlushDeferredUnlocked();
+-    void RasterWorkerLoop(uint32_t index);
++    void RasterWorkerLoop();
++    void RasterBands(const GSPrimitiveBatch *batches, size_t count);
+     void DrawSprite(const GSPrimitiveBatch &batch);
+     void DrawTriangle(const GSPrimitiveBatch &batch);
+     void DrawLine(const GSPrimitiveBatch &batch);
+@@ -83,8 +85,9 @@
+     std::array<uint32_t, 2> m_clutCbp{};
+     GSMem::TexturePageCache m_texturePageCache;
+ 
+-    // Large sprites/triangles are rasterized by row bands on a small pool (worker 0 is the caller), synchronously:
+-    // the draw returns only when every band is done, so primitive order and VRAM visibility are unchanged.
++    // Sprites/triangles are rasterized by row bands on a small pool (the caller is one of the rasterizers),
++    // synchronously: the draw returns only when every band is done, so primitive order and VRAM visibility are
++    // unchanged. There are several bands per rasterizer, claimed through m_rasterNextBand, to balance uneven rows.
+     std::vector<std::thread> m_rasterWorkers;
+     std::mutex m_rasterMutex;
+     std::condition_variable m_rasterStart;
+@@ -93,12 +96,15 @@
+     size_t m_rasterBatchCount = 0;
+     uint64_t m_rasterGeneration = 0;
+     uint32_t m_rasterPending = 0;
++    uint32_t m_rasterBands = 1;
++    std::atomic<uint32_t> m_rasterNextBand{0};
+     int m_rasterRounding = 0;
+     bool m_rasterStop = false;
+ 
+-    // Small sprites/triangles are queued and rasterized together in one band-parallel pass. Every other backend
+-    // entry point flushes the queue first, and a primitive that would read VRAM a queued one writes (or write VRAM
+-    // a queued one reads as texture) flushes it too, so the result matches drawing them one by one.
++    // Sprites/triangles are queued and rasterized together in one band-parallel pass. Every other backend entry point
++    // flushes the queue first (LoadClut only when it changes the CLUT or reads a queued target), and a primitive that
++    // would read VRAM a queued one writes (or write VRAM a queued one reads as texture) flushes it too, so the result
++    // matches drawing them one by one.
+     struct VramRange
+     {
+         uint32_t lo = ~0u, hi = 0u; // 256-byte blocks, [lo, hi)
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -530,10 +530,16 @@
+     Reset();
+ 
+     const uint32_t hw = std::max(1u, std::thread::hardware_concurrency());
+-    const uint32_t rasterizers = std::clamp(hw / 2u, 1u, 8u);
++    // PS2X_GS_RASTER_THREADS / PS2X_GS_RASTER_BANDS override the rasterizer and band counts for A/B runs.
++    uint32_t rasterizers = std::clamp(hw / 2u, 1u, 8u);
++    if (const char *env = std::getenv("PS2X_GS_RASTER_THREADS"))
++        rasterizers = std::clamp<uint32_t>(static_cast<uint32_t>(std::atoi(env)), 1u, 64u);
++    m_rasterBands = rasterizers * 4u;
++    if (const char *env = std::getenv("PS2X_GS_RASTER_BANDS"))
++        m_rasterBands = std::max<uint32_t>(static_cast<uint32_t>(std::atoi(env)), 1u);
+     for (uint32_t i = 1; i < rasterizers; ++i)
+-        m_rasterWorkers.emplace_back([this, i]()
+-                                     { RasterWorkerLoop(i); });
++        m_rasterWorkers.emplace_back([this]()
++                                     { RasterWorkerLoop(); });
+ }
+ 
+ GSCpuBackend::~GSCpuBackend()
+@@ -565,7 +571,23 @@
+     }
+ }
+ 
+-void GSCpuBackend::RasterWorkerLoop(uint32_t index)
++// Every rasterizer takes the next unclaimed band until none are left, so a thread that drew a light band helps with
++// the rest. Bands are disjoint row sets and each band draws the primitives in order, so the pixels match a serial draw.
++void GSCpuBackend::RasterBands(const GSPrimitiveBatch *batches, size_t count)
++{
++    for (uint32_t band; (band = m_rasterNextBand.fetch_add(1u, std::memory_order_relaxed)) < m_rasterBands;)
++        runRasterBand(band, m_rasterBands, [&]()
++                      {
++                          for (size_t i = 0; i < count; ++i)
++                          {
++                              if (batches[i].state.prim.type == GS_PRIM_SPRITE)
++                                  DrawSprite(batches[i]);
++                              else
++                                  DrawTriangle(batches[i]);
++                          } });
++}
++
++void GSCpuBackend::RasterWorkerLoop()
+ {
+     uint64_t seen = 0;
+     for (;;)
+@@ -586,15 +608,7 @@
+         }
+         // The caller may be inside the VU1 interpreter, which rasterizes with round-toward-zero.
+         std::fesetround(rounding);
+-        runRasterBand(index, static_cast<uint32_t>(m_rasterWorkers.size() + 1u), [&]()
+-                      {
+-                          for (size_t i = 0; i < batchCount; ++i)
+-                          {
+-                              if (batches[i].state.prim.type == GS_PRIM_SPRITE)
+-                                  DrawSprite(batches[i]);
+-                              else
+-                                  DrawTriangle(batches[i]);
+-                          } });
++        RasterBands(batches, batchCount);
+         bool last = false;
+         {
+             std::lock_guard<std::mutex> lock(m_rasterMutex);
+@@ -613,24 +627,17 @@
+         m_rasterBatchCount = count;
+         m_rasterRounding = std::fegetround();
+         m_rasterPending = static_cast<uint32_t>(m_rasterWorkers.size());
++        m_rasterNextBand.store(0u, std::memory_order_relaxed);
+         ++m_rasterGeneration;
+     }
+     m_rasterStart.notify_all();
+-    runRasterBand(0u, static_cast<uint32_t>(m_rasterWorkers.size() + 1u), [&]()
+-                  {
+-                      for (size_t i = 0; i < count; ++i)
+-                      {
+-                          if (batches[i].state.prim.type == GS_PRIM_SPRITE)
+-                              DrawSprite(batches[i]);
+-                          else
+-                              DrawTriangle(batches[i]);
+-                      } });
++    RasterBands(batches, count);
+     std::unique_lock<std::mutex> lock(m_rasterMutex);
+     m_rasterDone.wait(lock, [this]()
+                       { return m_rasterPending == 0u; });
+ }
+ 
+-void GSCpuBackend::DeferPrimitive(const GSPrimitiveBatch &batch)
++void GSCpuBackend::DeferPrimitive(const GSPrimitiveBatch &batch, bool large)
+ {
+     const GSDrawState &state = batch.state;
+     const auto &ctx = state.context;
+@@ -658,6 +665,11 @@
+     if (!deferrable)
+     {
+         FlushDeferredUnlocked();
++        if (large)
++        {
++            DrawPrimitiveParallel(&batch, 1u);
++            return;
++        }
+         if (state.prim.type == GS_PRIM_SPRITE)
+             DrawSprite(batch);
+         else
+@@ -746,7 +758,6 @@
+ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    FlushDeferredUnlocked();
+     if (!m_vram || (!isFourBitIndexedPsm(tex0.psm) && !isEightBitIndexedPsm(tex0.psm)))
+         return;
+ 
+@@ -778,7 +789,24 @@
+         return;
+     }
+ 
++    // Queued primitives read the CLUT when they are rasterized, so flush them only if this load changes it, or if
++    // its source rows may be a queued primitive's frame or Z buffer (same conservative page range as DeferPrimitive).
++    const uint32_t clutRows = tex0.csm == 0u ? 16u : static_cast<uint32_t>(texclut.cov) + 1u;
++    const uint32_t clutPages = tex0.csm == 0u ? 1u : std::max<uint32_t>(texclut.cbw, 1u);
++    VramRange source;
++    source.lo = tex0.cbp;
++    source.hi = tex0.cbp + (clutPages * ((clutRows + 31u) / 32u) + 1u) * 32u;
++    if (source.hi > GSMem::MEMORY_SIZE / 256u || source.overlaps(m_deferredFrame) || source.overlaps(m_deferredZ))
++        FlushDeferredUnlocked();
++    const std::array<uint16_t, 512> previous = m_clut;
+     LoadClutUnlocked(tex0, texclut);
++    if (!m_deferred.empty() && m_clut != previous)
++    {
++        const std::array<uint16_t, 512> loaded = m_clut;
++        m_clut = previous;
++        FlushDeferredUnlocked();
++        m_clut = loaded;
++    }
+ }
+ 
+ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+@@ -1043,13 +1071,7 @@
+     case GS_PRIM_TRIANGLE:
+     case GS_PRIM_TRISTRIP:
+     case GS_PRIM_TRIFAN:
+-        if (parallel())
+-        {
+-            FlushDeferredUnlocked();
+-            DrawPrimitiveParallel(&batch, 1u);
+-        }
+-        else
+-            DeferPrimitive(batch);
++        DeferPrimitive(batch, parallel());
+         break;
+     case GS_PRIM_LINE:
+     case GS_PRIM_LINESTRIP:
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -12,7 +12,7 @@
+ {
+     constexpr size_t kPublishBytes = 64u * 1024u;
+     constexpr size_t kEagerBytes = 4u * 1024u; // published at once when the worker is idle
+-    constexpr size_t kMaxPendingChunks = 8u;
++    constexpr size_t kMaxPendingChunks = 32u;
+ 
+     const char *const kSyncPointNames[] = {
+         "init", "reset", "sync-finish", "sync-l2h", "sync-present", "sync-debug", "sync-reset", "present",
