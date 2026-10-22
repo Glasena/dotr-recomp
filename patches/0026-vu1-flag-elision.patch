@@ -1,0 +1,532 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -42,8 +42,42 @@
+     {
+         std::vector<uint16_t> upper;
+         std::vector<uint16_t> lower;
++        // Per block start pair, per block pair: 0, or the ready offset of the next FMAC flag write when this
++        // pair's MAC/status write is never read before it (see buildFastBlock). Empty: nothing to elide.
++        std::vector<std::vector<uint32_t>> elide;
+     };
+     std::unordered_map<const VU1Interpreter *, DirectIds> g_directIds;
++
++    // Upper handler ids run by directAddSubMul on the fast-block path: ADD/SUB/MUL/MADD/MSUB/OPMSUB and their
++    // ACC forms (ids 0x40+), not MAX/MINI/ABS/CLIP/ITOF/FTOI/NOP. These are every MAC/status flag writer.
++    constexpr bool isDirectFmacId(uint16_t id)
++    {
++        const uint16_t op = id >= 0x40u ? static_cast<uint16_t>(id - 0x40u) : id;
++        return op <= 0x0Fu || (op >= 0x18u && op <= 0x1Cu) ||
++               (op >= 0x1Eu && op <= 0x2Eu && op != 0x1Fu && op != 0x2Bu);
++    }
++
++    // Lower FSEQ/FSAND/FSOR/FMEQ/FMAND/FMOR (opHi 0x14-0x1B, FSSET 0x15 excluded) read MAC or status.
++    constexpr bool isFlagReader(uint32_t lower, bool iBit)
++    {
++        const uint32_t opHi = lower >> 25;
++        return !iBit && opHi >= 0x14u && opHi <= 0x1Bu && opHi != 0x15u;
++    }
++
++    struct FlagStats
++    {
++        uint64_t fmacs = 0, fast = 0, elided = 0, checks = 0, mismatches = 0;
++    } g_flagStats;
++
++    void printFlagStats()
++    {
++        std::fprintf(stderr, "[vu1:flag-check] fmacs=%llu sse_fast=%llu elided=%llu checks=%llu mismatches=%llu\n",
++                     static_cast<unsigned long long>(g_flagStats.fmacs),
++                     static_cast<unsigned long long>(g_flagStats.fast),
++                     static_cast<unsigned long long>(g_flagStats.elided),
++                     static_cast<unsigned long long>(g_flagStats.checks),
++                     static_cast<unsigned long long>(g_flagStats.mismatches));
++    }
+ }
+ 
+ void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
+@@ -1986,6 +2020,53 @@
+         if (w.offset > span)
+             block->exitLate.push_back(w);
+ 
++    // Dead MAC/status writes. A reader at cycle r sees the newest FMAC write with ready cycle <= r, so writer w
++    // with next writer n is invisible when no MAC/status reader issues in [ready(w), ready(n)). Its sticky bits
++    // are carried to the next write that is queued; writes whose next writer is not ready when the block exits
++    // are queued at exit (run(), leaveBlock). FSSET replaces sticky bits and edits same-cycle entries: such
++    // blocks keep every write.
++    {
++        const uint32_t count = block->pairCount;
++        std::vector<uint32_t> elide;
++        std::vector<uint32_t> writers;
++        std::vector<uint32_t> readers;
++        bool fsset = false;
++        for (uint32_t k = 0; k < count; ++k)
++        {
++            const DecodedInstructionPair &d = m_decodedCodeCache[startPair + k];
++            if (!d.iBit && (d.lower >> 25) == 0x15u)
++                fsset = true;
++            if (isFlagReader(d.lower, d.iBit))
++                readers.push_back(block->issue[k]);
++            if (DEST(d.upper) != 0u && isDirectFmacId(vu1UpperHandlerId(d.upper)))
++                writers.push_back(k);
++        }
++        bool any = false;
++        if (!fsset && writers.size() > 1u)
++        {
++            elide.assign(count, 0u);
++            for (size_t w = 0; w + 1u < writers.size(); ++w)
++            {
++                const uint32_t from = block->issue[writers[w]] + kFmacLatency;
++                const uint32_t until = block->issue[writers[w + 1u]] + kFmacLatency;
++                bool read = false;
++                for (uint32_t r : readers)
++                    read |= r >= from && r < until;
++                if (!read)
++                {
++                    elide[writers[w]] = until;
++                    any = true;
++                }
++            }
++        }
++        if (!any)
++            elide.clear();
++        DirectIds &ids = g_directIds[this];
++        if (ids.elide.size() != m_cachedPairCount)
++            ids.elide.assign(m_cachedPairCount, {});
++        ids.elide[startPair] = std::move(elide);
++    }
++
+     m_fastBlocks[startPair] = std::move(block);
+     return m_fastBlocks[startPair].get();
+ }
+@@ -2161,6 +2242,220 @@
+     const uint64_t budgetEnd = m_cycle + maxCycles;
+     bool programEnded = false;
+ 
++    // MAC/status flags on the fast-block path (#34). Every FMAC still computes its exact Z/S/U/O conditions (SSE
++    // when all lanes are strictly normal, else normalizeFmacResult/calculateFmacProductSticky) and ORs them into
++    // the sticky bits, but a write that no reader can see is not queued (see buildFastBlock). PS2X_VU_NO_FLAG_ELIDE
++    // queues every write. PS2X_VU_FLAG_CHECK runs the real pipeline with the plain applyFmacDest model and the
++    // elided one in a shadow, and compares MAC, status and clip at every flag reader and at block exit.
++    static const bool noElide = std::getenv("PS2X_VU_NO_FLAG_ELIDE") != nullptr;
++    static const bool flagCheck = std::getenv("PS2X_VU_FLAG_CHECK") != nullptr;
++    const bool directPath = directIds != nullptr && !noDirect;
++    const bool shadowActive = flagCheck && directPath;
++    const uint32_t *blockElide = nullptr; // DirectIds::elide of the current block, or null
++    uint32_t stickyCarry = 0u;            // sticky Z/S/U/O of elided writes, not queued yet
++    struct ElidedWrite
++    {
++        uint64_t issue = 0;
++        uint64_t nextReady = 0; // ready cycle of the write that hides it
++        uint8_t laneFlags[4]{};
++        uint8_t dest = 0;
++        uint32_t sticky = 0; // stickyCarry including this write
++    };
++    std::array<ElidedWrite, 8> elidedWrites{}; // only the last few can still be visible at block exit
++    uint32_t elidedCount = 0u;
++    struct ShadowFlags
++    {
++        std::vector<FlagPipelineEntry> pending; // in commit order
++        uint32_t mac = 0, status = 0, clip = 0;
++    } shadow;
++
++    auto macStatus = [](const uint8_t laneFlags[4], uint8_t dest, uint32_t &mac, uint32_t &status)
++    {
++        // Same as updateFmacFlags().
++        mac = status = 0u;
++        for (uint32_t component = 0; component < 4u; ++component)
++        {
++            const uint8_t lane = laneForComponent(component);
++            if ((dest & lane) == 0u)
++                continue;
++            const uint32_t flags = laneFlags[component];
++            if ((flags & 0x1u) != 0u)
++                mac |= lane;
++            if ((flags & 0x2u) != 0u)
++                mac |= static_cast<uint32_t>(lane) << 4;
++            if ((flags & 0x4u) != 0u)
++                mac |= static_cast<uint32_t>(lane) << 8;
++            if ((flags & 0x8u) != 0u)
++                mac |= static_cast<uint32_t>(lane) << 12;
++            status |= flags;
++        }
++    };
++    auto applyFlagEntry = [](const FlagPipelineEntry &entry, uint32_t &mac, uint32_t &status, uint32_t &clip)
++    {
++        // Same as commitReadyPipelines().
++        if (entry.writesMac)
++            mac = entry.mac;
++        if (entry.writesStatus)
++        {
++            const uint32_t current = entry.status & 0xFu;
++            status = (status & 0xFF0u) | current | ((current | entry.extraSticky) << 6);
++        }
++        if (entry.writesSticky)
++            status = (status & 0x03Fu) | (entry.status & 0xFC0u);
++        if (entry.writesClip)
++            clip = entry.clip;
++    };
++    auto shadowInsert = [&](const FlagPipelineEntry &entry)
++    {
++        auto at = shadow.pending.end();
++        while (at != shadow.pending.begin() && (at - 1)->readyCycle > entry.readyCycle)
++            --at;
++        shadow.pending.insert(at, entry);
++    };
++    // Queues an FMAC flag write issued at `issue`, into the real pipeline or the check-mode shadow.
++    auto queueFlags = [&](uint64_t issue, const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky,
++                          bool toShadow)
++    {
++        if (!toShadow)
++        {
++            const uint64_t now = m_cycle;
++            m_cycle = issue;
++            updateFmacFlags(laneFlags, dest, extraSticky);
++            m_cycle = now;
++            return;
++        }
++        FlagPipelineEntry entry{};
++        entry.valid = true;
++        entry.issueCycle = issue;
++        entry.readyCycle = issue + kFmacLatency;
++        macStatus(laneFlags, dest, entry.mac, entry.status);
++        entry.extraSticky = extraSticky;
++        entry.writesMac = entry.writesStatus = true;
++        shadowInsert(entry);
++    };
++    auto writeFlags = [&](const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky, bool toShadow)
++    {
++        const uint32_t nextReady = blockElide ? blockElide[m_fastIndex] : 0u;
++        if (nextReady == 0u)
++        {
++            queueFlags(m_cycle, laneFlags, dest, extraSticky | stickyCarry, toShadow);
++            stickyCarry = 0u;
++            return;
++        }
++        uint32_t mac = 0u, status = 0u;
++        macStatus(laneFlags, dest, mac, status);
++        stickyCarry |= (status | extraSticky) & 0xFu;
++        ElidedWrite &write = elidedWrites[elidedCount++ & 7u];
++        write.issue = m_cycle;
++        write.nextReady = m_fastStart + nextReady;
++        std::memcpy(write.laneFlags, laneFlags, 4u);
++        write.dest = dest;
++        write.sticky = stickyCarry;
++        ++g_flagStats.elided;
++    };
++    // At block exit, a write whose hiding write is not ready yet is visible from here on: queue it after all.
++    auto queueVisibleElided = [&](bool toShadow)
++    {
++        for (uint32_t n = elidedCount > 8u ? elidedCount - 8u : 0u; n < elidedCount; ++n)
++        {
++            const ElidedWrite &write = elidedWrites[n & 7u];
++            if (write.nextReady > m_cycle)
++                queueFlags(write.issue, write.laneFlags, write.dest, write.sticky, toShadow);
++        }
++        elidedCount = 0u;
++        stickyCarry = 0u;
++    };
++    auto shadowCommit = [&]()
++    {
++        size_t done = 0;
++        while (done < shadow.pending.size() && shadow.pending[done].readyCycle <= m_cycle)
++            applyFlagEntry(shadow.pending[done++], shadow.mac, shadow.status, shadow.clip);
++        shadow.pending.erase(shadow.pending.begin(), shadow.pending.begin() + static_cast<std::ptrdiff_t>(done));
++    };
++    auto realPendingInOrder = [&]()
++    {
++        std::vector<FlagPipelineEntry> entries;
++        for (uint32_t bits = m_flagMask; bits != 0u; bits &= bits - 1u)
++            entries.push_back(m_flagPipeline[std::countr_zero(bits)]);
++        std::stable_sort(entries.begin(), entries.end(), [](const FlagPipelineEntry &a, const FlagPipelineEntry &b)
++                         { return a.readyCycle < b.readyCycle; });
++        return entries;
++    };
++    // Status bits FMAC flags and FSSET touch; D/I come from the FDIV pipeline, which the shadow does not model.
++    constexpr uint32_t kCheckedStatus = 0x3CFu;
++    auto compareFlags = [&](const char *where, uint32_t mac, uint32_t status, uint32_t clip, uint32_t shadowMac,
++                            uint32_t shadowStatus, uint32_t shadowClip)
++    {
++        ++g_flagStats.checks;
++        if (mac == shadowMac && ((status ^ shadowStatus) & kCheckedStatus) == 0u && clip == shadowClip)
++            return;
++        if (++g_flagStats.mismatches <= 32u)
++            std::fprintf(stderr,
++                         "[vu1:flag-check] mismatch at %s: block=0x%x pc=0x%x cycle=%llu mac %04x/%04x status "
++                         "%03x/%03x clip %06x/%06x (exact/elided)\n",
++                         where, m_fastBlock ? m_fastBlock->startPair * 8u : 0u, m_state.pc,
++                         static_cast<unsigned long long>(m_cycle), mac, shadowMac, status & kCheckedStatus,
++                         shadowStatus & kCheckedStatus, clip, shadowClip);
++    };
++    auto onBlockEnter = [&]()
++    {
++        blockElide = nullptr;
++        if (directPath && !noElide)
++        {
++            const uint32_t start = m_fastBlock->startPair;
++            if (start < directIds->elide.size() && !directIds->elide[start].empty())
++                blockElide = directIds->elide[start].data();
++        }
++        elidedCount = 0u;
++        stickyCarry = 0u;
++        if (shadowActive)
++        {
++            shadow.mac = m_state.mac;
++            shadow.status = m_state.status;
++            shadow.clip = m_state.clip;
++            shadow.pending = realPendingInOrder();
++        }
++    };
++    auto leaveBlock = [&]()
++    {
++        if (shadowActive)
++        {
++            queueVisibleElided(true);
++            shadowCommit();
++            compareFlags("exit", m_state.mac, m_state.status, m_state.clip, shadow.mac, shadow.status, shadow.clip);
++            uint32_t mac = m_state.mac, status = m_state.status, clip = m_state.clip;
++            for (const FlagPipelineEntry &entry : realPendingInOrder())
++                applyFlagEntry(entry, mac, status, clip);
++            for (const FlagPipelineEntry &entry : shadow.pending)
++                applyFlagEntry(entry, shadow.mac, shadow.status, shadow.clip);
++            shadow.pending.clear();
++            compareFlags("exit-drained", mac, status, clip, shadow.mac, shadow.status, shadow.clip);
++        }
++        else if (elidedCount != 0u)
++        {
++            queueVisibleElided(false);
++            commitReadyPipelines(); // a write ready by now must be visible to the interpreter's next pair
++        }
++        exitFastBlock();
++    };
++    // Check mode: copy this pair's non-FMAC flag entries (FSSET, CLIP, FCSET) to the shadow.
++    auto mirrorToShadow = [&](uint32_t maskBefore)
++    {
++        for (uint32_t bits = m_flagMask & ~maskBefore; bits != 0u; bits &= bits - 1u)
++        {
++            const FlagPipelineEntry &entry = m_flagPipeline[std::countr_zero(bits)];
++            if (!entry.writesMac)
++            {
++                shadowInsert(entry);
++                continue;
++            }
++            if (!entry.writesStatus) // FSSET in the same pair dropped the FMAC status write
++                for (FlagPipelineEntry &own : shadow.pending)
++                    if (own.writesMac && own.issueCycle == entry.issueCycle)
++                        own.writesStatus = false;
++        }
++    };
++
+     // ADD/SUB/MUL/MADD/MSUB/OPMSUB into VF and their ACC forms (special field, same numbering; special 0x2E
+     // is OPMULA), broadcast and Q/I included, on the fast-block path. The interpreter table stays scalar.
+     auto directAddSubMul = [&](uint32_t word, bool toAcc)
+@@ -2212,40 +2507,113 @@
+                 right = loaded;
+         }
+ 
+-        if (toAcc ? isFmacProductSum(0xFFu, op) : isFmacProductSum(op, 0xFFu))
++        const bool productSum = toAcc ? isFmacProductSum(0xFFu, op) : isFmacProductSum(op, 0xFFu);
++        const bool mul = (op >= 0x18u && op <= 0x1Cu) || op == 0x1Eu || op == 0x2Au || op == 0x2Eu;
++        __m128 product = _mm_setzero_ps();
++        float result[4];
++        if (productSum)
+         {
+             float acc[4];
+             for (int c = 0; c < 4; ++c)
+                 acc[c] = normalizeOperand(m_state.acc[c]);
+-            const __m128 product = _mm_mul_ps(left, right);
++            product = _mm_mul_ps(left, right);
+             const bool productSub = (op >= 0x0Cu && op <= 0x0Fu) || op == 0x25u || op == 0x27u ||
+                                     op == 0x2Du || op == 0x2Eu;
+-            const __m128 sum = productSub ? _mm_sub_ps(_mm_loadu_ps(acc), product)
+-                                          : _mm_add_ps(_mm_loadu_ps(acc), product);
+-            float result[4];
+-            _mm_storeu_ps(result, sum);
+-            if (op == 0x2Eu)
+-                result[3] = 0.0f;
+-            if (toAcc)
+-                applyFmacDestAcc(result, DEST(word));
+-            else
+-                applyFmacDest(m_state.vf[FD(word)], result, DEST(word));
+-            return;
++            _mm_storeu_ps(result, productSub ? _mm_sub_ps(_mm_loadu_ps(acc), product)
++                                             : _mm_add_ps(_mm_loadu_ps(acc), product));
++        }
++        else
++        {
++            const bool sub = (op >= 0x04u && op <= 0x07u) || op == 0x24u || op == 0x26u || op == 0x2Cu;
++            _mm_storeu_ps(result, mul   ? _mm_mul_ps(left, right)
++                                  : sub ? _mm_sub_ps(left, right)
++                                        : _mm_add_ps(left, right));
+         }
+-
+-        const bool mul = (op >= 0x18u && op <= 0x1Cu) || op == 0x1Eu || op == 0x2Au || op == 0x2Eu;
+-        const bool sub = (op >= 0x04u && op <= 0x07u) || op == 0x24u || op == 0x26u || op == 0x2Cu;
+-        const __m128 wide = mul ? _mm_mul_ps(left, right)
+-                          : sub ? _mm_sub_ps(left, right)
+-                                : _mm_add_ps(left, right);
+-        float result[4];
+-        _mm_storeu_ps(result, wide);
+         if (op == 0x2Eu)
+             result[3] = 0.0f;
+-        if (toAcc)
+-            applyFmacDestAcc(result, DEST(word));
++
++        const uint8_t dest = DEST(word);
++        if (dest == 0u)
++            return; // no lane and no flag write, as in applyFmacDest()
++        if ((++g_flagStats.fmacs & 0xFFFFFu) == 0u && flagCheck)
++            printFlagStats(); // test mode leaves with _Exit, so report as we go
++        float *const dst = toAcc ? m_state.acc : m_state.vf[FD(word)];
++
++        // normalizeFmacResult()/calculateFmacProductSticky() for all active lanes at once, when every lane is one
++        // of these cases (operands are already normalized: zero, normal or +/-FLT_MAX):
++        // - the result (and for ACC +/- product, the product, with the cancellation bound on ACC) is strictly
++        //   inside (FLT_MIN, FLT_MAX): S only, no clamping, as normalizeFmacResult's own fast path;
++        // - ADD/SUB result +/-0: without flush-to-zero a nonzero exact sum of two floats never rounds to zero, so
++        //   the exact result is that zero: Z, S from its sign;
++        // - MUL or ACC +/- product with a zero operand lane: the product is exactly +/-0, so the exact result is
++        //   the float one (+/-0, or ACC when that is strictly normal) and the product reports Z and its sign.
++        // Anything else (underflow, overflow, cancellation) takes the exact path.
++        const int active = ((dest >> 3) & 1) | ((dest >> 1) & 2) | ((dest << 1) & 4) | ((dest << 3) & 8);
++        const __m128i bits = _mm_castps_si128(_mm_loadu_ps(result));
++        const __m128i magnitudeMask = _mm_set1_epi32(0x7FFFFFFF);
++        const __m128i minNormal = _mm_set1_epi32(0x00800000);
++        const __m128i maxNormal = _mm_set1_epi32(0x7F7FFFFF);
++        const __m128i magnitude = _mm_and_si128(bits, magnitudeMask);
++        const __m128i normal = _mm_and_si128(_mm_cmpgt_epi32(magnitude, minNormal),
++                                             _mm_cmplt_epi32(magnitude, maxNormal));
++        const __m128i zero = _mm_cmpeq_epi32(magnitude, _mm_setzero_si128());
++        const __m128i operandZero = _mm_castps_si128(_mm_or_ps(_mm_cmpeq_ps(left, _mm_setzero_ps()),
++                                                               _mm_cmpeq_ps(right, _mm_setzero_ps())));
++        __m128i ok;
++        int productZero = 0;
++        if (productSum)
++        {
++            const __m128i exponent = _mm_srli_epi32(magnitude, 23);
++            const __m128i accBits = _mm_castps_si128(_mm_loadu_ps(m_state.acc));
++            const __m128i accExponent = _mm_srli_epi32(_mm_and_si128(accBits, magnitudeMask), 23);
++            const __m128i productMagnitude = _mm_and_si128(_mm_castps_si128(product), magnitudeMask);
++            ok = _mm_and_si128(normal, _mm_cmpgt_epi32(exponent, _mm_set1_epi32(2)));
++            ok = _mm_and_si128(ok, _mm_cmplt_epi32(exponent, _mm_set1_epi32(254)));
++            ok = _mm_and_si128(ok, _mm_cmplt_epi32(accExponent, _mm_set1_epi32(254)));
++            ok = _mm_andnot_si128(_mm_cmpgt_epi32(accExponent, _mm_add_epi32(exponent, _mm_set1_epi32(16))), ok);
++            ok = _mm_and_si128(ok, _mm_cmpgt_epi32(productMagnitude, minNormal));
++            ok = _mm_and_si128(ok, _mm_cmplt_epi32(productMagnitude, maxNormal));
++            ok = _mm_or_si128(ok, _mm_and_si128(operandZero, _mm_or_si128(normal, zero)));
++            productZero = _mm_movemask_ps(_mm_castsi128_ps(operandZero)) & active;
++        }
++        else
++            ok = _mm_or_si128(normal, mul ? _mm_and_si128(zero, operandZero) : zero);
++        uint8_t laneFlags[4];
++        uint32_t extraSticky = 0u;
++        float normalized[4];
++        float *flagged = result; // the clamped result the flags describe
++        if ((_mm_movemask_ps(_mm_castsi128_ps(ok)) & active) == active)
++        {
++            ++g_flagStats.fast;
++            const int signs = _mm_movemask_ps(_mm_castsi128_ps(bits));
++            const int zeros = _mm_movemask_ps(_mm_castsi128_ps(zero));
++            for (int c = 0; c < 4; ++c)
++                laneFlags[c] = static_cast<uint8_t>(((zeros >> c) & 1) | (((signs >> c) & 1) << 1));
++            if (productSum)
++                extraSticky = ((_mm_movemask_ps(product) & active) != 0 ? 0x2u : 0u) | (productZero != 0 ? 0x1u : 0u);
++        }
+         else
+-            applyFmacDest(m_state.vf[FD(word)], result, DEST(word));
++        {
++            if (shadowActive)
++            {
++                std::memcpy(normalized, result, sizeof(normalized)); // the reference below normalizes `result`
++                flagged = normalized;
++            }
++            normalizeFmacResult(flagged, dest, laneFlags);
++            extraSticky = calculateFmacProductSticky(dest);
++        }
++
++        if (shadowActive)
++        {
++            writeFlags(laneFlags, dest, extraSticky, true);
++            if (toAcc)
++                applyFmacDestAcc(result, dest);
++            else
++                applyFmacDest(dst, result, dest);
++            return;
++        }
++        writeFlags(laneFlags, dest, extraSticky, false);
++        applyDest(dst, flagged, dest);
+     };
+ 
+     // Executes one pair's upper and lower instructions; register results land in m_state right away.
+@@ -2261,17 +2629,8 @@
+             if (directOk)
+             {
+                 const uint16_t id = directIds->upper[directPair];
+-                // Not MAX/MINI (0x10-0x17, 0x1D, 0x1F, 0x2B) nor anything past OPMSUB.
+-                const bool directFmac = id <= 0x0Fu || (id >= 0x18u && id <= 0x1Cu) ||
+-                                        (id >= 0x1Eu && id <= 0x2Eu && id != 0x1Fu && id != 0x2Bu);
+-                // ACC forms: special ids 0x40+, not ABS (0x1D), CLIP (0x1F), 0x2B, ITOF/FTOI or NOP.
+-                const uint16_t special = static_cast<uint16_t>(id - 0x40u);
+-                const bool directAcc = id >= 0x40u &&
+-                                       (special <= 0x0Fu || (special >= 0x18u && special <= 0x1Cu) ||
+-                                        (special >= 0x1Eu && special <= 0x2Eu && special != 0x1Fu &&
+-                                         special != 0x2Bu));
+-                if (directFmac || directAcc)
+-                    directAddSubMul(decoded.upper, directAcc);
++                if (isDirectFmacId(id))
++                    directAddSubMul(decoded.upper, id >= 0x40u);
+                 else
+                     g_vu1UpperFn[id](*this, decoded.upper);
+             }
+@@ -2382,8 +2741,8 @@
+         if (m_state.pc + 8u > codeSize)
+             break;
+ 
+-        if (!m_fastBlock)
+-            tryEnterFastBlock(budgetEnd);
++        if (!m_fastBlock && tryEnterFastBlock(budgetEnd))
++            onBlockEnter();
+         if (m_fastBlock)
+         {
+             // Block mode: the issue cycle comes from the block's static timing, no hazard scan or write queues.
+@@ -2401,13 +2760,22 @@
+                 }
+             }
+             if (leave)
+-                exitFastBlock(); // the interpreter runs this pair below
++                leaveBlock(); // the interpreter runs this pair below
+             else
+             {
+                 const uint32_t viWriteBits = decoded.lowerUsage.viWrite & 0xFFFEu;
+                 const uint8_t writtenVi = viWriteBits != 0u ? static_cast<uint8_t>(std::countr_zero(viWriteBits)) : 0u;
+                 const int32_t oldVi = writtenVi != 0u ? m_state.vi[writtenVi] : 0;
++                const uint32_t flagMaskBefore = m_flagMask;
++                if (shadowActive && isFlagReader(decoded.lower, decoded.iBit))
++                {
++                    shadowCommit();
++                    compareFlags("reader", m_state.mac, m_state.status, m_state.clip, shadow.mac, shadow.status,
++                                 shadow.clip);
++                }
+                 executePair(decoded);
++                if (shadowActive)
++                    mirrorToShadow(flagMaskBefore);
+                 if (writtenVi != 0u)
+                     m_state.vi[writtenVi] = static_cast<int16_t>(m_state.vi[writtenVi]); // as the VI commit does
+                 m_viBranchBackupValid = false;
+@@ -2419,7 +2787,7 @@
+                 ++m_fastIndex;
+                 if (programEnded || m_fastIndex == block.pairCount ||
+                     m_state.pc != (block.startPair + m_fastIndex) * 8u)
+-                    exitFastBlock();
++                    leaveBlock();
+                 if (programEnded)
+                     break;
+                 continue;
+@@ -2525,7 +2893,7 @@
+             break;
+     }
+     if (m_fastBlock)
+-        exitFastBlock();
++        leaveBlock();
+ 
+     if (programEnded)
+     {

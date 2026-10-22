@@ -169,6 +169,14 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   vs ~17.1 for the 0024 binary in the same session; `queue-full` ~1 s -> ~0 per 5 s, the waits left are
   `sync-present`/`present` (~1.3 s per 5 s, the frame's raster tail). Raster threads 3-10 all land at ~20-21.5:
   the raster is no longer the limit. `PS2X_GS_RASTER_THREADS`/`PS2X_GS_RASTER_BANDS` override the counts.
+- Patch 0026 (2026-10-22, #34): fast-block FMAC flags. An SSE classifier gives exact Z/S (and product sticky)
+  for 99.98% of FMACs (normal results, ADD/SUB zero sums, zero-operand products); the rest keeps the long-double
+  path. MAC/status writes that no FMAND/FMEQ/FMOR/FSAND/FSEQ/FSOR sees before the next FMAC write in the block are
+  not queued (88% of FMACs; sticky bits carried to the next queued write; ones still visible at block exit are
+  queued then; FSSET blocks keep all). Map 1900->2300: ~25.6 VBlanks/s (15.3/15.9 s) vs ~22.3 for the 0025
+  binary (17.5/18.5 s, same session); `PS2X_VU_NO_FLAG_ELIDE=1` 17.4 s. `PS2X_VU_FLAG_CHECK=1` runs the real
+  pipeline with the old model and the new one in a shadow, comparing MAC/status/clip at each reader and block
+  exit: 0 mismatches over 127.9M FMACs to VBlank 2300 (a broken analysis gives 336k). Dumps identical.
 
 ## Automated test mode (2026-10-21, #18) — agents MUST use this, never manual screenshots
 - `tools/test_run.sh`: hidden window, no audio, uncapped VBlanks, scripted pad, PNG dumps, exit. Default script:
@@ -268,6 +276,7 @@ Order is tracked with the `priority: N` labels; #13 is pinned on GitHub.
    all in with identical dumps, but the map only went ~14.1 -> ~14.5 VBlanks/s, so #27 stays open: the FMAC
    math is not the remaining cost. Profile before the next VU1 step. Do not port PCSX2 microVU.
    Patch 0024 (#32, raster thread) took the map to ~18.5, patch 0025 (#33, raster batching/balance) to ~21.7;
-   the game thread now waits only at present (~1.3 s per 5 s). Profile the game thread (VU1) next.
+   the game thread now waits only at present (~1.3 s per 5 s). Patch 0026 (#34, FMAC flag classification and
+   dead-write elision) took it to ~25.6. Profile the game thread again before the next VU1 step.
 2. Then #10 (box glyphs), #14 (display env), #16, #17, #3-#5. Open an issue per new blocker.
 3. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).
