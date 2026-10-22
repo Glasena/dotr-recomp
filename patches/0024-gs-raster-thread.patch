@@ -1,0 +1,553 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -387,6 +387,7 @@
+     src/lib/gs/ps2_gs_memory.cpp
+     src/lib/gs/gs_frontend.cpp
+     src/lib/gs/gs_cpu_backend.cpp
++    src/lib/gs/gs_threaded_backend.cpp
+     src/lib/ps2_iop_host.cpp
+     src/lib/ps2_memory.cpp
+     src/lib/ps2_pad.cpp
+diff --git a/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+new file mode 100644
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/gs/gs_threaded_backend.h
+@@ -0,0 +1,114 @@
++// Adapted from Tobiichi-Port (GOW-Port) gs_threaded_backend.h, itself adapted from Taylor N. Albarnaz / LightVelox
++// (GPL-3.0), PS2Recomp sotc-port ac9efa070638ad3b3accd284de6f898d5ab271d1.
++#pragma once
++
++#include "runtime/gs/gs_backend.h"
++
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <deque>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++// Runs a raster backend on its own thread, in command order. Commands that only change GS state are queued;
++// anything that returns GS state (VRAM reads, snapshots, presentation, local-to-host bytes, Sync/FINISH) waits
++// until the worker has executed everything queued before it. The caller's FP rounding mode travels with the queue.
++// PS2X_GS_THREAD=0 runs the backend inline instead; PS2X_GS_SYNC_STATS=1 prints the waits per sync point every 5 s.
++class GSThreadedBackend final : public GSRasterBackend
++{
++public:
++    explicit GSThreadedBackend(std::unique_ptr<GSRasterBackend> inner);
++    ~GSThreadedBackend() override;
++
++    static bool EnabledByEnv();
++
++    void Initialize(uint8_t *vram, uint32_t vramSize) override;
++    void Reset() override;
++
++    void Submit(const GSPrimitiveBatch &batch) override;
++    void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override;
++
++    void BeginTransfer(const GSTransferCommand &command) override;
++    void UploadImage(const uint8_t *data, uint32_t sizeBytes) override;
++
++    void Flush() override;
++    void TextureFlush() override;
++    void Sync(GSSyncReason reason) override;
++    PresentationFrame Present(const GSPresentationRequest &request) override;
++
++    bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
++    uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override;
++
++    uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override;
++    void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override;
++    void SnapshotVram(std::vector<uint8_t> &out) const override;
++    GSTransferSnapshot GetTransferSnapshot() const override;
++
++private:
++    enum class Op : uint8_t
++    {
++        Rounding,
++        Submit,
++        LoadClut,
++        BeginTransfer,
++        Upload,
++        Flush,
++        TextureFlush,
++        WriteVram,
++    };
++
++    enum SyncPoint : uint8_t
++    {
++        kInitialize,
++        kReset,
++        kSyncFinish,
++        kSyncLocalToHost,
++        kSyncPresentation,
++        kSyncDebugReadback,
++        kSyncReset,
++        kPresent,
++        kClear,
++        kLocalToHost,
++        kReadVram,
++        kSnapshotVram,
++        kTransferSnapshot,
++        kQueueFull,
++        kSyncPointCount,
++    };
++
++    void Enqueue(Op op, const void *payload, uint32_t size);
++    void PublishLocked();
++    void RunOnWorker(SyncPoint point, const std::function<void()> &function) const;
++    void WorkerLoop();
++    void Execute(const std::vector<uint8_t> &chunk);
++    void CountWait(SyncPoint point, bool waited, std::chrono::steady_clock::time_point start) const;
++
++    std::unique_ptr<GSRasterBackend> m_inner;
++
++    mutable std::mutex m_producerMutex;
++    std::vector<uint8_t> m_open;
++    int m_lastRounding = -1;
++
++    mutable std::mutex m_queueMutex;
++    mutable std::condition_variable m_workCv;
++    mutable std::condition_variable m_doneCv;
++    std::deque<std::vector<uint8_t>> m_pending;
++    std::vector<std::vector<uint8_t>> m_spare;
++    uint64_t m_published = 0u;
++    uint64_t m_completed = 0u;
++    bool m_stop = false;
++    std::atomic<bool> m_idle{true};
++
++    bool m_stats = false;
++    mutable std::atomic<uint64_t> m_calls[kSyncPointCount]{};
++    mutable std::atomic<uint64_t> m_waits[kSyncPointCount]{};
++    mutable std::atomic<uint64_t> m_waitNs[kSyncPointCount]{};
++    mutable std::atomic<int64_t> m_lastPrintNs{0};
++
++    std::thread m_worker;
++};
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1,5 +1,6 @@
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/gs_cpu_backend.h"
++#include "runtime/gs/gs_threaded_backend.h"
+ #include "runtime/ps2_test_mode.h"
+ #include "ps2_log.h"
+ #include "runtime/ps2_memory.h"
+@@ -106,8 +107,19 @@
+ }
+ 
+ 
++namespace
++{
++    std::unique_ptr<GSRasterBackend> makeDefaultBackend()
++    {
++        auto cpu = std::make_unique<GSCpuBackend>();
++        if (!GSThreadedBackend::EnabledByEnv())
++            return cpu;
++        return std::make_unique<GSThreadedBackend>(std::move(cpu));
++    }
++}
++
+ GS::GS()
+-    : m_backend(std::make_unique<GSCpuBackend>())
++    : m_backend(makeDefaultBackend())
+ {
+     reset();
+ }
+@@ -118,7 +130,7 @@
+     m_localMemorySize = vramSize;
+     m_privRegs = privRegs;
+     if (!m_backend)
+-        m_backend = std::make_unique<GSCpuBackend>();
++        m_backend = makeDefaultBackend();
+     m_backend->Initialize(vram, vramSize);
+     reset();
+ }
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -0,0 +1,378 @@
++// Adapted from Tobiichi-Port (GOW-Port) gs_threaded_backend.cpp, itself adapted from Taylor N. Albarnaz / LightVelox
++// (GPL-3.0), PS2Recomp sotc-port ac9efa070638ad3b3accd284de6f898d5ab271d1.
++#include "runtime/gs/gs_threaded_backend.h"
++
++#include <cfenv>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <pthread.h>
++
++namespace
++{
++    constexpr size_t kPublishBytes = 64u * 1024u;
++    constexpr size_t kEagerBytes = 4u * 1024u; // published at once when the worker is idle
++    constexpr size_t kMaxPendingChunks = 8u;
++
++    const char *const kSyncPointNames[] = {
++        "init", "reset", "sync-finish", "sync-l2h", "sync-present", "sync-debug", "sync-reset", "present",
++        "clear", "l2h-bytes", "read-vram", "snapshot", "transfer-snapshot", "queue-full",
++    };
++
++    bool envFlag(const char *name, bool fallback)
++    {
++        const char *value = std::getenv(name);
++        if (!value || !*value)
++            return fallback;
++        return *value != '0';
++    }
++
++    struct LoadClutArgs
++    {
++        GSTex0Reg tex0;
++        GSTexClutReg texclut;
++    };
++
++    struct WriteVramArgs
++    {
++        uint32_t psm, base, bw, x, y, value;
++    };
++
++    template <typename T>
++    T readAt(const uint8_t *data)
++    {
++        T value;
++        std::memcpy(&value, data, sizeof(T));
++        return value;
++    }
++
++    int64_t nowNs()
++    {
++        return std::chrono::duration_cast<std::chrono::nanoseconds>(
++                   std::chrono::steady_clock::now().time_since_epoch())
++            .count();
++    }
++}
++
++bool GSThreadedBackend::EnabledByEnv()
++{
++    return envFlag("PS2X_GS_THREAD", true);
++}
++
++GSThreadedBackend::GSThreadedBackend(std::unique_ptr<GSRasterBackend> inner)
++    : m_inner(std::move(inner)), m_stats(envFlag("PS2X_GS_SYNC_STATS", false))
++{
++    m_open.reserve(kPublishBytes + 4096u);
++    m_lastPrintNs.store(nowNs());
++    m_worker = std::thread([this]
++                           { WorkerLoop(); });
++}
++
++GSThreadedBackend::~GSThreadedBackend()
++{
++    RunOnWorker(kReset, [] {}); // drain
++    {
++        std::lock_guard<std::mutex> lock(m_queueMutex);
++        m_stop = true;
++    }
++    m_workCv.notify_all();
++    if (m_worker.joinable())
++        m_worker.join();
++}
++
++void GSThreadedBackend::Enqueue(Op op, const void *payload, uint32_t size)
++{
++    std::lock_guard<std::mutex> lock(m_producerMutex);
++    const auto append = [&](Op kind, const void *bytes, uint32_t length)
++    {
++        uint8_t header[5];
++        header[0] = static_cast<uint8_t>(kind);
++        std::memcpy(header + 1u, &length, sizeof(length));
++        m_open.insert(m_open.end(), header, header + sizeof(header));
++        if (length)
++            m_open.insert(m_open.end(), static_cast<const uint8_t *>(bytes), static_cast<const uint8_t *>(bytes) + length);
++    };
++    // The rasterizer reads the rounding mode of the thread it runs on (VU1 XGKICKs run round-toward-zero).
++    const int rounding = std::fegetround();
++    if (rounding != m_lastRounding)
++    {
++        m_lastRounding = rounding;
++        append(Op::Rounding, &rounding, sizeof(rounding));
++    }
++    append(op, payload, size);
++    // Hand work over as soon as the worker is idle, so it rasterizes while the producer keeps going.
++    if (m_open.size() >= kPublishBytes || (m_open.size() >= kEagerBytes && m_idle.load(std::memory_order_relaxed)))
++        PublishLocked();
++}
++
++void GSThreadedBackend::PublishLocked()
++{
++    if (m_open.empty())
++        return;
++    std::vector<uint8_t> next;
++    {
++        std::unique_lock<std::mutex> lock(m_queueMutex);
++        if (m_pending.size() >= kMaxPendingChunks)
++        {
++            const auto start = std::chrono::steady_clock::now();
++            m_doneCv.wait(lock, [&]
++                          { return m_stop || m_pending.size() < kMaxPendingChunks; });
++            CountWait(kQueueFull, true, start);
++        }
++        m_pending.push_back(std::move(m_open));
++        ++m_published;
++        m_idle.store(false, std::memory_order_relaxed);
++        if (!m_spare.empty())
++        {
++            next = std::move(m_spare.back());
++            m_spare.pop_back();
++        }
++    }
++    m_workCv.notify_one();
++    next.clear();
++    m_open = std::move(next);
++    if (m_open.capacity() < kPublishBytes)
++        m_open.reserve(kPublishBytes + 4096u);
++}
++
++void GSThreadedBackend::RunOnWorker(SyncPoint point, const std::function<void()> &function) const
++{
++    // Wait until everything queued so far has executed, then run the call on the caller's thread (and rounding
++    // mode). Other threads may keep queueing meanwhile: the inner backend serializes calls itself, and their
++    // commands are simply later than this call, as without the worker.
++    auto *self = const_cast<GSThreadedBackend *>(this);
++    const auto start = std::chrono::steady_clock::now();
++    uint64_t target = 0u;
++    {
++        std::lock_guard<std::mutex> producer(m_producerMutex);
++        self->PublishLocked();
++        std::lock_guard<std::mutex> lock(m_queueMutex);
++        target = m_published;
++    }
++    bool waited = false;
++    {
++        std::unique_lock<std::mutex> lock(m_queueMutex);
++        waited = m_completed < target;
++        m_doneCv.wait(lock, [&]
++                      { return m_completed >= target || m_stop; });
++    }
++    function();
++    CountWait(point, waited, start);
++}
++
++void GSThreadedBackend::CountWait(SyncPoint point, bool waited, std::chrono::steady_clock::time_point start) const
++{
++    if (!m_stats)
++        return;
++    m_calls[point].fetch_add(1u, std::memory_order_relaxed);
++    if (waited)
++    {
++        m_waits[point].fetch_add(1u, std::memory_order_relaxed);
++        m_waitNs[point].fetch_add(static_cast<uint64_t>((std::chrono::steady_clock::now() - start).count()),
++                                  std::memory_order_relaxed);
++    }
++    const int64_t now = nowNs();
++    int64_t last = m_lastPrintNs.load(std::memory_order_relaxed);
++    if (now - last < 5000000000LL || !m_lastPrintNs.compare_exchange_strong(last, now))
++        return;
++    char line[1024];
++    int used = std::snprintf(line, sizeof(line), "[gs-thread] waits/calls (ms waited) over %.1f s:",
++                             static_cast<double>(now - last) / 1e9);
++    for (int i = 0; i < kSyncPointCount && used < static_cast<int>(sizeof(line)); ++i)
++    {
++        const uint64_t calls = m_calls[i].exchange(0u);
++        const uint64_t waits = m_waits[i].exchange(0u);
++        const uint64_t ns = m_waitNs[i].exchange(0u);
++        if (calls)
++            used += std::snprintf(line + used, sizeof(line) - used, " %s=%llu/%llu(%.0f)", kSyncPointNames[i],
++                                  static_cast<unsigned long long>(waits), static_cast<unsigned long long>(calls),
++                                  static_cast<double>(ns) / 1e6);
++    }
++    std::fprintf(stderr, "%s\n", line);
++}
++
++void GSThreadedBackend::WorkerLoop()
++{
++    pthread_setname_np(pthread_self(), "GSThread");
++    for (;;)
++    {
++        std::vector<uint8_t> chunk;
++        {
++            std::unique_lock<std::mutex> lock(m_queueMutex);
++            if (m_pending.empty())
++                m_idle.store(true, std::memory_order_relaxed);
++            m_workCv.wait(lock, [&]
++                          { return m_stop || !m_pending.empty(); });
++            if (m_stop)
++                return;
++            chunk = std::move(m_pending.front());
++            m_pending.pop_front();
++        }
++        Execute(chunk);
++        {
++            std::lock_guard<std::mutex> lock(m_queueMutex);
++            ++m_completed;
++            if (m_spare.size() < kMaxPendingChunks * 2u)
++                m_spare.push_back(std::move(chunk));
++        }
++        m_doneCv.notify_all();
++    }
++}
++
++void GSThreadedBackend::Execute(const std::vector<uint8_t> &chunk)
++{
++    const uint8_t *data = chunk.data();
++    const size_t size = chunk.size();
++    size_t offset = 0u;
++    while (offset + 5u <= size)
++    {
++        const Op op = static_cast<Op>(data[offset]);
++        const uint32_t length = readAt<uint32_t>(data + offset + 1u);
++        const uint8_t *payload = data + offset + 5u;
++        offset += 5u + length;
++        switch (op)
++        {
++        case Op::Rounding:
++            std::fesetround(readAt<int>(payload));
++            break;
++        case Op::Submit:
++            m_inner->Submit(readAt<GSPrimitiveBatch>(payload));
++            break;
++        case Op::LoadClut:
++        {
++            const LoadClutArgs args = readAt<LoadClutArgs>(payload);
++            m_inner->LoadClut(args.tex0, args.texclut);
++            break;
++        }
++        case Op::BeginTransfer:
++            m_inner->BeginTransfer(readAt<GSTransferCommand>(payload));
++            break;
++        case Op::Upload:
++            m_inner->UploadImage(length ? payload : nullptr, length);
++            break;
++        case Op::Flush:
++            m_inner->Flush();
++            break;
++        case Op::TextureFlush:
++            m_inner->TextureFlush();
++            break;
++        case Op::WriteVram:
++        {
++            const WriteVramArgs a = readAt<WriteVramArgs>(payload);
++            m_inner->WriteVram(a.psm, a.base, a.bw, a.x, a.y, a.value);
++            break;
++        }
++        }
++    }
++}
++
++void GSThreadedBackend::Initialize(uint8_t *vram, uint32_t vramSize)
++{
++    RunOnWorker(kInitialize, [&]
++                { m_inner->Initialize(vram, vramSize); });
++}
++
++void GSThreadedBackend::Reset()
++{
++    RunOnWorker(kReset, [&]
++                { m_inner->Reset(); });
++}
++
++void GSThreadedBackend::Submit(const GSPrimitiveBatch &batch)
++{
++    Enqueue(Op::Submit, &batch, sizeof(batch));
++}
++
++void GSThreadedBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
++{
++    const LoadClutArgs args{tex0, texclut};
++    Enqueue(Op::LoadClut, &args, sizeof(args));
++}
++
++void GSThreadedBackend::BeginTransfer(const GSTransferCommand &command)
++{
++    Enqueue(Op::BeginTransfer, &command, sizeof(command));
++}
++
++void GSThreadedBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
++{
++    Enqueue(Op::Upload, data, data ? sizeBytes : 0u);
++}
++
++void GSThreadedBackend::Flush()
++{
++    // Ordering only: every call that reads GS state drains the queue first.
++    Enqueue(Op::Flush, nullptr, 0u);
++}
++
++void GSThreadedBackend::TextureFlush()
++{
++    Enqueue(Op::TextureFlush, nullptr, 0u);
++}
++
++void GSThreadedBackend::Sync(GSSyncReason reason)
++{
++    SyncPoint point = kSyncFinish;
++    switch (reason)
++    {
++    case GSSyncReason::Finish: point = kSyncFinish; break;
++    case GSSyncReason::LocalToHost: point = kSyncLocalToHost; break;
++    case GSSyncReason::Presentation: point = kSyncPresentation; break;
++    case GSSyncReason::DebugReadback: point = kSyncDebugReadback; break;
++    case GSSyncReason::Reset: point = kSyncReset; break;
++    }
++    RunOnWorker(point, [&]
++                { m_inner->Sync(reason); });
++}
++
++PresentationFrame GSThreadedBackend::Present(const GSPresentationRequest &request)
++{
++    PresentationFrame frame;
++    RunOnWorker(kPresent, [&]
++                { frame = m_inner->Present(request); });
++    return frame;
++}
++
++bool GSThreadedBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
++{
++    bool result = false;
++    RunOnWorker(kClear, [&]
++                { result = m_inner->ClearFramebuffer(context, rgba); });
++    return result;
++}
++
++uint32_t GSThreadedBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
++{
++    uint32_t result = 0u;
++    RunOnWorker(kLocalToHost, [&]
++                { result = m_inner->ConsumeLocalToHostBytes(dst, maxBytes); });
++    return result;
++}
++
++uint32_t GSThreadedBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
++{
++    uint32_t result = 0u;
++    RunOnWorker(kReadVram, [&]
++                { result = m_inner->ReadVram(psm, base, bw, x, y); });
++    return result;
++}
++
++void GSThreadedBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
++{
++    const WriteVramArgs args{psm, base, bw, x, y, value};
++    Enqueue(Op::WriteVram, &args, sizeof(args));
++}
++
++void GSThreadedBackend::SnapshotVram(std::vector<uint8_t> &out) const
++{
++    RunOnWorker(kSnapshotVram, [&]
++                { m_inner->SnapshotVram(out); });
++}
++
++GSTransferSnapshot GSThreadedBackend::GetTransferSnapshot() const
++{
++    GSTransferSnapshot result;
++    RunOnWorker(kTransferSnapshot, [&]
++                { result = m_inner->GetTransferSnapshot(); });
++    return result;
++}

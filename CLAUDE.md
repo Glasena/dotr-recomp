@@ -156,6 +156,12 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   did ADD/SUB/MUL). Map samples after VBlank ~1800: ~14.6 VBlanks/s (14.1-15.0) vs ~14.2; dumps byte-identical.
 - Patch 0023 (2026-10-22, #31): the same SSE path for the ACC forms (ADDA/SUBA/MULA/MADDA/MSUBA, broadcast, Q/I,
   OPMULA). Map after VBlank ~1800: ~14.5 VBlanks/s (13.2-15.5, two runs) vs ~14.6: no measurable gain. Dumps identical.
+- Patch 0024 (2026-10-22, #32): `GSThreadedBackend` (ported from Tobiichi-Port) runs `GSCpuBackend` on a
+  `GSThread`; readers (VRAM, snapshot, Present, l2h, Sync/FINISH, clear) drain the queue, then call inline. Map
+  after VBlank ~1800: ~18.5 VBlanks/s (17.9-19.4, two runs) vs ~14.4 with `PS2X_GS_THREAD=0`. Dumps 1900/2100/2300
+  identical to `test_before`; default 1200/1500/1700 identical on/off. `PS2X_GS_SYNC_STATS=1`: the game thread
+  waits mostly on `queue-full` (~1 s per 5 s): the band-parallel raster (fork-join, bands idle ~60%) is now the
+  limit, not the syncs. Presentation waits are on the main thread.
 
 ## Automated test mode (2026-10-21, #18) — agents MUST use this, never manual screenshots
 - `tools/test_run.sh`: hidden window, no audio, uncapped VBlanks, scripted pad, PNG dumps, exit. Default script:
@@ -254,5 +260,6 @@ Order is tracked with the `priority: N` labels; #13 is pinned on GitHub.
    patch 0019 are in (~14.1 VBlanks/s). #27 (SSE FMAC on fast blocks, children #28-#31, patches 0020-0023) is
    all in with identical dumps, but the map only went ~14.1 -> ~14.5 VBlanks/s, so #27 stays open: the FMAC
    math is not the remaining cost. Profile before the next VU1 step. Do not port PCSX2 microVU.
+   Patch 0024 (#32, raster thread) took the map to ~18.5; the raster bands' load balance is the next GS cost.
 2. Then #10 (box glyphs), #14 (display env), #16, #17, #3-#5. Open an issue per new blocker.
 3. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).
