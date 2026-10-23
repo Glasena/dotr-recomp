@@ -1,0 +1,128 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h b/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
+index d67aa8e..8886eaf 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
+@@ -417,11 +417,122 @@ struct Vu1Aot
+         _mm_storeu_ps(dst, _mm_or_ps(_mm_and_ps(lanes, _mm_loadu_ps(flagged)), _mm_andnot_ps(lanes, _mm_loadu_ps(dst))));
+     }
+ 
++    // applyDest() with the dest field as a constant.
++    template <uint8_t Dest>
++    [[gnu::always_inline]] static inline void storeDest(float *dst, __m128 value)
++    {
++        if constexpr (Dest == 0xFu)
++            _mm_storeu_ps(dst, value);
++        else if constexpr (Dest != 0u)
++        {
++            const __m128 lanes = _mm_load_ps(reinterpret_cast<const float *>(vu1fast::kDestLanes[Dest]));
++            _mm_storeu_ps(dst, _mm_or_ps(_mm_and_ps(lanes, value), _mm_andnot_ps(lanes, _mm_loadu_ps(dst))));
++        }
++    }
++
++    // VU1Interpreter::queueClip() with the free entry found from m_flagMask, as queueFlags().
++    static inline void queueClip(VU1Interpreter &s, uint32_t clip)
++    {
++        const uint32_t freeIndex = static_cast<uint32_t>(std::countr_one(s.m_flagMask));
++        if (freeIndex >= VU1Interpreter::kMaxFlagEntries)
++        {
++            s.queueClip(clip); // full: reported there
++            return;
++        }
++        s.m_workingClip = ((s.m_workingClip << 6) | (clip & 0x3Fu)) & 0xFFFFFFu;
++        VU1Interpreter::FlagPipelineEntry &entry = s.m_flagPipeline[freeIndex];
++        entry = {};
++        entry.valid = true;
++        entry.issueCycle = s.m_cycle;
++        entry.readyCycle = s.m_cycle + VU1Interpreter::kFmacLatency;
++        s.m_nextCommitCycle = std::min(s.m_nextCommitCycle, entry.readyCycle);
++        s.m_flagMask |= 1u << freeIndex;
++        entry.clip = s.m_workingClip;
++        entry.writesClip = true;
++    }
++
++    // Upper ops other than FMAC and NOP that the generated code runs inline (#44): MAX/MINI (vector, broadcast,
++    // I), ITOF/FTOI, ABS and CLIP. The rest (reserved encodings) stay on g_vu1UpperFn.
++    static constexpr bool isInlineUpper(uint16_t id)
++    {
++        return (id >= 0x10u && id <= 0x17u) || id == 0x1Du || id == 0x1Fu || id == 0x2Bu || id == 0x2Fu ||
++               (id >= 0x50u && id <= 0x57u) || id == 0x5Du || id == 0x5Fu;
++    }
++
++    // The ps2_vu1_upper.cpp handlers of those ops with the word as a constant: the same operand normalization,
++    // the same compare order for MAX/MINI ((vs > t) ? vs : t is MAXPS, (vs < t) ? vs : t is MINPS), the same
++    // FTOI saturation and the same CLIP flag queueing.
++    template <uint16_t UId, uint32_t Upper>
++    [[gnu::always_inline]] static inline void inlineUpper(VU1Interpreter &s)
++    {
++        constexpr uint8_t dest = static_cast<uint8_t>((Upper >> 21) & 0xFu);
++        constexpr uint8_t ft = static_cast<uint8_t>((Upper >> 16) & 0x1Fu);
++        constexpr uint8_t fs = static_cast<uint8_t>((Upper >> 11) & 0x1Fu);
++        constexpr uint8_t fd = static_cast<uint8_t>((Upper >> 6) & 0x1Fu);
++        s.m_currentUpperInstruction = Upper;
++        float(&vf)[32][4] = s.m_state.vf;
++        if constexpr (UId < 0x40u) // MAX/MINI into fd
++        {
++            constexpr bool isMax = (UId >= 0x10u && UId <= 0x13u) || UId == 0x1Du || UId == 0x2Bu;
++            const __m128 vs = vu1NormalizeOperands(_mm_loadu_ps(vf[fs]));
++            __m128 t;
++            if constexpr (UId == 0x1Du || UId == 0x1Fu)
++                t = vu1NormalizeOperands(_mm_set1_ps(s.m_state.i));
++            else
++            {
++                t = vu1NormalizeOperands(_mm_loadu_ps(vf[ft]));
++                if constexpr (UId <= 0x17u)
++                    t = _mm_shuffle_ps(t, t, _MM_SHUFFLE(UId & 3, UId & 3, UId & 3, UId & 3));
++            }
++            storeDest<dest>(vf[fd], isMax ? _mm_max_ps(vs, t) : _mm_min_ps(vs, t));
++        }
++        else if constexpr (UId <= 0x53u) // ITOF0/4/12/15: raw integer bits, no normalization
++        {
++            __m128 value = _mm_cvtepi32_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(vf[fs])));
++            constexpr float scale = UId == 0x50u ? 1.0f : UId == 0x51u ? 16.0f : UId == 0x52u ? 4096.0f : 32768.0f;
++            if constexpr (UId != 0x50u)
++                value = _mm_div_ps(value, _mm_set1_ps(scale));
++            storeDest<dest>(vf[ft], value);
++        }
++        else if constexpr (UId <= 0x57u) // FTOI0/4/12/15
++        {
++            // vuFloatToInt(): the product by a power of two is exact in float (normalized operands), or overflows
++            // to +/-Inf or +/-FLT_MAX; >= 2^31 saturates to INT32_MAX, CVTTPS2DQ gives INT32_MIN below -2^31.
++            constexpr float scale = UId == 0x54u ? 1.0f : UId == 0x55u ? 16.0f : UId == 0x56u ? 4096.0f : 32768.0f;
++            const __m128 scaled = _mm_mul_ps(vu1NormalizeOperands(_mm_loadu_ps(vf[fs])), _mm_set1_ps(scale));
++            const __m128i truncated = _mm_cvttps_epi32(scaled);
++            const __m128i high = _mm_castps_si128(_mm_cmpge_ps(scaled, _mm_set1_ps(2147483648.0f)));
++            const __m128i value = _mm_or_si128(_mm_andnot_si128(high, truncated),
++                                               _mm_and_si128(high, _mm_set1_epi32(0x7FFFFFFF)));
++            storeDest<dest>(vf[ft], _mm_castsi128_ps(value));
++        }
++        else if constexpr (UId == 0x5Du) // ABS
++            storeDest<dest>(vf[ft], _mm_and_ps(vu1NormalizeOperands(_mm_loadu_ps(vf[fs])),
++                                               _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF))));
++        else // CLIP fs.xyz, ft.w on the raw bits
++        {
++            uint32_t wBits, bits[3];
++            std::memcpy(&wBits, &vf[ft][3], sizeof(wBits));
++            std::memcpy(bits, vf[fs], sizeof(bits));
++            const int32_t limit =
++                (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
++            uint32_t flags = 0u;
++            for (uint32_t c = 0; c < 3u; ++c)
++            {
++                flags |= static_cast<int32_t>(bits[c]) > limit ? 1u << (2u * c) : 0u;
++                flags |= static_cast<int32_t>(bits[c] ^ 0x80000000u) > limit ? 2u << (2u * c) : 0u;
++            }
++            queueClip(s, flags);
++        }
++    }
++
+     // The upper op of pair k, with its word and handler id as constants.
+     template <uint16_t UId, uint32_t Upper>
+     [[gnu::always_inline]] static inline void upper(VU1Interpreter &s, Vu1AotRun &r, uint32_t k)
+     {
+-        if constexpr (UId < 0x80u && vu1fast::isDirectFmacId(UId))
++        if constexpr (isInlineUpper(UId))
++            inlineUpper<UId, Upper>(s);
++        else if constexpr (UId < 0x80u && vu1fast::isDirectFmacId(UId))
+         {
+             constexpr bool toAcc = UId >= 0x40u;
+             constexpr uint8_t op = static_cast<uint8_t>(toAcc ? UId - 0x40u : UId);

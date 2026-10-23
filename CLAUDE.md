@@ -217,6 +217,10 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   runs that pair. `PS2X_VU_AOT_VERIFY` now reports a second call at the same cycle/PC ("no progress") instead of hanging.
 - #43 (2026-10-23): `config/vu1_manifest.txt` = `<image> 0x<pc> <pairs> <content fnv1a>` per captured block (143,
   no game bytes); `vu1_gen.py` warns on missing/changed blocks (`--check` exits 1), `--write-manifest` refreshes it.
+- Patch 0038 (2026-10-23, #44 upper): `Vu1Aot::upper<>` runs MAX/MINI (vector/bc/I), ITOF/FTOI, ABS and CLIP inline
+  (`inlineUpper<>`, SSE, word constant; inline `queueClip`), no generator change. Map 1900->2300, 3 interleaved
+  pairs vs post-#47: instructions 73.6G -> 68.8G (-6.6%), cycles ~37.9G -> ~35.4G, wall ~15.0 -> ~14.1 s.
+  Dumps, verify (0/262K), flag check and `vu1_diff` unchanged.
 - Patch 0027 (2026-10-22, #35): `perf --call-graph dwarf` found the map/hash share was `IopKernel::beginNextReady`/
   `nextWakeCycle` walking the thread `std::map` on every idle IOP step (~7.5%) and the GIF_STAT lookup in
   `advanceEeTimers` (~2.1%). Kernel caches "nothing ready until cycle W" behind a version bumped by every public
