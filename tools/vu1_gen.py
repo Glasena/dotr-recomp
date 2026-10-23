@@ -1,12 +1,18 @@
-"""VU1 AOT skeleton generator (#39): read a PS2X_VU1_CAPTURE directory and print block statistics.
+"""VU1 AOT generator (#39, #40): read a PS2X_VU1_CAPTURE directory, print block statistics, emit C++.
 
 The runtime (patch 0031) writes, per VU1 micro memory image, <hash>.bin (the image) and <hash>.txt with lines
 "block 0x<pc> <pairs>" (fast blocks built by buildFastBlock) and "interp 0x<pc> <reason>" (tryEnterFastBlock
 refusals). This script splits every captured block start the way buildFastBlock does (stop before a reserved op,
 after the delay slot of a branch or E bit, at 256 pairs or at the end of the image), checks the pair count against
-the capture and prints blocks, pairs, ops by kind, flag readers, XGKICKs and branches. It emits no code yet (#40).
+the capture and prints blocks, pairs, ops by kind, flag readers, XGKICKs and branches.
 
-usage: vu1_gen.py [CAPTURE_DIR]   (default ../dotr/vu1)
+With --emit OUT_DIR it writes OUT_DIR/vu1_aot.cpp (#40): per block, the tight-loop runs of the runtime's fast-block
+executor (run() in ps2_vu1_core.cpp) as straight-line calls to Vu1Aot::pair<> (src/lib/vu/ps2_vu1_aot.h) with
+the words, handler ids and VI plans as constants, and a table keyed by (image hash, start pc). The runtime uses a
+block only when its words and per-pair plans (DirectIds::Plan) equal what is written here. Build it in with
+cmake -DPS2X_VU1_AOT_DIR=OUT_DIR.
+
+usage: vu1_gen.py [CAPTURE_DIR] [--emit OUT_DIR]   (default ../dotr/vu1)
        vu1_gen.py --self-test"""
 import collections, os, struct, sys
 
@@ -98,6 +104,155 @@ def split_block(image, start_pair):
     return pairs
 
 
+def upper_id(upper):
+    """vu1UpperHandlerId()."""
+    op = upper & 0x3F
+    if (upper & 0x7FF) in (0x2FF, 0x33C) or op >= 0x3C:
+        return 0x40 + special(upper)
+    return 0xC0 if op > 0x2F else op
+
+
+def lower_id(lower, ibit):
+    """vu1LowerHandlerId(), NOP for an I-bit immediate."""
+    if ibit or lower in (0, 0x8000033C):
+        return 0
+    op_hi = (lower >> 25) & 0x7F
+    if op_hi != 0x40:
+        return 1 + op_hi
+    return 0x140 + special(lower) if (lower & 0x3F) >= 0x3C else 0x100 + (lower & 0x3F)
+
+
+def lane(c):
+    return 1 << (3 - c)
+
+
+def upper_vf_write(upper):
+    """Register decodeUpperUsage() writes (0 for none)."""
+    op, dest = upper & 0x3F, (upper >> 21) & 0xF
+    if not dest:
+        return 0
+    if op <= 0x2F:
+        return (upper >> 6) & 0x1F
+    if op >= 0x3C and (0x10 <= special(upper) <= 0x17 or special(upper) == 0x1D):
+        return (upper >> 16) & 0x1F
+    return 0
+
+
+def lower_usage(lower):
+    """decodeLowerUsage() reduced to (VF registers read, VF register written, VI write mask, delaysNextBranchRead)."""
+    if lower in (0, 0x8000033C):
+        return set(), 0, 0, False
+    op_hi, dest = (lower >> 25) & 0x7F, (lower >> 21) & 0xF
+    vf_t, vf_s = (lower >> 16) & 0x1F, (lower >> 11) & 0x1F
+    vi_t, vi_s, vi_d = (lower >> 16) & 0xF, (lower >> 11) & 0xF, (lower >> 6) & 0xF
+    lanes_s, lanes_t = lane((lower >> 21) & 3), lane((lower >> 23) & 3)
+    reads, write, vi, delays = set(), 0, 0, False
+    if op_hi == 0x00:
+        write = vf_t if dest else 0
+    elif op_hi == 0x01:
+        reads = {vf_s} if dest else set()
+    elif op_hi in (0x04, 0x14, 0x16, 0x17, 0x18, 0x1A, 0x1B, 0x1C, 0x21, 0x25):
+        vi = 1 << vi_t
+    elif op_hi in (0x08, 0x09):
+        vi, delays = 1 << vi_t, True
+    elif op_hi in (0x10, 0x12, 0x13):
+        vi = 2
+    elif op_hi == 0x40:
+        direct, sp = lower & 0x3F, special(lower)
+        if direct in (0x30, 0x31, 0x34, 0x35):
+            vi, delays = 1 << vi_d, True
+        elif direct == 0x32:
+            vi, delays = 1 << vi_t, True
+        elif direct < 0x3C:
+            pass
+        elif sp in (0x30, 0x31):
+            reads = {vf_s} if (sp == 0x31 or dest) else set()
+            write = vf_t if dest else 0
+        elif sp in (0x34, 0x36):
+            vi, delays, write = 1 << vi_s, True, (vf_t if dest else 0)
+        elif sp in (0x35, 0x37):
+            vi, delays, reads = 1 << vi_t, True, ({vf_s} if dest else set())
+        elif sp in (0x38, 0x3A):
+            reads = {vf_s, vf_t}
+        elif sp == 0x39:
+            reads = {vf_t}
+        elif sp == 0x3C:
+            reads, vi, delays = {vf_s}, 1 << vi_t, True
+        elif sp in (0x3D, 0x40, 0x41, 0x64):
+            write = vf_t if dest else 0
+        elif sp in (0x3E, 0x68, 0x69):
+            vi = 1 << vi_t
+        elif sp in (0x42, 0x43) or 0x70 <= sp <= 0x7D and sp != 0x7B:
+            reads = {vf_s}
+    del lanes_s, lanes_t  # every read above has nonzero lanes; only the register matters here
+    return reads, write, vi & 0xFFFE, delays
+
+
+def plan(d):
+    """DirectIds::Plan of a decoded pair: upperId, lowerId, viReg, plain, recordVi."""
+    reads, write, vi, delays = (set(), 0, 0, False) if d['ibit'] else lower_usage(d['lower'])
+    up = upper_vf_write(d['upper'])
+    shadow = up != 0 and (up in reads or write == up)
+    vi_reg = (vi & -vi).bit_length() - 1 if vi else 0
+    plain = not (d['branch'] or d['lo'] == 'XGKICK' or d['ebit'] or d['dbit'] or d['tbit'] or shadow)
+    return upper_id(d['upper']), lower_id(d['lower'], d['ibit']), vi_reg, plain, vi_reg != 0 and delays
+
+
+def tight_runs(plans):
+    """The tight-loop runs of a block: (first, end) for each run that can start where the block step arrives."""
+    last = len(plans) - 1
+    runs = []
+    for k in range(last):
+        if plans[k][3] and (k == 0 or not plans[k - 1][3]):
+            e = k + 1
+            while e < last and plans[e][3]:
+                e += 1
+            runs.append((k, e))
+    return runs
+
+
+def emit(capture_dir, out_dir):
+    body, table = [], []
+    for h, image, blocks, _ in load(capture_dir):
+        for pc in sorted(blocks):
+            pairs = split_block(image, pc // 8)
+            plans = [plan(d) for d in pairs]
+            runs = tight_runs(plans)
+            name = f'b_{h}_{pc:04x}'
+            info = ', '.join(f'{{0x{d["lower"]:08x}u, 0x{d["upper"]:08x}u, 0x{p[0]:x}, 0x{p[1]:x}, {p[2]}, '
+                             f'{str(p[3]).lower()}, {str(p[4]).lower()}}}' for d, p in zip(pairs, plans))
+            body.append(f'const Vu1AotPair {name}_info[] = {{{info}}};')
+            fn = 'nullptr'
+            if runs:
+                fn = name
+                lines = [f'bool {name}(VU1Interpreter &v, Vu1AotRun &r, uint32_t first)', '{',
+                         '    switch (first)', '    {']
+                for first, end in runs:
+                    lines.append(f'    case {first}:')
+                    for k in range(first, end):
+                        d, p = pairs[k], plans[k]
+                        lines.append(f'        A::pair<0x{p[0]:x}, 0x{d["upper"]:08x}u, 0x{p[1]:x}, 0x{d["lower"]:08x}u, '
+                                     f'{p[2]}, {str(p[4]).lower()}>(v, r, {k});')
+                        if k + 1 < end:
+                            lines.append(f'        if (A::stopped(v)) return A::end(v, r, {k + 1});')
+                    lines.append(f'        return A::end(v, r, {end});')
+                lines += ['    default:', '        return false;', '    }', '}']
+                body.append('\n'.join(lines))
+            key = fnv1a(image[pc:pc + 8 * len(pairs)], pc // 8)
+            table.append(f'    {{0x{h}ull, 0x{pc:04x}u, {len(pairs)}u, 0x{key:016x}ull, {name}_info, {fn}}},')
+    os.makedirs(out_dir, exist_ok=True)
+    text = '\n'.join([
+        '// Generated by dotr-recomp tools/vu1_gen.py from a PS2X_VU1_CAPTURE directory. Game data: not for git.',
+        '#include "ps2_vu1_aot.h"', '', 'namespace', '{', 'using A = Vu1Aot;', ''] + body + [
+        '}', '', 'extern const Vu1AotBlock g_vu1AotBlocks[] = {'] + table + [
+        '};', f'extern const uint32_t g_vu1AotBlockCount = {len(table)}u;', ''])
+    path = os.path.join(out_dir, 'vu1_aot.cpp')
+    old = open(path).read() if os.path.exists(path) else None
+    if old != text:  # keep the timestamp when nothing changed, so ninja does not rebuild it
+        open(path, 'w').write(text)
+    print(f'wrote {path}: {len(table)} blocks')
+
+
 def load(capture_dir):
     for name in sorted(os.listdir(capture_dir)):
         if not name.endswith('.bin'):
@@ -150,6 +305,15 @@ def self_test():
                         0x7F << 25, nop_upper)                                 # reserved lower
     assert [len(split_block(image, p)) for p in range(6)] == [3, 2, 3, 2, 1, 0]
     assert fnv1a(b'') == 1469598103934665603
+    # IADDI vi1 (delays the next branch read), MOVE.xyzw vf1, vf2 under an upper writing vf2 (shadow), B, delay slot
+    iaddi = (0x40 << 25) | (1 << 16) | 0x32
+    move = (0x40 << 25) | (0xF << 21) | (1 << 16) | (2 << 11) | 0x33C
+    add_vf2 = (0xF << 21) | (2 << 6) | 0x28
+    image = struct.pack('<8I', iaddi, nop_upper, move, add_vf2, b_op, nop_upper, 0, nop_upper)
+    plans = [plan(d) for d in split_block(image, 0)]
+    assert [p[2:] for p in plans] == [(1, True, True), (0, False, False), (0, False, False), (0, True, False)]
+    assert plans[1][:2] == (0x28, 0x170) and plans[0][1] == 0x132
+    assert tight_runs(plans) == [(0, 1)] and tight_runs([plans[0], plans[0], plans[1], plans[0], plans[0]]) == [(0, 2), (3, 4)]
     print('self-test ok')
 
 
@@ -157,9 +321,17 @@ if __name__ == '__main__':
     if sys.argv[1:] == ['--self-test']:
         self_test()
         sys.exit()
-    capture = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), '..', '..', 'dotr', 'vu1')
+    args = sys.argv[1:]
+    out = None
+    if '--emit' in args:
+        i = args.index('--emit')
+        out = args[i + 1]
+        del args[i:i + 2]
+    capture = args[0] if args else os.path.join(os.path.dirname(__file__), '..', '..', 'dotr', 'vu1')
     n_blocks = n_pairs = 0
     for item in load(capture):
         b, p = stats(*item)
         n_blocks, n_pairs = n_blocks + b, n_pairs + p
     print(f'total: {n_blocks} blocks, {n_pairs} pairs')
+    if out:
+        emit(capture, out)

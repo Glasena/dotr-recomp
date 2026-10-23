@@ -90,6 +90,13 @@ cmake -S ../PS2Recomp -B ../PS2Recomp/out/build-runtime -G Ninja -DCMAKE_BUILD_T
   -DCMAKE_PREFIX_PATH="$(realpath ../deps/ffmpeg)" \
   -DCMAKE_CXX_COMPILER_LAUNCHER="$(realpath ../deps/bin/ccache)" -DCMAKE_C_COMPILER_LAUNCHER="$(realpath ../deps/bin/ccache)"
 cmake --build ../PS2Recomp/out/build-runtime --target ps2EntryRunner
+
+# 8. (optional, faster 3D) generated VU1 blocks: capture the map's VU1 microcode once, generate C++ from it into
+#    ../dotr/vu1/gen, and build it in. Without PS2X_VU1_AOT_DIR the runtime builds as in step 7.
+PS2X_VU1_CAPTURE="$(realpath ../dotr/vu1)" PS2X_DUMP_FRAMES=2300 PS2X_EXIT_AT=2300 tools/test_run.sh
+python3 tools/vu1_gen.py ../dotr/vu1 --emit ../dotr/vu1/gen
+cmake -DPS2X_VU1_AOT_DIR="$(realpath ../dotr/vu1/gen)" ../PS2Recomp/out/build-runtime
+cmake --build ../PS2Recomp/out/build-runtime --target ps2EntryRunner
 ```
 
 Rebuild times (12 threads): cold full build ~45 min (~4000 steps, most of it the 762 overlay modules); no change

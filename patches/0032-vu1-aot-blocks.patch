@@ -1,0 +1,1345 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -411,6 +411,20 @@ if(NOT MSVC)
+         PROPERTIES COMPILE_OPTIONS "-O3")
+ endif()
+ 
++# Generated VU1 blocks (#40): a directory with vu1_aot.cpp from dotr-recomp's tools/vu1_gen.py (game data, never
++# in git). Empty: the runtime builds and behaves as before.
++set(PS2X_VU1_AOT_DIR "" CACHE PATH "Directory with generated VU1 block code (vu1_aot.cpp); empty for none")
++if(PS2X_VU1_AOT_DIR)
++    set(PS2X_VU1_AOT_SRC "${PS2X_VU1_AOT_DIR}/vu1_aot.cpp")
++    target_sources(ps2_runtime PRIVATE "${PS2X_VU1_AOT_SRC}")
++    set_source_files_properties("${PS2X_VU1_AOT_SRC}" PROPERTIES
++        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu")
++    if(NOT MSVC)
++        set_source_files_properties("${PS2X_VU1_AOT_SRC}" PROPERTIES COMPILE_OPTIONS "-O3")
++    endif()
++    set_property(SOURCE src/lib/vu/ps2_vu1_core.cpp APPEND PROPERTY COMPILE_DEFINITIONS PS2X_VU1_AOT=1)
++endif()
++
+ if(PS2X_ENABLE_RUNTIME_LOGS)
+     target_compile_definitions(ps2_runtime PUBLIC
+         PS2_RUNTIME_LOGS=1
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -9,6 +9,7 @@
+ 
+ class GS;
+ class PS2Memory;
++struct Vu1Aot; // src/lib/vu/ps2_vu1_aot.h: fast-block helpers shared with generated VU1 code
+ 
+ struct VU1State
+ {
+@@ -40,6 +41,8 @@ struct VU1State
+ 
+ class VU1Interpreter
+ {
++    friend struct Vu1Aot;
++
+ public:
+     enum class Unit : uint8_t
+     {
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h b/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
+new file mode 100644
+--- /dev/null
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
+@@ -0,0 +1,430 @@
++#ifndef PS2_VU1_AOT_H
++#define PS2_VU1_AOT_H
++
++// Fast-block helpers shared by ps2_vu1_core.cpp and generated VU1 code (#40, tools/vu1_gen.py in dotr-recomp).
++// Internal to src/lib/vu: only the VU .cpp files and the generated file include it.
++
++#include "runtime/ps2_vu1.h"
++#include "ps2_vu1_detail.h"
++
++#include <array>
++#include <bit>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <xmmintrin.h>
++
++namespace vu1fast
++{
++    // ACC +/- product instructions (MADD/MSUB/OPMSUB and their ACC forms); OPMULA (special 0x2E) is a plain product.
++    constexpr bool isFmacProductSum(uint8_t op, uint8_t special)
++    {
++        return (op >= 0x08u && op <= 0x0Fu) ||
++               op == 0x21u || op == 0x23u || op == 0x25u || op == 0x27u ||
++               op == 0x29u || op == 0x2Du || op == 0x2Eu ||
++               (special >= 0x08u && special <= 0x0Fu) ||
++               special == 0x21u || special == 0x23u || special == 0x25u ||
++               special == 0x27u || special == 0x29u || special == 0x2Du;
++    }
++
++    constexpr uint8_t laneForComponent(uint32_t component)
++    {
++        return static_cast<uint8_t>(1u << (3u - component));
++    }
++
++    // Upper handler ids run by the direct FMAC path on fast blocks: ADD/SUB/MUL/MADD/MSUB/OPMSUB and their
++    // ACC forms (ids 0x40+), not MAX/MINI/ABS/CLIP/ITOF/FTOI/NOP. These are every MAC/status flag writer.
++    constexpr bool isDirectFmacId(uint16_t id)
++    {
++        const uint16_t op = id >= 0x40u ? static_cast<uint16_t>(id - 0x40u) : id;
++        return op <= 0x0Fu || (op >= 0x18u && op <= 0x1Cu) ||
++               (op >= 0x1Eu && op <= 0x2Eu && op != 0x1Fu && op != 0x2Bu);
++    }
++
++    // The math and the fast flag test of one direct FMAC (#38), per op number and VF/ACC form, so the op, its
++    // operand source and the add/sub/product kind are compile-time. Operands are normalized as normalizeOperand(),
++    // with a separate multiply and add, under the caller's rounding mode, exactly like the generic code they
++    // replace. `ok` has a bit per lane whose flags the fast test can derive (see Vu1Aot::fmac).
++    struct FmacMath
++    {
++        __m128 left, right, product, result;
++        int ok;            // lanes the fast flag test covers
++        int productZero;   // productSum: lanes with a zero operand (exact zero product)
++        bool productSum;
++    };
++    using FmacMathFn = void (*)(VU1State &state, uint32_t word, FmacMath &m);
++
++    template <uint8_t Op, bool ToAcc>
++    inline void fmacMath(VU1State &state, uint32_t word, FmacMath &m)
++    {
++        constexpr bool qSource = Op == 0x1Cu || Op == 0x20u || Op == 0x24u || Op == 0x21u || Op == 0x25u;
++        constexpr bool iSource = Op == 0x1Eu || Op == 0x22u || Op == 0x26u || Op == 0x23u || Op == 0x27u;
++        constexpr bool broadcast = Op <= 0x0Fu || (Op >= 0x18u && Op <= 0x1Bu);
++        constexpr bool productSum = ToAcc ? isFmacProductSum(0xFFu, Op) : isFmacProductSum(Op, 0xFFu);
++        constexpr bool mul = (Op >= 0x18u && Op <= 0x1Cu) || Op == 0x1Eu || Op == 0x2Au || Op == 0x2Eu;
++        constexpr bool productSub = (Op >= 0x0Cu && Op <= 0x0Fu) || Op == 0x25u || Op == 0x27u || Op == 0x2Du ||
++                                    Op == 0x2Eu;
++        constexpr bool sub = (Op >= 0x04u && Op <= 0x07u) || Op == 0x24u || Op == 0x26u || Op == 0x2Cu;
++
++        __m128 left = vu1NormalizeOperands(_mm_loadu_ps(state.vf[FS(word)]));
++        __m128 right;
++        if constexpr (qSource)
++            right = vu1NormalizeOperands(_mm_set1_ps(state.q));
++        else if constexpr (iSource)
++            right = vu1NormalizeOperands(_mm_set1_ps(state.i));
++        else
++        {
++            const __m128 loaded = vu1NormalizeOperands(_mm_loadu_ps(state.vf[FT(word)]));
++            if constexpr (broadcast)
++                right = _mm_shuffle_ps(loaded, loaded, _MM_SHUFFLE(Op & 3, Op & 3, Op & 3, Op & 3));
++            else if constexpr (Op == 0x2Eu)
++            {
++                // OPMSUB: acc - (vs.yzx * vt.zxy), OPMULA: vs.yzx * vt.zxy; w is forced to 0 below.
++                left = _mm_shuffle_ps(left, left, _MM_SHUFFLE(3, 0, 2, 1));
++                right = _mm_shuffle_ps(loaded, loaded, _MM_SHUFFLE(3, 1, 0, 2));
++            }
++            else
++                right = loaded;
++        }
++
++        __m128 product = _mm_setzero_ps();
++        __m128 result;
++        if constexpr (productSum)
++        {
++            const __m128 acc = vu1NormalizeOperands(_mm_loadu_ps(state.acc));
++            product = _mm_mul_ps(left, right);
++            result = productSub ? _mm_sub_ps(acc, product) : _mm_add_ps(acc, product);
++        }
++        else if constexpr (mul)
++            result = _mm_mul_ps(left, right);
++        else if constexpr (sub)
++            result = _mm_sub_ps(left, right);
++        else
++            result = _mm_add_ps(left, right);
++        if constexpr (Op == 0x2Eu)
++            result = _mm_and_ps(result, _mm_castsi128_ps(_mm_set_epi32(0, -1, -1, -1)));
++
++        // Per lane: the result (and for ACC +/- product, the product, with the cancellation bound on ACC) is
++        // strictly inside (FLT_MIN, FLT_MAX); or an exact zero (see Vu1Aot::fmac).
++        const __m128i bits = _mm_castps_si128(result);
++        const __m128i magnitudeMask = _mm_set1_epi32(0x7FFFFFFF);
++        const __m128i minNormal = _mm_set1_epi32(0x00800000);
++        const __m128i maxNormal = _mm_set1_epi32(0x7F7FFFFF);
++        const __m128i magnitude = _mm_and_si128(bits, magnitudeMask);
++        const __m128i normal = _mm_and_si128(_mm_cmpgt_epi32(magnitude, minNormal),
++                                             _mm_cmplt_epi32(magnitude, maxNormal));
++        const __m128i zero = _mm_cmpeq_epi32(magnitude, _mm_setzero_si128());
++        __m128i ok;
++        m.productZero = 0;
++        if constexpr (productSum || mul)
++        {
++            const __m128i operandZero = _mm_castps_si128(_mm_or_ps(_mm_cmpeq_ps(left, _mm_setzero_ps()),
++                                                                   _mm_cmpeq_ps(right, _mm_setzero_ps())));
++            if constexpr (productSum)
++            {
++                const __m128i exponent = _mm_srli_epi32(magnitude, 23);
++                const __m128i accBits = _mm_castps_si128(_mm_loadu_ps(state.acc));
++                const __m128i accExponent = _mm_srli_epi32(_mm_and_si128(accBits, magnitudeMask), 23);
++                const __m128i productMagnitude = _mm_and_si128(_mm_castps_si128(product), magnitudeMask);
++                ok = _mm_and_si128(normal, _mm_cmpgt_epi32(exponent, _mm_set1_epi32(2)));
++                ok = _mm_and_si128(ok, _mm_cmplt_epi32(exponent, _mm_set1_epi32(254)));
++                ok = _mm_and_si128(ok, _mm_cmplt_epi32(accExponent, _mm_set1_epi32(254)));
++                ok = _mm_andnot_si128(_mm_cmpgt_epi32(accExponent, _mm_add_epi32(exponent, _mm_set1_epi32(16))), ok);
++                ok = _mm_and_si128(ok, _mm_cmpgt_epi32(productMagnitude, minNormal));
++                ok = _mm_and_si128(ok, _mm_cmplt_epi32(productMagnitude, maxNormal));
++                ok = _mm_or_si128(ok, _mm_and_si128(operandZero, _mm_or_si128(normal, zero)));
++                m.productZero = _mm_movemask_ps(_mm_castsi128_ps(operandZero));
++            }
++            else
++                ok = _mm_or_si128(normal, _mm_and_si128(zero, operandZero));
++        }
++        else
++            ok = _mm_or_si128(normal, zero);
++        m.left = left;
++        m.right = right;
++        m.product = product;
++        m.result = result;
++        m.ok = _mm_movemask_ps(_mm_castsi128_ps(ok));
++        m.productSum = productSum;
++    }
++
++    // Lane masks for a dest field (x = bit 3 -> lane 0).
++    alignas(16) inline constexpr int32_t kDestLanes[16][4] = {
++        {0, 0, 0, 0}, {0, 0, 0, -1}, {0, 0, -1, 0}, {0, 0, -1, -1},
++        {0, -1, 0, 0}, {0, -1, 0, -1}, {0, -1, -1, 0}, {0, -1, -1, -1},
++        {-1, 0, 0, 0}, {-1, 0, 0, -1}, {-1, 0, -1, 0}, {-1, 0, -1, -1},
++        {-1, -1, 0, 0}, {-1, -1, 0, -1}, {-1, -1, -1, 0}, {-1, -1, -1, -1}};
++
++    struct FlagStats
++    {
++        uint64_t fmacs = 0, fast = 0, elided = 0, checks = 0, mismatches = 0;
++    };
++    inline FlagStats g_flagStats;
++
++    inline void printFlagStats()
++    {
++        std::fprintf(stderr, "[vu1:flag-check] fmacs=%llu sse_fast=%llu elided=%llu checks=%llu mismatches=%llu\n",
++                     static_cast<unsigned long long>(g_flagStats.fmacs),
++                     static_cast<unsigned long long>(g_flagStats.fast),
++                     static_cast<unsigned long long>(g_flagStats.elided),
++                     static_cast<unsigned long long>(g_flagStats.checks),
++                     static_cast<unsigned long long>(g_flagStats.mismatches));
++    }
++
++    // MAC/status writes of the current fast block that buildFastBlock found invisible (#34), and the sticky bits
++    // they carry to the next queued write.
++    struct FlagElision
++    {
++        struct Write
++        {
++            uint64_t issue = 0;
++            uint64_t nextReady = 0; // ready cycle of the write that hides it
++            uint8_t laneFlags[4]{};
++            uint8_t dest = 0;
++            uint32_t sticky = 0; // stickyCarry including this write
++        };
++        const uint32_t *blockElide = nullptr; // DirectIds::elide of the current block, or null
++        uint32_t stickyCarry = 0;             // sticky Z/S/U/O of elided writes, not queued yet
++        std::array<Write, 8> writes{};        // only the last few can still be visible at block exit
++        uint32_t count = 0;
++    };
++
++    // normalizeOperand() of a raw word, for an I-bit immediate known at compile time.
++    constexpr uint32_t normalizedOperandBits(uint32_t bits)
++    {
++        const uint32_t exponent = (bits >> 23) & 0xFFu;
++        return exponent == 0u ? (bits & 0x80000000u)
++               : exponent == 0xFFu ? ((bits & 0x80000000u) | 0x7F7FFFFFu)
++                                   : bits;
++    }
++}
++
++// What a generated block needs from run() besides the interpreter.
++struct Vu1AotRun
++{
++    const uint32_t *issue = nullptr; // FastBlock::issue of the block
++    uint32_t startPair = 0;
++    vu1fast::FlagElision *flags = nullptr;
++    uint8_t *vuData = nullptr;
++    uint32_t dataSize = 0;
++};
++
++// Runs one tight-loop run of plain pairs of a block, starting at pair `first` (the fast-block index). Returns
++// false, having done nothing, when the block has no generated run starting there.
++using Vu1AotFn = bool (*)(VU1Interpreter &s, Vu1AotRun &r, uint32_t first);
++
++// What the generator assumed about each pair; checked against DirectIds::Plan before a block is used.
++struct Vu1AotPair
++{
++    uint32_t lower, upper;
++    uint16_t upperId, lowerId;
++    uint8_t viReg;
++    bool plain, recordVi;
++};
++
++struct Vu1AotBlock
++{
++    uint64_t image;    // fnv1a of the micro memory image
++    uint32_t pc;       // block start
++    uint32_t pairs;    // FastBlock::pairCount
++    uint64_t key;      // fnv1a of the block's words seeded with its start pair (the PS2X_VU_STATS block key)
++    const Vu1AotPair *info;
++    Vu1AotFn fn;
++};
++
++// Defined by the generated file (CMake PS2X_VU1_AOT_DIR); ps2_vu1_core.cpp reads them only with PS2X_VU1_AOT.
++extern const Vu1AotBlock g_vu1AotBlocks[];
++extern const uint32_t g_vu1AotBlockCount;
++
++struct Vu1Aot
++{
++    using FmacMath = vu1fast::FmacMath;
++    using FlagElision = vu1fast::FlagElision;
++
++    static void macStatus(const uint8_t laneFlags[4], uint8_t dest, uint32_t &mac, uint32_t &status)
++    {
++        // Same as updateFmacFlags().
++        mac = status = 0u;
++        for (uint32_t component = 0; component < 4u; ++component)
++        {
++            const uint8_t lane = vu1fast::laneForComponent(component);
++            if ((dest & lane) == 0u)
++                continue;
++            const uint32_t flags = laneFlags[component];
++            if ((flags & 0x1u) != 0u)
++                mac |= lane;
++            if ((flags & 0x2u) != 0u)
++                mac |= static_cast<uint32_t>(lane) << 4;
++            if ((flags & 0x4u) != 0u)
++                mac |= static_cast<uint32_t>(lane) << 8;
++            if ((flags & 0x8u) != 0u)
++                mac |= static_cast<uint32_t>(lane) << 12;
++            status |= flags;
++        }
++    }
++
++    // Queues an FMAC flag write issued at `issue` into the real flag pipeline.
++    static void queueFlags(VU1Interpreter &s, uint64_t issue, const uint8_t laneFlags[4], uint8_t dest,
++                           uint32_t extraSticky)
++    {
++        const uint64_t now = s.m_cycle;
++        s.m_cycle = issue;
++        s.updateFmacFlags(laneFlags, dest, extraSticky);
++        s.m_cycle = now;
++    }
++
++    // The FMAC flag write of block pair `index`: queued through `queue(issue, laneFlags, dest, extraSticky)`, or
++    // elided with its sticky bits carried to the next queued write.
++    template <class Queue>
++    static inline void writeFlags(VU1Interpreter &s, FlagElision &e, uint32_t index, const uint8_t laneFlags[4],
++                                  uint8_t dest, uint32_t extraSticky, Queue &&queue)
++    {
++        const uint32_t nextReady = e.blockElide ? e.blockElide[index] : 0u;
++        if (nextReady == 0u)
++        {
++            queue(s.m_cycle, laneFlags, dest, extraSticky | e.stickyCarry);
++            e.stickyCarry = 0u;
++            return;
++        }
++        uint32_t mac = 0u, status = 0u;
++        macStatus(laneFlags, dest, mac, status);
++        e.stickyCarry |= (status | extraSticky) & 0xFu;
++        FlagElision::Write &write = e.writes[e.count++ & 7u];
++        write.issue = s.m_cycle;
++        write.nextReady = s.m_fastStart + nextReady;
++        std::memcpy(write.laneFlags, laneFlags, 4u);
++        write.dest = dest;
++        write.sticky = e.stickyCarry;
++        ++vu1fast::g_flagStats.elided;
++    }
++
++    // ADD/SUB/MUL/MADD/MSUB/OPMSUB into VF or ACC on the fast-block path: `math` (an fmacMath instance) gives the
++    // result, then the flags go to `write(laneFlags, dest, extraSticky)` and the dest lanes are written.
++    // `shadow`: PS2X_VU_FLAG_CHECK mode, which normalizes a copy and writes through applyFmacDest().
++    template <class Math, class Write>
++    static inline void fmac(VU1Interpreter &s, Math &&math, uint32_t word, bool toAcc, bool shadow, Write &&write)
++    {
++        s.m_currentUpperInstruction = word;
++        FmacMath m;
++        math(s.m_state, word, m);
++        const bool productSum = m.productSum;
++        const __m128 product = m.product;
++        float result[4];
++        _mm_storeu_ps(result, m.result);
++
++        const uint8_t dest = DEST(word);
++        if (dest == 0u)
++            return; // no lane and no flag write, as in applyFmacDest()
++        if ((++vu1fast::g_flagStats.fmacs & 0xFFFFFu) == 0u && shadow)
++            vu1fast::printFlagStats(); // test mode leaves with _Exit, so report as we go
++        float *const dst = toAcc ? s.m_state.acc : s.m_state.vf[FD(word)];
++
++        // normalizeFmacResult()/calculateFmacProductSticky() for all active lanes at once, when every lane is one
++        // of these cases (operands are already normalized: zero, normal or +/-FLT_MAX):
++        // - the result (and for ACC +/- product, the product, with the cancellation bound on ACC) is strictly
++        //   inside (FLT_MIN, FLT_MAX): S only, no clamping, as normalizeFmacResult's own fast path;
++        // - ADD/SUB result +/-0: without flush-to-zero a nonzero exact sum of two floats never rounds to zero, so
++        //   the exact result is that zero: Z, S from its sign;
++        // - MUL or ACC +/- product with a zero operand lane: the product is exactly +/-0, so the exact result is
++        //   the float one (+/-0, or ACC when that is strictly normal) and the product reports Z and its sign.
++        // Anything else (underflow, overflow, cancellation) takes the exact path.
++        const int active = ((dest >> 3) & 1) | ((dest >> 1) & 2) | ((dest << 1) & 4) | ((dest << 3) & 8);
++        const __m128i bits = _mm_castps_si128(m.result);
++        const int productZero = m.productZero & active;
++        uint8_t laneFlags[4];
++        uint32_t extraSticky = 0u;
++        float normalized[4];
++        float *flagged = result; // the clamped result the flags describe
++        if ((m.ok & active) == active)
++        {
++            ++vu1fast::g_flagStats.fast;
++            const int signs = _mm_movemask_ps(_mm_castsi128_ps(bits));
++            const int zeros = _mm_movemask_ps(
++                _mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF)), _mm_setzero_si128())));
++            for (int c = 0; c < 4; ++c)
++                laneFlags[c] = static_cast<uint8_t>(((zeros >> c) & 1) | (((signs >> c) & 1) << 1));
++            if (productSum)
++                extraSticky = ((_mm_movemask_ps(product) & active) != 0 ? 0x2u : 0u) | (productZero != 0 ? 0x1u : 0u);
++        }
++        else
++        {
++            if (shadow)
++            {
++                std::memcpy(normalized, result, sizeof(normalized)); // the reference below normalizes `result`
++                flagged = normalized;
++            }
++            s.normalizeFmacResult(flagged, dest, laneFlags);
++            extraSticky = s.calculateFmacProductSticky(dest);
++        }
++
++        write(laneFlags, dest, extraSticky);
++        if (shadow)
++        {
++            if (toAcc)
++                s.applyFmacDestAcc(result, dest);
++            else
++                s.applyFmacDest(dst, result, dest);
++            return;
++        }
++        const __m128 lanes = _mm_load_ps(reinterpret_cast<const float *>(vu1fast::kDestLanes[dest]));
++        _mm_storeu_ps(dst, _mm_or_ps(_mm_and_ps(lanes, _mm_loadu_ps(flagged)), _mm_andnot_ps(lanes, _mm_loadu_ps(dst))));
++    }
++
++    // One plain pair of a tight-loop run (run() in ps2_vu1_core.cpp), with its words and plan as constants.
++    template <uint16_t UId, uint32_t Upper, uint16_t LId, uint32_t Lower, uint8_t ViReg, bool RecordVi>
++    [[gnu::always_inline]] static inline void pair(VU1Interpreter &s, Vu1AotRun &r, uint32_t k)
++    {
++        const uint64_t issue = s.m_fastStart + r.issue[k];
++        if (s.m_nextCommitCycle <= issue)
++            s.fastAdvanceTo(issue);
++        else
++            s.m_cycle = issue;
++        const int32_t oldVi = s.m_state.vi[ViReg];
++        if constexpr (UId < 0x80u && vu1fast::isDirectFmacId(UId))
++        {
++            constexpr bool toAcc = UId >= 0x40u;
++            constexpr uint8_t op = static_cast<uint8_t>(toAcc ? UId - 0x40u : UId);
++            fmac(
++                s, [](VU1State &state, uint32_t word, FmacMath &m) { vu1fast::fmacMath<op, toAcc>(state, word, m); },
++                Upper, toAcc, false,
++                [&](const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky)
++                {
++                    writeFlags(s, *r.flags, k, laneFlags, dest, extraSticky,
++                               [&](uint64_t at, const uint8_t lf[4], uint8_t d, uint32_t sticky)
++                               { queueFlags(s, at, lf, d, sticky); });
++                });
++        }
++        else if constexpr (UId == 0x40u + 0x2Fu || UId == 0x40u + 0x30u) // NOP: the handler only records the word
++            s.m_currentUpperInstruction = Upper;
++        else
++            g_vu1UpperFn[UId](s, Upper);
++        if constexpr ((Upper & 0x80000000u) != 0u)
++            s.m_state.i = std::bit_cast<float>(vu1fast::normalizedOperandBits(Lower));
++        else if constexpr (LId != kVu1LowerNop) // the NOP handler is empty
++            g_vu1LowerFn[LId](s, Lower, r.vuData, r.dataSize);
++        if constexpr (ViReg != 0u)
++            s.m_state.vi[ViReg] = static_cast<int16_t>(s.m_state.vi[ViReg]); // as the VI commit does
++        s.m_viBranchBackupValid = false;
++        if constexpr (RecordVi)
++            s.recordViWriteForBranch(ViReg, oldVi);
++        s.m_state.vf[0][0] = 0.0f;
++        s.m_state.vf[0][1] = 0.0f;
++        s.m_state.vf[0][2] = 0.0f;
++        s.m_state.vf[0][3] = 1.0f;
++        s.m_state.vi[0] = 0;
++    }
++
++    static bool stopped(const VU1Interpreter &s) { return s.m_stopRequested; }
++
++    // End of a run that stopped before pair k, as after the tight loop.
++    static inline bool end(VU1Interpreter &s, Vu1AotRun &r, uint32_t k)
++    {
++        s.m_state.pc = (r.startPair + k) * 8u;
++        s.fastAdvanceTo(s.m_fastStart + r.issue[k - 1u] + 1u);
++        s.m_state.cycles = s.m_cycle;
++        s.m_fastIndex = k;
++        return true;
++    }
++};
++
++#endif
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -4,6 +4,7 @@
+ #include "runtime/ps2_memory.h"
+ #include "runtime/ps2_test_mode.h"
+ #include "ps2_vu1_detail.h"
++#include "ps2_vu1_aot.h"
+ 
+ #include <array>
+ #include <bit>
+@@ -25,24 +26,10 @@
+ #include <utility>
+ #include <xmmintrin.h>
+ 
++using namespace vu1fast;
++
+ namespace
+ {
+-    // ACC +/- product instructions (MADD/MSUB/OPMSUB and their ACC forms); OPMULA (special 0x2E) is a plain product.
+-    constexpr bool isFmacProductSum(uint8_t op, uint8_t special)
+-    {
+-        return (op >= 0x08u && op <= 0x0Fu) ||
+-               op == 0x21u || op == 0x23u || op == 0x25u || op == 0x27u ||
+-               op == 0x29u || op == 0x2Du || op == 0x2Eu ||
+-               (special >= 0x08u && special <= 0x0Fu) ||
+-               special == 0x21u || special == 0x23u || special == 0x25u ||
+-               special == 0x27u || special == 0x29u || special == 0x2Du;
+-    }
+-
+-    constexpr uint8_t laneForComponent(uint32_t component)
+-    {
+-        return static_cast<uint8_t>(1u << (3u - component));
+-    }
+-
+     // Handler ids for each decoded pair, indexed like m_decodedCodeCache. Not on VU1Interpreter:
+     // ps2_vu1.h is included by ps2_runtime.h, and touching it rebuilds every overlay.
+     struct DirectIds
+@@ -64,9 +51,23 @@ namespace
+             bool recordVi = false; // viReg != 0 and the write delays the next branch's read
+         };
+         std::vector<Plan> plan;
++        // Per block start pair: the generated code of its tight-loop runs (#40), or null.
++        std::vector<Vu1AotFn> aot;
++        uint64_t imageHash = 0; // fnv1a of the code, when generated blocks exist
+     };
+     std::unordered_map<const VU1Interpreter *, DirectIds> g_directIds;
+ 
++    // Generated VU1 blocks (#40): compiled in with CMake PS2X_VU1_AOT_DIR. PS2X_VU_NO_AOT=1 ignores them;
++    // PS2X_VU_AOT_VERIFY=1 runs each generated run and the tight loop on copies of the state and compares them.
++#ifdef PS2X_VU1_AOT
++    const Vu1AotBlock *const g_aotBlocks = g_vu1AotBlocks;
++    const uint32_t g_aotBlockCount = std::getenv("PS2X_VU_NO_AOT") != nullptr ? 0u : g_vu1AotBlockCount;
++#else
++    const Vu1AotBlock *const g_aotBlocks = nullptr;
++    const uint32_t g_aotBlockCount = 0u;
++#endif
++    const bool g_aotVerify = std::getenv("PS2X_VU_AOT_VERIFY") != nullptr;
++
+     // PS2X_VU_STATS=1 (#36): VU1 coverage counters. Off: one predictable branch on a static per hook.
+     // Only VU1 is counted. The game thread is the only caller, so the counters are plain.
+     const bool g_vuStats = std::getenv("PS2X_VU_STATS") != nullptr;
+@@ -105,7 +106,7 @@ namespace
+     struct VuStats
+     {
+         uint64_t imageHash = 0;
+-        uint64_t fastPairs = 0, tightPairs = 0, interpPairs = 0, blocks = 0, blockBuilds = 0, runs = 0;
++        uint64_t fastPairs = 0, tightPairs = 0, aotPairs = 0, interpPairs = 0, blocks = 0, blockBuilds = 0, runs = 0;
+         uint64_t refusals[RefusalCount]{};
+         std::unordered_map<uint32_t, std::array<uint64_t, RefusalCount>> refusalsByPc;
+         std::unordered_map<uint64_t, VuImageStats> images;
+@@ -141,10 +142,10 @@ namespace
+         s.lastInterp = s.interpPairs;
+         std::fprintf(stderr,
+                      "[vu-stats:%s] last interval: fast %llu interp %llu (fast %.1f%%) | total: fast %llu interp %llu "
+-                     "(fast %.1f%%, tight loop %.1f%%) runs %llu blocks %llu (%.1f/run, %.1f pairs/block) builds %llu\n",
++                     "(fast %.1f%%, tight loop %.1f%%, generated %.1f%%) runs %llu blocks %llu (%.1f/run, %.1f pairs/block) builds %llu\n",
+                      tag, (unsigned long long)dFast, (unsigned long long)dInterp, pct(dFast, dFast + dInterp),
+                      (unsigned long long)s.fastPairs, (unsigned long long)s.interpPairs, pct(s.fastPairs, total),
+-                     pct(s.tightPairs, total), (unsigned long long)s.runs, (unsigned long long)s.blocks,
++                     pct(s.tightPairs, total), pct(s.aotPairs, total), (unsigned long long)s.runs, (unsigned long long)s.blocks,
+                      s.runs ? double(s.blocks) / s.runs : 0.0, s.blocks ? double(s.fastPairs) / s.blocks : 0.0,
+                      (unsigned long long)s.blockBuilds);
+         std::fprintf(stderr, "[vu-stats:%s] interp pairs by reason:", tag);
+@@ -321,122 +322,6 @@ namespace
+         ++s.refusalsByPc[pc][reason];
+     }
+ 
+-    // Upper handler ids run by directAddSubMul on the fast-block path: ADD/SUB/MUL/MADD/MSUB/OPMSUB and their
+-    // ACC forms (ids 0x40+), not MAX/MINI/ABS/CLIP/ITOF/FTOI/NOP. These are every MAC/status flag writer.
+-    constexpr bool isDirectFmacId(uint16_t id)
+-    {
+-        const uint16_t op = id >= 0x40u ? static_cast<uint16_t>(id - 0x40u) : id;
+-        return op <= 0x0Fu || (op >= 0x18u && op <= 0x1Cu) ||
+-               (op >= 0x1Eu && op <= 0x2Eu && op != 0x1Fu && op != 0x2Bu);
+-    }
+-
+-    // The math and the fast flag test of one direct FMAC (#38), per op number and VF/ACC form, so the op, its
+-    // operand source and the add/sub/product kind are compile-time. Operands are normalized as normalizeOperand(),
+-    // with a separate multiply and add, under the caller's rounding mode, exactly like the generic code they
+-    // replace. `ok` has a bit per lane whose flags the fast test can derive (see the caller).
+-    struct FmacMath
+-    {
+-        __m128 left, right, product, result;
+-        int ok;            // lanes the fast flag test covers
+-        int productZero;   // productSum: lanes with a zero operand (exact zero product)
+-        bool productSum;
+-    };
+-    using FmacMathFn = void (*)(VU1State &state, uint32_t word, FmacMath &m);
+-
+-    template <uint8_t Op, bool ToAcc>
+-    void fmacMath(VU1State &state, uint32_t word, FmacMath &m)
+-    {
+-        constexpr bool qSource = Op == 0x1Cu || Op == 0x20u || Op == 0x24u || Op == 0x21u || Op == 0x25u;
+-        constexpr bool iSource = Op == 0x1Eu || Op == 0x22u || Op == 0x26u || Op == 0x23u || Op == 0x27u;
+-        constexpr bool broadcast = Op <= 0x0Fu || (Op >= 0x18u && Op <= 0x1Bu);
+-        constexpr bool productSum = ToAcc ? isFmacProductSum(0xFFu, Op) : isFmacProductSum(Op, 0xFFu);
+-        constexpr bool mul = (Op >= 0x18u && Op <= 0x1Cu) || Op == 0x1Eu || Op == 0x2Au || Op == 0x2Eu;
+-        constexpr bool productSub = (Op >= 0x0Cu && Op <= 0x0Fu) || Op == 0x25u || Op == 0x27u || Op == 0x2Du ||
+-                                    Op == 0x2Eu;
+-        constexpr bool sub = (Op >= 0x04u && Op <= 0x07u) || Op == 0x24u || Op == 0x26u || Op == 0x2Cu;
+-
+-        __m128 left = vu1NormalizeOperands(_mm_loadu_ps(state.vf[FS(word)]));
+-        __m128 right;
+-        if constexpr (qSource)
+-            right = vu1NormalizeOperands(_mm_set1_ps(state.q));
+-        else if constexpr (iSource)
+-            right = vu1NormalizeOperands(_mm_set1_ps(state.i));
+-        else
+-        {
+-            const __m128 loaded = vu1NormalizeOperands(_mm_loadu_ps(state.vf[FT(word)]));
+-            if constexpr (broadcast)
+-                right = _mm_shuffle_ps(loaded, loaded, _MM_SHUFFLE(Op & 3, Op & 3, Op & 3, Op & 3));
+-            else if constexpr (Op == 0x2Eu)
+-            {
+-                // OPMSUB: acc - (vs.yzx * vt.zxy), OPMULA: vs.yzx * vt.zxy; w is forced to 0 below.
+-                left = _mm_shuffle_ps(left, left, _MM_SHUFFLE(3, 0, 2, 1));
+-                right = _mm_shuffle_ps(loaded, loaded, _MM_SHUFFLE(3, 1, 0, 2));
+-            }
+-            else
+-                right = loaded;
+-        }
+-
+-        __m128 product = _mm_setzero_ps();
+-        __m128 result;
+-        if constexpr (productSum)
+-        {
+-            const __m128 acc = vu1NormalizeOperands(_mm_loadu_ps(state.acc));
+-            product = _mm_mul_ps(left, right);
+-            result = productSub ? _mm_sub_ps(acc, product) : _mm_add_ps(acc, product);
+-        }
+-        else if constexpr (mul)
+-            result = _mm_mul_ps(left, right);
+-        else if constexpr (sub)
+-            result = _mm_sub_ps(left, right);
+-        else
+-            result = _mm_add_ps(left, right);
+-        if constexpr (Op == 0x2Eu)
+-            result = _mm_and_ps(result, _mm_castsi128_ps(_mm_set_epi32(0, -1, -1, -1)));
+-
+-        // Per lane: the result (and for ACC +/- product, the product, with the cancellation bound on ACC) is
+-        // strictly inside (FLT_MIN, FLT_MAX); or an exact zero (see the caller).
+-        const __m128i bits = _mm_castps_si128(result);
+-        const __m128i magnitudeMask = _mm_set1_epi32(0x7FFFFFFF);
+-        const __m128i minNormal = _mm_set1_epi32(0x00800000);
+-        const __m128i maxNormal = _mm_set1_epi32(0x7F7FFFFF);
+-        const __m128i magnitude = _mm_and_si128(bits, magnitudeMask);
+-        const __m128i normal = _mm_and_si128(_mm_cmpgt_epi32(magnitude, minNormal),
+-                                             _mm_cmplt_epi32(magnitude, maxNormal));
+-        const __m128i zero = _mm_cmpeq_epi32(magnitude, _mm_setzero_si128());
+-        __m128i ok;
+-        m.productZero = 0;
+-        if constexpr (productSum || mul)
+-        {
+-            const __m128i operandZero = _mm_castps_si128(_mm_or_ps(_mm_cmpeq_ps(left, _mm_setzero_ps()),
+-                                                                   _mm_cmpeq_ps(right, _mm_setzero_ps())));
+-            if constexpr (productSum)
+-            {
+-                const __m128i exponent = _mm_srli_epi32(magnitude, 23);
+-                const __m128i accBits = _mm_castps_si128(_mm_loadu_ps(state.acc));
+-                const __m128i accExponent = _mm_srli_epi32(_mm_and_si128(accBits, magnitudeMask), 23);
+-                const __m128i productMagnitude = _mm_and_si128(_mm_castps_si128(product), magnitudeMask);
+-                ok = _mm_and_si128(normal, _mm_cmpgt_epi32(exponent, _mm_set1_epi32(2)));
+-                ok = _mm_and_si128(ok, _mm_cmplt_epi32(exponent, _mm_set1_epi32(254)));
+-                ok = _mm_and_si128(ok, _mm_cmplt_epi32(accExponent, _mm_set1_epi32(254)));
+-                ok = _mm_andnot_si128(_mm_cmpgt_epi32(accExponent, _mm_add_epi32(exponent, _mm_set1_epi32(16))), ok);
+-                ok = _mm_and_si128(ok, _mm_cmpgt_epi32(productMagnitude, minNormal));
+-                ok = _mm_and_si128(ok, _mm_cmplt_epi32(productMagnitude, maxNormal));
+-                ok = _mm_or_si128(ok, _mm_and_si128(operandZero, _mm_or_si128(normal, zero)));
+-                m.productZero = _mm_movemask_ps(_mm_castsi128_ps(operandZero));
+-            }
+-            else
+-                ok = _mm_or_si128(normal, _mm_and_si128(zero, operandZero));
+-        }
+-        else
+-            ok = _mm_or_si128(normal, zero);
+-        m.left = left;
+-        m.right = right;
+-        m.product = product;
+-        m.result = result;
+-        m.ok = _mm_movemask_ps(_mm_castsi128_ps(ok));
+-        m.productSum = productSum;
+-    }
+-
+     template <uint16_t Id>
+     constexpr FmacMathFn fmacMathFor()
+     {
+@@ -454,13 +339,6 @@ namespace
+     constexpr std::array<FmacMathFn, kVu1UpperFnCount> kFmacMath =
+         makeFmacMathTable(std::make_integer_sequence<uint16_t, kVu1UpperFnCount>{});
+ 
+-    // Lane masks for a dest field (x = bit 3 -> lane 0).
+-    alignas(16) constexpr int32_t kDestLanes[16][4] = {
+-        {0, 0, 0, 0}, {0, 0, 0, -1}, {0, 0, -1, 0}, {0, 0, -1, -1},
+-        {0, -1, 0, 0}, {0, -1, 0, -1}, {0, -1, -1, 0}, {0, -1, -1, -1},
+-        {-1, 0, 0, 0}, {-1, 0, 0, -1}, {-1, 0, -1, 0}, {-1, 0, -1, -1},
+-        {-1, -1, 0, 0}, {-1, -1, 0, -1}, {-1, -1, -1, 0}, {-1, -1, -1, -1}};
+-
+     // Lower FSEQ/FSAND/FSOR/FMEQ/FMAND/FMOR (opHi 0x14-0x1B, FSSET 0x15 excluded) read MAC or status.
+     constexpr bool isFlagReader(uint32_t lower, bool iBit)
+     {
+@@ -468,19 +346,49 @@ namespace
+         return !iBit && opHi >= 0x14u && opHi <= 0x1Bu && opHi != 0x15u;
+     }
+ 
+-    struct FlagStats
++    // The generated code for the block at startPair, if a generated block has the same image, start, words and
++    // pair plans. Anything else keeps the tight loop and is reported once.
++    Vu1AotFn bindAot(const DirectIds &ids, const uint8_t *code, uint32_t startPair, uint32_t pairCount)
++    {
++        const uint32_t pc = startPair * 8u;
++        for (uint32_t b = 0; b < g_aotBlockCount; ++b)
++        {
++            const Vu1AotBlock &block = g_aotBlocks[b];
++            if (block.image != ids.imageHash || block.pc != pc)
++                continue;
++            bool same = block.pairs == pairCount && block.key == fnv1a(code + pc, pairCount * 8u, startPair);
++            for (uint32_t k = 0; same && k < pairCount; ++k)
++            {
++                const DirectIds::Plan &plan = ids.plan[startPair + k];
++                const Vu1AotPair &info = block.info[k];
++                same = info.lower == plan.lower && info.upper == plan.upper && info.upperId == plan.upperId &&
++                       info.lowerId == plan.lowerId && info.viReg == plan.viReg && info.plain == plan.plain &&
++                       info.recordVi == plan.recordVi;
++            }
++            if (same)
++                return block.fn;
++            std::fprintf(stderr, "[vu1:aot] block %016llx:0x%04x does not match the generated code; not used\n",
++                         static_cast<unsigned long long>(ids.imageHash), pc);
++            return nullptr;
++        }
++        return nullptr;
++    }
++
++    struct AotVerifyStats
+     {
+-        uint64_t fmacs = 0, fast = 0, elided = 0, checks = 0, mismatches = 0;
+-    } g_flagStats;
++        uint64_t checks = 0, mismatches = 0;
++        std::unordered_map<uint32_t, uint64_t> byPc; // run start pc -> mismatches
++    } g_aotVerifyStats;
+ 
+-    void printFlagStats()
++    void printAotVerifyStats()
+     {
+-        std::fprintf(stderr, "[vu1:flag-check] fmacs=%llu sse_fast=%llu elided=%llu checks=%llu mismatches=%llu\n",
+-                     static_cast<unsigned long long>(g_flagStats.fmacs),
+-                     static_cast<unsigned long long>(g_flagStats.fast),
+-                     static_cast<unsigned long long>(g_flagStats.elided),
+-                     static_cast<unsigned long long>(g_flagStats.checks),
+-                     static_cast<unsigned long long>(g_flagStats.mismatches));
++        AotVerifyStats &v = g_aotVerifyStats;
++        std::fprintf(stderr, "[vu1:aot-verify] checks=%llu mismatches=%llu", static_cast<unsigned long long>(v.checks),
++                     static_cast<unsigned long long>(v.mismatches));
++        for (const auto &[pc, n] : v.byPc)
++            std::fprintf(stderr, " 0x%04x=%llu", pc, static_cast<unsigned long long>(n));
++        std::fprintf(stderr, "\n");
++        std::fflush(stderr);
+     }
+ }
+ 
+@@ -2240,6 +2148,8 @@ void VU1Interpreter::prepareCodeCache(const uint8_t *vuCode, uint32_t codeSize,
+             if (g_vuCapture && m_unit == Unit::VU1)
+                 vuCaptureImage(vuCode, pairCount);
+         }
++        if (rebuiltCode && g_aotBlockCount != 0u && m_unit == Unit::VU1)
++            g_directIds[this].imageHash = fnv1a(vuCode, pairCount * 8u);
+         m_cachedVuCode = vuCode;
+         m_cachedMemory = memory;
+         m_cachedCodeSize = codeSize;
+@@ -2504,6 +2414,12 @@ const VU1Interpreter::FastBlock *VU1Interpreter::buildFastBlock(uint32_t startPa
+         if (ids.elide.size() != m_cachedPairCount)
+             ids.elide.assign(m_cachedPairCount, {});
+         ids.elide[startPair] = std::move(elide);
++        if (g_aotBlockCount != 0u && m_unit == Unit::VU1 && ids.plan.size() == m_cachedPairCount)
++        {
++            if (ids.aot.size() != m_cachedPairCount)
++                ids.aot.assign(m_cachedPairCount, nullptr);
++            ids.aot[startPair] = bindAot(ids, m_cachedCodeCopy.data(), startPair, block->pairCount);
++        }
+     }
+ 
+     if (g_vuStats && m_unit == Unit::VU1)
+@@ -2713,45 +2629,13 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     static const bool flagCheck = std::getenv("PS2X_VU_FLAG_CHECK") != nullptr;
+     const bool directPath = directIds != nullptr && !noDirect;
+     const bool shadowActive = flagCheck && directPath;
+-    const uint32_t *blockElide = nullptr; // DirectIds::elide of the current block, or null
+-    uint32_t stickyCarry = 0u;            // sticky Z/S/U/O of elided writes, not queued yet
+-    struct ElidedWrite
+-    {
+-        uint64_t issue = 0;
+-        uint64_t nextReady = 0; // ready cycle of the write that hides it
+-        uint8_t laneFlags[4]{};
+-        uint8_t dest = 0;
+-        uint32_t sticky = 0; // stickyCarry including this write
+-    };
+-    std::array<ElidedWrite, 8> elidedWrites{}; // only the last few can still be visible at block exit
+-    uint32_t elidedCount = 0u;
++    FlagElision elision; // the current block's elided MAC/status writes
+     struct ShadowFlags
+     {
+         std::vector<FlagPipelineEntry> pending; // in commit order
+         uint32_t mac = 0, status = 0, clip = 0;
+     } shadow;
+ 
+-    auto macStatus = [](const uint8_t laneFlags[4], uint8_t dest, uint32_t &mac, uint32_t &status)
+-    {
+-        // Same as updateFmacFlags().
+-        mac = status = 0u;
+-        for (uint32_t component = 0; component < 4u; ++component)
+-        {
+-            const uint8_t lane = laneForComponent(component);
+-            if ((dest & lane) == 0u)
+-                continue;
+-            const uint32_t flags = laneFlags[component];
+-            if ((flags & 0x1u) != 0u)
+-                mac |= lane;
+-            if ((flags & 0x2u) != 0u)
+-                mac |= static_cast<uint32_t>(lane) << 4;
+-            if ((flags & 0x4u) != 0u)
+-                mac |= static_cast<uint32_t>(lane) << 8;
+-            if ((flags & 0x8u) != 0u)
+-                mac |= static_cast<uint32_t>(lane) << 12;
+-            status |= flags;
+-        }
+-    };
+     auto applyFlagEntry = [](const FlagPipelineEntry &entry, uint32_t &mac, uint32_t &status, uint32_t &clip)
+     {
+         // Same as commitReadyPipelines().
+@@ -2780,52 +2664,35 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     {
+         if (!toShadow)
+         {
+-            const uint64_t now = m_cycle;
+-            m_cycle = issue;
+-            updateFmacFlags(laneFlags, dest, extraSticky);
+-            m_cycle = now;
++            Vu1Aot::queueFlags(*this, issue, laneFlags, dest, extraSticky);
+             return;
+         }
+         FlagPipelineEntry entry{};
+         entry.valid = true;
+         entry.issueCycle = issue;
+         entry.readyCycle = issue + kFmacLatency;
+-        macStatus(laneFlags, dest, entry.mac, entry.status);
++        Vu1Aot::macStatus(laneFlags, dest, entry.mac, entry.status);
+         entry.extraSticky = extraSticky;
+         entry.writesMac = entry.writesStatus = true;
+         shadowInsert(entry);
+     };
+     auto writeFlags = [&](const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky, bool toShadow)
+     {
+-        const uint32_t nextReady = blockElide ? blockElide[m_fastIndex] : 0u;
+-        if (nextReady == 0u)
+-        {
+-            queueFlags(m_cycle, laneFlags, dest, extraSticky | stickyCarry, toShadow);
+-            stickyCarry = 0u;
+-            return;
+-        }
+-        uint32_t mac = 0u, status = 0u;
+-        macStatus(laneFlags, dest, mac, status);
+-        stickyCarry |= (status | extraSticky) & 0xFu;
+-        ElidedWrite &write = elidedWrites[elidedCount++ & 7u];
+-        write.issue = m_cycle;
+-        write.nextReady = m_fastStart + nextReady;
+-        std::memcpy(write.laneFlags, laneFlags, 4u);
+-        write.dest = dest;
+-        write.sticky = stickyCarry;
+-        ++g_flagStats.elided;
++        Vu1Aot::writeFlags(*this, elision, m_fastIndex, laneFlags, dest, extraSticky,
++                           [&](uint64_t issue, const uint8_t lf[4], uint8_t d, uint32_t sticky)
++                           { queueFlags(issue, lf, d, sticky, toShadow); });
+     };
+     // At block exit, a write whose hiding write is not ready yet is visible from here on: queue it after all.
+     auto queueVisibleElided = [&](bool toShadow)
+     {
+-        for (uint32_t n = elidedCount > 8u ? elidedCount - 8u : 0u; n < elidedCount; ++n)
++        for (uint32_t n = elision.count > 8u ? elision.count - 8u : 0u; n < elision.count; ++n)
+         {
+-            const ElidedWrite &write = elidedWrites[n & 7u];
++            const FlagElision::Write &write = elision.writes[n & 7u];
+             if (write.nextReady > m_cycle)
+                 queueFlags(write.issue, write.laneFlags, write.dest, write.sticky, toShadow);
+         }
+-        elidedCount = 0u;
+-        stickyCarry = 0u;
++        elision.count = 0u;
++        elision.stickyCarry = 0u;
+     };
+     auto shadowCommit = [&]()
+     {
+@@ -2861,15 +2728,15 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     };
+     auto onBlockEnter = [&]()
+     {
+-        blockElide = nullptr;
++        elision.blockElide = nullptr;
+         if (directPath && !noElide)
+         {
+             const uint32_t start = m_fastBlock->startPair;
+             if (start < directIds->elide.size() && !directIds->elide[start].empty())
+-                blockElide = directIds->elide[start].data();
++                elision.blockElide = directIds->elide[start].data();
+         }
+-        elidedCount = 0u;
+-        stickyCarry = 0u;
++        elision.count = 0u;
++        elision.stickyCarry = 0u;
+         if (shadowActive)
+         {
+             shadow.mac = m_state.mac;
+@@ -2893,7 +2760,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             shadow.pending.clear();
+             compareFlags("exit-drained", mac, status, clip, shadow.mac, shadow.status, shadow.clip);
+         }
+-        else if (elidedCount != 0u)
++        else if (elision.count != 0u)
+         {
+             queueVisibleElided(false);
+             commitReadyPipelines(); // a write ready by now must be visible to the interpreter's next pair
+@@ -2923,71 +2790,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     // the interpreter table stays scalar.
+     auto directAddSubMul = [&](FmacMathFn math, uint32_t word, bool toAcc)
+     {
+-        m_currentUpperInstruction = word;
+-        FmacMath m;
+-        math(m_state, word, m);
+-        const bool productSum = m.productSum;
+-        const __m128 product = m.product;
+-        float result[4];
+-        _mm_storeu_ps(result, m.result);
+-
+-        const uint8_t dest = DEST(word);
+-        if (dest == 0u)
+-            return; // no lane and no flag write, as in applyFmacDest()
+-        if ((++g_flagStats.fmacs & 0xFFFFFu) == 0u && flagCheck)
+-            printFlagStats(); // test mode leaves with _Exit, so report as we go
+-        float *const dst = toAcc ? m_state.acc : m_state.vf[FD(word)];
+-
+-        // normalizeFmacResult()/calculateFmacProductSticky() for all active lanes at once, when every lane is one
+-        // of these cases (operands are already normalized: zero, normal or +/-FLT_MAX):
+-        // - the result (and for ACC +/- product, the product, with the cancellation bound on ACC) is strictly
+-        //   inside (FLT_MIN, FLT_MAX): S only, no clamping, as normalizeFmacResult's own fast path;
+-        // - ADD/SUB result +/-0: without flush-to-zero a nonzero exact sum of two floats never rounds to zero, so
+-        //   the exact result is that zero: Z, S from its sign;
+-        // - MUL or ACC +/- product with a zero operand lane: the product is exactly +/-0, so the exact result is
+-        //   the float one (+/-0, or ACC when that is strictly normal) and the product reports Z and its sign.
+-        // Anything else (underflow, overflow, cancellation) takes the exact path.
+-        const int active = ((dest >> 3) & 1) | ((dest >> 1) & 2) | ((dest << 1) & 4) | ((dest << 3) & 8);
+-        const __m128i bits = _mm_castps_si128(m.result);
+-        const int productZero = m.productZero & active;
+-        uint8_t laneFlags[4];
+-        uint32_t extraSticky = 0u;
+-        float normalized[4];
+-        float *flagged = result; // the clamped result the flags describe
+-        if ((m.ok & active) == active)
+-        {
+-            ++g_flagStats.fast;
+-            const int signs = _mm_movemask_ps(_mm_castsi128_ps(bits));
+-            const int zeros = _mm_movemask_ps(
+-                _mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF)), _mm_setzero_si128())));
+-            for (int c = 0; c < 4; ++c)
+-                laneFlags[c] = static_cast<uint8_t>(((zeros >> c) & 1) | (((signs >> c) & 1) << 1));
+-            if (productSum)
+-                extraSticky = ((_mm_movemask_ps(product) & active) != 0 ? 0x2u : 0u) | (productZero != 0 ? 0x1u : 0u);
+-        }
+-        else
+-        {
+-            if (shadowActive)
+-            {
+-                std::memcpy(normalized, result, sizeof(normalized)); // the reference below normalizes `result`
+-                flagged = normalized;
+-            }
+-            normalizeFmacResult(flagged, dest, laneFlags);
+-            extraSticky = calculateFmacProductSticky(dest);
+-        }
+-
+-        if (shadowActive)
+-        {
+-            writeFlags(laneFlags, dest, extraSticky, true);
+-            if (toAcc)
+-                applyFmacDestAcc(result, dest);
+-            else
+-                applyFmacDest(dst, result, dest);
+-            return;
+-        }
+-        writeFlags(laneFlags, dest, extraSticky, false);
+-        const __m128 lanes = _mm_load_ps(reinterpret_cast<const float *>(kDestLanes[dest]));
+-        _mm_storeu_ps(dst, _mm_or_ps(_mm_and_ps(lanes, _mm_loadu_ps(flagged)), _mm_andnot_ps(lanes, _mm_loadu_ps(dst))));
++        Vu1Aot::fmac(*this, math, word, toAcc, shadowActive,
++                     [&](const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky)
++                     { writeFlags(laneFlags, dest, extraSticky, shadowActive); });
+     };
+ 
+     // Executes one pair's upper and lower instructions; register results land in m_state right away.
+@@ -3109,6 +2914,258 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         return ended;
+     };
+ 
++    // Tight loop (#37): a run of plain pairs, never the block's last one (the delay slot or the cut). The
++    // generic step below would find no budget/XGKICK leave, no branch, PC jump or program end, and its
++    // commit after a pair is repeated by the commit before the next one, so only that one is kept.
++    // PC, cycles and the stats are written once after the run.
++    auto tightLoop = [&]()
++    {
++        const FastBlock &block = *m_fastBlock;
++        const DirectIds::Plan *plan = directIds->plan.data() + block.startPair;
++        const uint32_t last = block.pairCount - 1u;
++        const uint32_t first = m_fastIndex;
++        uint32_t k = first;
++        do
++        {
++            const DirectIds::Plan &p = plan[k];
++            const uint64_t issue = m_fastStart + block.issue[k];
++            if (m_nextCommitCycle <= issue)
++                fastAdvanceTo(issue);
++            else
++                m_cycle = issue;
++            m_fastIndex = k; // writeFlags() reads the block's elide data by it
++            if (shadowActive && isFlagReader(p.lower, p.iBit))
++            {
++                shadowCommit();
++                compareFlags("reader", m_state.mac, m_state.status, m_state.clip, shadow.mac, shadow.status,
++                             shadow.clip);
++            }
++            const uint32_t flagMaskBefore = m_flagMask;
++            const int32_t oldVi = m_state.vi[p.viReg];
++            if (const FmacMathFn math = kFmacMath[p.upperId])
++                directAddSubMul(math, p.upper, p.upperId >= 0x40u);
++            else
++                g_vu1UpperFn[p.upperId](*this, p.upper);
++            if (p.iBit)
++            {
++                float immediate = 0.0f;
++                std::memcpy(&immediate, &p.lower, sizeof(immediate));
++                m_state.i = normalizeOperand(immediate);
++            }
++            else
++                g_vu1LowerFn[p.lowerId](*this, p.lower, vuData, dataSize);
++            if (shadowActive)
++                mirrorToShadow(flagMaskBefore);
++            if (p.viReg != 0u)
++                m_state.vi[p.viReg] = static_cast<int16_t>(m_state.vi[p.viReg]); // as the VI commit does
++            m_viBranchBackupValid = false;
++            if (p.recordVi)
++                recordViWriteForBranch(p.viReg, oldVi);
++            m_state.vf[0][0] = 0.0f;
++            m_state.vf[0][1] = 0.0f;
++            m_state.vf[0][2] = 0.0f;
++            m_state.vf[0][3] = 1.0f;
++            m_state.vi[0] = 0;
++            ++k;
++        } while (k < last && plan[k].plain && !m_stopRequested);
++        m_state.pc = (block.startPair + k) * 8u; // the block never wraps: its pairs are below codeSize
++        fastAdvanceTo(m_fastStart + block.issue[k - 1u] + 1u);
++        m_state.cycles = m_cycle;
++        m_fastIndex = k;
++        if (stats)
++        {
++            vuStats().fastPairs += k - first;
++            vuStats().tightPairs += k - first;
++            if (vuStats().current)
++                vuStats().current->fastPairs += k - first;
++        }
++    };
++
++    // Generated runs (#40) replace tightLoop() pair for pair, with the words and plans as constants. Off under
++    // PS2X_VU_FLAG_CHECK (its shadow lives in tightLoop); PS2X_VU_AOT_VERIFY checks them against tightLoop().
++    const bool aotPath = directPath && !shadowActive && g_aotBlockCount != 0u;
++    struct AotSnapshot
++    {
++        VU1State state;
++        uint64_t cycle, nextCommit, efuResourceReady, xgkickSync;
++        std::array<FlagPipelineEntry, kMaxFlagEntries> flagPipeline;
++        ScalarPipelineEntry fdiv;
++        std::array<ScalarPipelineEntry, 2> efu;
++        uint32_t flagMask, efuMask, storeMask, fastIndex, workingClip, currentUpper;
++        uint32_t xSource, xTotal, xCopied, xTagEnd, xCredit;
++        uint64_t xIssue;
++        bool xActive, xEop;
++        int32_t backupValue;
++        uint8_t backupReg;
++        bool backupValid, stop;
++        FlagElision elision;
++    };
++    auto takeSnapshot = [&](AotSnapshot &x)
++    {
++        x.state = m_state;
++        x.cycle = m_cycle;
++        x.nextCommit = m_nextCommitCycle;
++        x.efuResourceReady = m_efuResourceReady;
++        x.xgkickSync = m_xgkickSyncCycle;
++        x.flagPipeline = m_flagPipeline;
++        x.fdiv = m_fdiv;
++        x.efu = m_efu;
++        x.flagMask = m_flagMask;
++        x.efuMask = m_efuMask;
++        x.storeMask = m_storeMask;
++        x.fastIndex = m_fastIndex;
++        x.workingClip = m_workingClip;
++        x.currentUpper = m_currentUpperInstruction;
++        x.xSource = m_xgkick.sourceAddress;
++        x.xTotal = m_xgkick.totalBytes;
++        x.xCopied = m_xgkick.copiedBytes;
++        x.xTagEnd = m_xgkick.currentTagEnd;
++        x.xCredit = m_xgkick.cycleCredit;
++        x.xIssue = m_xgkick.issueCycle;
++        x.xActive = m_xgkick.active;
++        x.xEop = m_xgkick.currentTagEop;
++        x.backupValue = m_viBranchBackupValue;
++        x.backupReg = m_viBranchBackupReg;
++        x.backupValid = m_viBranchBackupValid;
++        x.stop = m_stopRequested;
++        x.elision = elision;
++    };
++    auto putSnapshot = [&](const AotSnapshot &x)
++    {
++        m_state = x.state;
++        m_cycle = x.cycle;
++        m_nextCommitCycle = x.nextCommit;
++        m_efuResourceReady = x.efuResourceReady;
++        m_xgkickSyncCycle = x.xgkickSync;
++        m_flagPipeline = x.flagPipeline;
++        m_fdiv = x.fdiv;
++        m_efu = x.efu;
++        m_flagMask = x.flagMask;
++        m_efuMask = x.efuMask;
++        m_storeMask = x.storeMask;
++        m_fastIndex = x.fastIndex;
++        m_workingClip = x.workingClip;
++        m_currentUpperInstruction = x.currentUpper;
++        m_xgkick.sourceAddress = x.xSource;
++        m_xgkick.totalBytes = x.xTotal;
++        m_xgkick.copiedBytes = x.xCopied;
++        m_xgkick.currentTagEnd = x.xTagEnd;
++        m_xgkick.cycleCredit = x.xCredit;
++        m_xgkick.issueCycle = x.xIssue;
++        m_xgkick.active = x.xActive;
++        m_xgkick.currentTagEop = x.xEop;
++        m_viBranchBackupValue = x.backupValue;
++        m_viBranchBackupReg = x.backupReg;
++        m_viBranchBackupValid = x.backupValid;
++        m_stopRequested = x.stop;
++        elision = x.elision;
++    };
++    // Differences between a snapshot taken after the generated run and the current (tightLoop) state, as a list
++    // of names; empty when they match.
++    auto diffSnapshot = [&](const AotSnapshot &a, std::string &out)
++    {
++        AotSnapshot b;
++        takeSnapshot(b);
++        const auto same = [](const auto &x, const auto &y) { return std::memcmp(&x, &y, sizeof(x)) == 0; };
++        const auto add = [&](bool ok, const char *name)
++        {
++            if (!ok)
++                out += out.empty() ? name : std::string(" ") + name;
++        };
++        add(same(a.state.vf, b.state.vf), "vf");
++        add(same(a.state.vi, b.state.vi), "vi");
++        add(same(a.state.acc, b.state.acc), "acc");
++        add(same(a.state.q, b.state.q) && same(a.state.p, b.state.p) && same(a.state.i, b.state.i), "q/p/i");
++        bool scalars = a.efuMask == b.efuMask && a.efuResourceReady == b.efuResourceReady &&
++                       a.fdiv.valid == b.fdiv.valid;
++        const auto sameScalar = [&](const ScalarPipelineEntry &x, const ScalarPipelineEntry &y)
++        { return !x.valid || (x.readyCycle == y.readyCycle && same(x.value, y.value) && x.statusDi == y.statusDi); };
++        scalars = scalars && sameScalar(a.fdiv, b.fdiv);
++        for (uint32_t bits = a.efuMask; scalars && bits != 0u; bits &= bits - 1u)
++            scalars = sameScalar(a.efu[std::countr_zero(bits)], b.efu[std::countr_zero(bits)]);
++        add(scalars, "fdiv/efu");
++        bool flags = a.state.mac == b.state.mac && a.state.status == b.state.status && a.state.clip == b.state.clip &&
++                     a.flagMask == b.flagMask && a.workingClip == b.workingClip;
++        for (uint32_t bits = a.flagMask; flags && bits != 0u; bits &= bits - 1u)
++        {
++            const FlagPipelineEntry &x = a.flagPipeline[std::countr_zero(bits)];
++            const FlagPipelineEntry &y = b.flagPipeline[std::countr_zero(bits)];
++            flags = x.readyCycle == y.readyCycle && x.issueCycle == y.issueCycle && x.mac == y.mac &&
++                    x.status == y.status && x.extraSticky == y.extraSticky && x.clip == y.clip &&
++                    x.writesMac == y.writesMac && x.writesStatus == y.writesStatus &&
++                    x.writesSticky == y.writesSticky && x.writesClip == y.writesClip;
++        }
++        flags = flags && a.elision.blockElide == b.elision.blockElide &&
++                a.elision.stickyCarry == b.elision.stickyCarry && a.elision.count == b.elision.count;
++        for (uint32_t n = a.elision.count > 8u ? a.elision.count - 8u : 0u; flags && n < a.elision.count; ++n)
++        {
++            const FlagElision::Write &x = a.elision.writes[n & 7u];
++            const FlagElision::Write &y = b.elision.writes[n & 7u];
++            flags = x.issue == y.issue && x.nextReady == y.nextReady && same(x.laneFlags, y.laneFlags) &&
++                    x.dest == y.dest && x.sticky == y.sticky;
++        }
++        add(flags, "flags");
++        add(a.cycle == b.cycle && a.state.cycles == b.state.cycles && a.nextCommit == b.nextCommit &&
++                a.xgkickSync == b.xgkickSync,
++            "cycles");
++        add(a.xSource == b.xSource && a.xTotal == b.xTotal && a.xCopied == b.xCopied && a.xTagEnd == b.xTagEnd &&
++                a.xCredit == b.xCredit && a.xIssue == b.xIssue && a.xActive == b.xActive && a.xEop == b.xEop,
++            "xgkick");
++        add(a.state.pc == b.state.pc && a.state.r == b.state.r && a.state.ebit == b.state.ebit &&
++                a.state.branchPending == b.state.branchPending && a.state.branchTarget == b.state.branchTarget &&
++                a.state.branchDelay == b.state.branchDelay && a.fastIndex == b.fastIndex &&
++                a.currentUpper == b.currentUpper && a.backupValid == b.backupValid &&
++                (!a.backupValid || (a.backupValue == b.backupValue && a.backupReg == b.backupReg)) &&
++                a.stop == b.stop && a.storeMask == b.storeMask,
++            "other");
++    };
++    std::vector<uint8_t> aotScratch; // PS2X_VU_AOT_VERIFY: VU data the generated run writes
++    std::vector<uint8_t> aotPacket;  // and the PATH1 bytes it copied
++    // Runs the generated run on a scratch copy of VU data with PATH1 submission off, keeps its result, restores
++    // the state, runs tightLoop() for real and compares. Returns false (nothing ran) when `aot` has no run here.
++    auto verifyAot = [&](Vu1AotFn aot, Vu1AotRun &aotRun, uint32_t first) -> bool
++    {
++        AotSnapshot before;
++        takeSnapshot(before);
++        aotScratch.assign(vuData, vuData + dataSize);
++        m_activeVuData = aotScratch.data();
++        m_activeGs = nullptr;
++        m_activeMemory = nullptr;
++        aotRun.vuData = aotScratch.data();
++        const bool ran = aot(*this, aotRun, first);
++        m_activeVuData = vuData;
++        m_activeGs = &gs;
++        m_activeMemory = memory;
++        if (!ran)
++            return false;
++        AotSnapshot after;
++        takeSnapshot(after);
++        const uint32_t from = std::min(before.xCopied, m_xgkick.copiedBytes);
++        aotPacket.assign(m_xgkick.packet.begin() + from, m_xgkick.packet.begin() + m_xgkick.copiedBytes);
++        putSnapshot(before);
++        tightLoop();
++        std::string diff;
++        diffSnapshot(after, diff);
++        if (std::memcmp(aotScratch.data(), vuData, dataSize) != 0)
++            diff += diff.empty() ? "stores" : " stores";
++        if (m_xgkick.copiedBytes != after.xCopied ||
++            std::memcmp(aotPacket.data(), m_xgkick.packet.data() + from, aotPacket.size()) != 0)
++            diff += diff.empty() ? "packet" : " packet";
++        AotVerifyStats &v = g_aotVerifyStats;
++        ++v.checks;
++        if (!diff.empty())
++        {
++            const uint32_t pc = (m_fastBlock->startPair + first) * 8u;
++            ++v.byPc[pc];
++            if (++v.mismatches <= 32u)
++                std::fprintf(stderr, "[vu1:aot-verify] mismatch: run at 0x%04x (block 0x%04x) pairs %u-%u: %s\n", pc,
++                             m_fastBlock->startPair * 8u, first, m_fastIndex - 1u, diff.c_str());
++        }
++        if ((v.checks & 0xFFFFFu) == 0u)
++            printAotVerifyStats(); // test mode leaves with _Exit, so report as we go
++        return true;
++    };
++
+     while (m_cycle < budgetEnd && !m_stopRequested)
+     {
+         commitReadyPipelines();
+@@ -3128,69 +3185,31 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         if (m_fastBlock && directPath && !m_state.ebit && m_fastIndex + 1u < m_fastBlock->pairCount &&
+             directIds->plan[m_fastBlock->startPair + m_fastIndex].plain)
+         {
+-            // Tight loop (#37): a run of plain pairs, never the block's last one (the delay slot or the cut). The
+-            // generic step below would find no budget/XGKICK leave, no branch, PC jump or program end, and its
+-            // commit after a pair is repeated by the commit before the next one, so only that one is kept.
+-            // PC, cycles and the stats are written once after the run.
+-            const FastBlock &block = *m_fastBlock;
+-            const DirectIds::Plan *plan = directIds->plan.data() + block.startPair;
+-            const uint32_t last = block.pairCount - 1u;
+-            const uint32_t first = m_fastIndex;
+-            uint32_t k = first;
+-            do
++            // A run of plain pairs: the generated code of this block when it has one (#40), else tightLoop().
++            const Vu1AotFn aot = aotPath && directIds->aot.size() == m_cachedPairCount
++                                     ? directIds->aot[m_fastBlock->startPair]
++                                     : nullptr;
++            if (aot)
+             {
+-                const DirectIds::Plan &p = plan[k];
+-                const uint64_t issue = m_fastStart + block.issue[k];
+-                if (m_nextCommitCycle <= issue)
+-                    fastAdvanceTo(issue);
+-                else
+-                    m_cycle = issue;
+-                m_fastIndex = k; // writeFlags() reads the block's elide data by it
+-                if (shadowActive && isFlagReader(p.lower, p.iBit))
+-                {
+-                    shadowCommit();
+-                    compareFlags("reader", m_state.mac, m_state.status, m_state.clip, shadow.mac, shadow.status,
+-                                 shadow.clip);
+-                }
+-                const uint32_t flagMaskBefore = m_flagMask;
+-                const int32_t oldVi = m_state.vi[p.viReg];
+-                if (const FmacMathFn math = kFmacMath[p.upperId])
+-                    directAddSubMul(math, p.upper, p.upperId >= 0x40u);
+-                else
+-                    g_vu1UpperFn[p.upperId](*this, p.upper);
+-                if (p.iBit)
++                const uint32_t first = m_fastIndex;
++                Vu1AotRun aotRun{m_fastBlock->issue.data(), m_fastBlock->startPair, &elision, vuData, dataSize};
++                if (g_aotVerify ? verifyAot(aot, aotRun, first) : aot(*this, aotRun, first))
+                 {
+-                    float immediate = 0.0f;
+-                    std::memcpy(&immediate, &p.lower, sizeof(immediate));
+-                    m_state.i = normalizeOperand(immediate);
++                    if (stats)
++                    {
++                        const uint32_t ran = m_fastIndex - first;
++                        vuStats().aotPairs += ran;
++                        if (!g_aotVerify) // tightLoop() counted them
++                        {
++                            vuStats().fastPairs += ran;
++                            if (vuStats().current)
++                                vuStats().current->fastPairs += ran;
++                        }
++                    }
++                    continue;
+                 }
+-                else
+-                    g_vu1LowerFn[p.lowerId](*this, p.lower, vuData, dataSize);
+-                if (shadowActive)
+-                    mirrorToShadow(flagMaskBefore);
+-                if (p.viReg != 0u)
+-                    m_state.vi[p.viReg] = static_cast<int16_t>(m_state.vi[p.viReg]); // as the VI commit does
+-                m_viBranchBackupValid = false;
+-                if (p.recordVi)
+-                    recordViWriteForBranch(p.viReg, oldVi);
+-                m_state.vf[0][0] = 0.0f;
+-                m_state.vf[0][1] = 0.0f;
+-                m_state.vf[0][2] = 0.0f;
+-                m_state.vf[0][3] = 1.0f;
+-                m_state.vi[0] = 0;
+-                ++k;
+-            } while (k < last && plan[k].plain && !m_stopRequested);
+-            m_state.pc = (block.startPair + k) * 8u; // the block never wraps: its pairs are below codeSize
+-            fastAdvanceTo(m_fastStart + block.issue[k - 1u] + 1u);
+-            m_state.cycles = m_cycle;
+-            m_fastIndex = k;
+-            if (stats)
+-            {
+-                vuStats().fastPairs += k - first;
+-                vuStats().tightPairs += k - first;
+-                if (vuStats().current)
+-                    vuStats().current->fastPairs += k - first;
+             }
++            tightLoop();
+             continue;
+         }
+         if (m_fastBlock)
