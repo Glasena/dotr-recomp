@@ -1,0 +1,56 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp b/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp
+index c6f2c0e..c2204b6 100644
+--- a/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp
+@@ -2,6 +2,7 @@
+ // (gs_parallel_backend.cpp) without its GL interop: the device is headless and Present reads the scanout
+ // back into PresentationFrame::pixels, which the host window and the test-mode dumps already consume.
+ #include "runtime/gs/gs_backend.h"
++#include "runtime/gs/gs_cpu_backend.h"
+ #include "runtime/gs/ps2_gs_memory.h"
+ #include "runtime/ps2_memory.h"
+ #include "gs_interface.hpp"
+@@ -10,6 +11,7 @@
+ #include "thread_id.hpp"
+ #include <algorithm>
+ #include <array>
++#include <cstdlib>
+ #include <cstring>
+ #include <iostream>
+ #include <mutex>
+@@ -148,6 +150,10 @@ namespace
+         uint32_t lastW = 0, lastH = 0;
+         uint64_t lastDisplay1 = 0;
+         Vulkan::BufferHandle readbackBuffer;
++        // PS2X_PGS_CPU_SCANOUT=1 (#51): scan out paraLLEl's VRAM with the CPU backend's presenter, to tell raster
++        // differences from CRTC/merge differences.
++        std::unique_ptr<GSCpuBackend> cpuScanout;
++        std::vector<uint8_t> cpuScanoutVram;
+ 
+         void observeRegister(uint8_t addr, uint64_t value)
+         {
+@@ -259,6 +265,12 @@ namespace
+             if (!gs.init(&vk.device, ParallelGS::GSOptions{}))
+                 throw std::runtime_error("parallel-gs: GS initialization failed; check Vulkan feature diagnostics above");
+             gs.set_signal_interface(this);
++            if (const char *v = std::getenv("PS2X_PGS_CPU_SCANOUT"); v && *v && *v != '0')
++            {
++                cpuScanoutVram.resize(VramSize);
++                cpuScanout = std::make_unique<GSCpuBackend>();
++                cpuScanout->Initialize(cpuScanoutVram.data(), VramSize);
++            }
+         }
+ 
+         ~ParallelBackend() override
+@@ -395,6 +407,11 @@ namespace
+         {
+             Lock lock(mutex);
+             gs.flush();
++            if (cpuScanout)
++            {
++                std::memcpy(cpuScanoutVram.data(), gs.map_vram_read(0, VramSize), VramSize);
++                return cpuScanout->Present(request);
++            }
+             auto &p = gs.get_priv_register_state();
+             p.qwords_lo[0] = request.pmode;
+             // Our HLE SetGsCrt never writes SMODE1 (the CPU backend ignores it); without CMOD/LC paraLLEl-GS

@@ -381,6 +381,12 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
   libgraph NTSC ones (636, 50, MAGH=2560/w-1, DH doubled in frame mode); the CPU path and HLE are untouched. The
   movie now matches the CPU dump scaled 1x2 (PSNR 31-34 dB, PHASH <= 9; the rest is interlace edges).
   `[pgs] scanout WxH ...` logs every scanout size/DISPLAY1 change.
+- Brightness: pgs is the hardware-correct side (#53 for the CPU backend). DotR draws CT16S with DTHE=1; hardware
+  adds DIMX before the 5-bit truncation, expands 16-bit scanout as `x<<3` (no bit replication) and blends both
+  circuits (PMODE 0x7f23, ALP=0x7F flicker filter). The CPU backend does none of the three. TFX/TCC/CLUT agree:
+  pgs VRAM with DTHE forced off, scanned out by the CPU presenter, is byte-identical to the CPU title frame.
+  Checked against PCSX2 (`GSDrawScanline` WriteFrame dither, `Expand16To32`, `GSRenderer::Merge`).
+  `PS2X_PGS_CPU_SCANOUT=1` (patch 0045) scans pgs VRAM out with the CPU presenter, to split raster from CRTC diffs.
 
 ## Next steps (2026-10-22)
 Order is tracked with the `priority: N` labels; #13 is pinned on GitHub.
