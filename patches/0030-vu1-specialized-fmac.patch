@@ -1,0 +1,502 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -18,6 +18,7 @@
+ #include <limits>
+ #include <ps2_log.h>
+ #include <unordered_map>
++#include <utility>
+ #include <xmmintrin.h>
+ 
+ namespace
+@@ -247,6 +248,137 @@ namespace
+                (op >= 0x1Eu && op <= 0x2Eu && op != 0x1Fu && op != 0x2Bu);
+     }
+ 
++    // The math and the fast flag test of one direct FMAC (#38), per op number and VF/ACC form, so the op, its
++    // operand source and the add/sub/product kind are compile-time. Operands are normalized as normalizeOperand(),
++    // with a separate multiply and add, under the caller's rounding mode, exactly like the generic code they
++    // replace. `ok` has a bit per lane whose flags the fast test can derive (see the caller).
++    struct FmacMath
++    {
++        __m128 left, right, product, result;
++        int ok;            // lanes the fast flag test covers
++        int productZero;   // productSum: lanes with a zero operand (exact zero product)
++        bool productSum;
++    };
++    using FmacMathFn = void (*)(VU1State &state, uint32_t word, FmacMath &m);
++
++    template <uint8_t Op, bool ToAcc>
++    void fmacMath(VU1State &state, uint32_t word, FmacMath &m)
++    {
++        constexpr bool qSource = Op == 0x1Cu || Op == 0x20u || Op == 0x24u || Op == 0x21u || Op == 0x25u;
++        constexpr bool iSource = Op == 0x1Eu || Op == 0x22u || Op == 0x26u || Op == 0x23u || Op == 0x27u;
++        constexpr bool broadcast = Op <= 0x0Fu || (Op >= 0x18u && Op <= 0x1Bu);
++        constexpr bool productSum = ToAcc ? isFmacProductSum(0xFFu, Op) : isFmacProductSum(Op, 0xFFu);
++        constexpr bool mul = (Op >= 0x18u && Op <= 0x1Cu) || Op == 0x1Eu || Op == 0x2Au || Op == 0x2Eu;
++        constexpr bool productSub = (Op >= 0x0Cu && Op <= 0x0Fu) || Op == 0x25u || Op == 0x27u || Op == 0x2Du ||
++                                    Op == 0x2Eu;
++        constexpr bool sub = (Op >= 0x04u && Op <= 0x07u) || Op == 0x24u || Op == 0x26u || Op == 0x2Cu;
++
++        __m128 left = vu1NormalizeOperands(_mm_loadu_ps(state.vf[FS(word)]));
++        __m128 right;
++        if constexpr (qSource)
++            right = vu1NormalizeOperands(_mm_set1_ps(state.q));
++        else if constexpr (iSource)
++            right = vu1NormalizeOperands(_mm_set1_ps(state.i));
++        else
++        {
++            const __m128 loaded = vu1NormalizeOperands(_mm_loadu_ps(state.vf[FT(word)]));
++            if constexpr (broadcast)
++                right = _mm_shuffle_ps(loaded, loaded, _MM_SHUFFLE(Op & 3, Op & 3, Op & 3, Op & 3));
++            else if constexpr (Op == 0x2Eu)
++            {
++                // OPMSUB: acc - (vs.yzx * vt.zxy), OPMULA: vs.yzx * vt.zxy; w is forced to 0 below.
++                left = _mm_shuffle_ps(left, left, _MM_SHUFFLE(3, 0, 2, 1));
++                right = _mm_shuffle_ps(loaded, loaded, _MM_SHUFFLE(3, 1, 0, 2));
++            }
++            else
++                right = loaded;
++        }
++
++        __m128 product = _mm_setzero_ps();
++        __m128 result;
++        if constexpr (productSum)
++        {
++            const __m128 acc = vu1NormalizeOperands(_mm_loadu_ps(state.acc));
++            product = _mm_mul_ps(left, right);
++            result = productSub ? _mm_sub_ps(acc, product) : _mm_add_ps(acc, product);
++        }
++        else if constexpr (mul)
++            result = _mm_mul_ps(left, right);
++        else if constexpr (sub)
++            result = _mm_sub_ps(left, right);
++        else
++            result = _mm_add_ps(left, right);
++        if constexpr (Op == 0x2Eu)
++            result = _mm_and_ps(result, _mm_castsi128_ps(_mm_set_epi32(0, -1, -1, -1)));
++
++        // Per lane: the result (and for ACC +/- product, the product, with the cancellation bound on ACC) is
++        // strictly inside (FLT_MIN, FLT_MAX); or an exact zero (see the caller).
++        const __m128i bits = _mm_castps_si128(result);
++        const __m128i magnitudeMask = _mm_set1_epi32(0x7FFFFFFF);
++        const __m128i minNormal = _mm_set1_epi32(0x00800000);
++        const __m128i maxNormal = _mm_set1_epi32(0x7F7FFFFF);
++        const __m128i magnitude = _mm_and_si128(bits, magnitudeMask);
++        const __m128i normal = _mm_and_si128(_mm_cmpgt_epi32(magnitude, minNormal),
++                                             _mm_cmplt_epi32(magnitude, maxNormal));
++        const __m128i zero = _mm_cmpeq_epi32(magnitude, _mm_setzero_si128());
++        __m128i ok;
++        m.productZero = 0;
++        if constexpr (productSum || mul)
++        {
++            const __m128i operandZero = _mm_castps_si128(_mm_or_ps(_mm_cmpeq_ps(left, _mm_setzero_ps()),
++                                                                   _mm_cmpeq_ps(right, _mm_setzero_ps())));
++            if constexpr (productSum)
++            {
++                const __m128i exponent = _mm_srli_epi32(magnitude, 23);
++                const __m128i accBits = _mm_castps_si128(_mm_loadu_ps(state.acc));
++                const __m128i accExponent = _mm_srli_epi32(_mm_and_si128(accBits, magnitudeMask), 23);
++                const __m128i productMagnitude = _mm_and_si128(_mm_castps_si128(product), magnitudeMask);
++                ok = _mm_and_si128(normal, _mm_cmpgt_epi32(exponent, _mm_set1_epi32(2)));
++                ok = _mm_and_si128(ok, _mm_cmplt_epi32(exponent, _mm_set1_epi32(254)));
++                ok = _mm_and_si128(ok, _mm_cmplt_epi32(accExponent, _mm_set1_epi32(254)));
++                ok = _mm_andnot_si128(_mm_cmpgt_epi32(accExponent, _mm_add_epi32(exponent, _mm_set1_epi32(16))), ok);
++                ok = _mm_and_si128(ok, _mm_cmpgt_epi32(productMagnitude, minNormal));
++                ok = _mm_and_si128(ok, _mm_cmplt_epi32(productMagnitude, maxNormal));
++                ok = _mm_or_si128(ok, _mm_and_si128(operandZero, _mm_or_si128(normal, zero)));
++                m.productZero = _mm_movemask_ps(_mm_castsi128_ps(operandZero));
++            }
++            else
++                ok = _mm_or_si128(normal, _mm_and_si128(zero, operandZero));
++        }
++        else
++            ok = _mm_or_si128(normal, zero);
++        m.left = left;
++        m.right = right;
++        m.product = product;
++        m.result = result;
++        m.ok = _mm_movemask_ps(_mm_castsi128_ps(ok));
++        m.productSum = productSum;
++    }
++
++    template <uint16_t Id>
++    constexpr FmacMathFn fmacMathFor()
++    {
++        if constexpr (Id < 0x80u && isDirectFmacId(Id))
++            return &fmacMath<static_cast<uint8_t>(Id >= 0x40u ? Id - 0x40u : Id), (Id >= 0x40u)>;
++        else
++            return nullptr;
++    }
++    template <uint16_t... Ids>
++    constexpr std::array<FmacMathFn, sizeof...(Ids)> makeFmacMathTable(std::integer_sequence<uint16_t, Ids...>)
++    {
++        return {fmacMathFor<Ids>()...};
++    }
++    // By upper handler id; null for every id isDirectFmacId() rejects.
++    constexpr std::array<FmacMathFn, kVu1UpperFnCount> kFmacMath =
++        makeFmacMathTable(std::make_integer_sequence<uint16_t, kVu1UpperFnCount>{});
++
++    // Lane masks for a dest field (x = bit 3 -> lane 0).
++    alignas(16) constexpr int32_t kDestLanes[16][4] = {
++        {0, 0, 0, 0}, {0, 0, 0, -1}, {0, 0, -1, 0}, {0, 0, -1, -1},
++        {0, -1, 0, 0}, {0, -1, 0, -1}, {0, -1, -1, 0}, {0, -1, -1, -1},
++        {-1, 0, 0, 0}, {-1, 0, 0, -1}, {-1, 0, -1, 0}, {-1, 0, -1, -1},
++        {-1, -1, 0, 0}, {-1, -1, 0, -1}, {-1, -1, -1, 0}, {-1, -1, -1, -1}};
++
+     // Lower FSEQ/FSAND/FSOR/FMEQ/FMAND/FMOR (opHi 0x14-0x1B, FSSET 0x15 excluded) read MAC or status.
+     constexpr bool isFlagReader(uint32_t lower, bool iBit)
+     {
+@@ -2701,80 +2833,17 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     };
+ 
+     // ADD/SUB/MUL/MADD/MSUB/OPMSUB into VF and their ACC forms (special field, same numbering; special 0x2E
+-    // is OPMULA), broadcast and Q/I included, on the fast-block path. The interpreter table stays scalar.
+-    auto directAddSubMul = [&](uint32_t word, bool toAcc)
++    // is OPMULA), broadcast and Q/I included, on the fast-block path. The math is the per-op kFmacMath instance;
++    // the interpreter table stays scalar.
++    auto directAddSubMul = [&](FmacMathFn math, uint32_t word, bool toAcc)
+     {
+         m_currentUpperInstruction = word;
+-        const uint8_t op = toAcc ? static_cast<uint8_t>((word & 3u) | ((word >> 4) & 0x7Cu))
+-                                 : static_cast<uint8_t>(word & 0x3Fu);
+-        float vs[4];
+-        for (int c = 0; c < 4; ++c)
+-            vs[c] = normalizeOperand(m_state.vf[FS(word)][c]);
+-        __m128 left = _mm_loadu_ps(vs);
+-
+-        __m128 right;
+-        if (op == 0x1Cu || op == 0x20u || op == 0x24u || op == 0x21u || op == 0x25u)
+-            right = _mm_set1_ps(normalizeOperand(m_state.q));
+-        else if (op == 0x1Eu || op == 0x22u || op == 0x26u || op == 0x23u || op == 0x27u)
+-            right = _mm_set1_ps(normalizeOperand(m_state.i));
+-        else
+-        {
+-            float vt[4];
+-            for (int c = 0; c < 4; ++c)
+-                vt[c] = normalizeOperand(m_state.vf[FT(word)][c]);
+-            const __m128 loaded = _mm_loadu_ps(vt);
+-            if (op <= 0x0Fu || (op >= 0x18u && op <= 0x1Bu))
+-            {
+-                switch (op & 3u)
+-                {
+-                case 0:
+-                    right = _mm_shuffle_ps(loaded, loaded, _MM_SHUFFLE(0, 0, 0, 0));
+-                    break;
+-                case 1:
+-                    right = _mm_shuffle_ps(loaded, loaded, _MM_SHUFFLE(1, 1, 1, 1));
+-                    break;
+-                case 2:
+-                    right = _mm_shuffle_ps(loaded, loaded, _MM_SHUFFLE(2, 2, 2, 2));
+-                    break;
+-                default:
+-                    right = _mm_shuffle_ps(loaded, loaded, _MM_SHUFFLE(3, 3, 3, 3));
+-                    break;
+-                }
+-            }
+-            else if (op == 0x2Eu)
+-            {
+-                // OPMSUB: acc - (vs.yzx * vt.zxy), OPMULA: vs.yzx * vt.zxy; w is forced to 0 below.
+-                left = _mm_shuffle_ps(left, left, _MM_SHUFFLE(3, 0, 2, 1));
+-                right = _mm_shuffle_ps(loaded, loaded, _MM_SHUFFLE(3, 1, 0, 2));
+-            }
+-            else
+-                right = loaded;
+-        }
+-
+-        const bool productSum = toAcc ? isFmacProductSum(0xFFu, op) : isFmacProductSum(op, 0xFFu);
+-        const bool mul = (op >= 0x18u && op <= 0x1Cu) || op == 0x1Eu || op == 0x2Au || op == 0x2Eu;
+-        __m128 product = _mm_setzero_ps();
++        FmacMath m;
++        math(m_state, word, m);
++        const bool productSum = m.productSum;
++        const __m128 product = m.product;
+         float result[4];
+-        if (productSum)
+-        {
+-            float acc[4];
+-            for (int c = 0; c < 4; ++c)
+-                acc[c] = normalizeOperand(m_state.acc[c]);
+-            product = _mm_mul_ps(left, right);
+-            const bool productSub = (op >= 0x0Cu && op <= 0x0Fu) || op == 0x25u || op == 0x27u ||
+-                                    op == 0x2Du || op == 0x2Eu;
+-            _mm_storeu_ps(result, productSub ? _mm_sub_ps(_mm_loadu_ps(acc), product)
+-                                             : _mm_add_ps(_mm_loadu_ps(acc), product));
+-        }
+-        else
+-        {
+-            const bool sub = (op >= 0x04u && op <= 0x07u) || op == 0x24u || op == 0x26u || op == 0x2Cu;
+-            _mm_storeu_ps(result, mul   ? _mm_mul_ps(left, right)
+-                                  : sub ? _mm_sub_ps(left, right)
+-                                        : _mm_add_ps(left, right));
+-        }
+-        if (op == 0x2Eu)
+-            result[3] = 0.0f;
++        _mm_storeu_ps(result, m.result);
+ 
+         const uint8_t dest = DEST(word);
+         if (dest == 0u)
+@@ -2793,44 +2862,18 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         //   the float one (+/-0, or ACC when that is strictly normal) and the product reports Z and its sign.
+         // Anything else (underflow, overflow, cancellation) takes the exact path.
+         const int active = ((dest >> 3) & 1) | ((dest >> 1) & 2) | ((dest << 1) & 4) | ((dest << 3) & 8);
+-        const __m128i bits = _mm_castps_si128(_mm_loadu_ps(result));
+-        const __m128i magnitudeMask = _mm_set1_epi32(0x7FFFFFFF);
+-        const __m128i minNormal = _mm_set1_epi32(0x00800000);
+-        const __m128i maxNormal = _mm_set1_epi32(0x7F7FFFFF);
+-        const __m128i magnitude = _mm_and_si128(bits, magnitudeMask);
+-        const __m128i normal = _mm_and_si128(_mm_cmpgt_epi32(magnitude, minNormal),
+-                                             _mm_cmplt_epi32(magnitude, maxNormal));
+-        const __m128i zero = _mm_cmpeq_epi32(magnitude, _mm_setzero_si128());
+-        const __m128i operandZero = _mm_castps_si128(_mm_or_ps(_mm_cmpeq_ps(left, _mm_setzero_ps()),
+-                                                               _mm_cmpeq_ps(right, _mm_setzero_ps())));
+-        __m128i ok;
+-        int productZero = 0;
+-        if (productSum)
+-        {
+-            const __m128i exponent = _mm_srli_epi32(magnitude, 23);
+-            const __m128i accBits = _mm_castps_si128(_mm_loadu_ps(m_state.acc));
+-            const __m128i accExponent = _mm_srli_epi32(_mm_and_si128(accBits, magnitudeMask), 23);
+-            const __m128i productMagnitude = _mm_and_si128(_mm_castps_si128(product), magnitudeMask);
+-            ok = _mm_and_si128(normal, _mm_cmpgt_epi32(exponent, _mm_set1_epi32(2)));
+-            ok = _mm_and_si128(ok, _mm_cmplt_epi32(exponent, _mm_set1_epi32(254)));
+-            ok = _mm_and_si128(ok, _mm_cmplt_epi32(accExponent, _mm_set1_epi32(254)));
+-            ok = _mm_andnot_si128(_mm_cmpgt_epi32(accExponent, _mm_add_epi32(exponent, _mm_set1_epi32(16))), ok);
+-            ok = _mm_and_si128(ok, _mm_cmpgt_epi32(productMagnitude, minNormal));
+-            ok = _mm_and_si128(ok, _mm_cmplt_epi32(productMagnitude, maxNormal));
+-            ok = _mm_or_si128(ok, _mm_and_si128(operandZero, _mm_or_si128(normal, zero)));
+-            productZero = _mm_movemask_ps(_mm_castsi128_ps(operandZero)) & active;
+-        }
+-        else
+-            ok = _mm_or_si128(normal, mul ? _mm_and_si128(zero, operandZero) : zero);
++        const __m128i bits = _mm_castps_si128(m.result);
++        const int productZero = m.productZero & active;
+         uint8_t laneFlags[4];
+         uint32_t extraSticky = 0u;
+         float normalized[4];
+         float *flagged = result; // the clamped result the flags describe
+-        if ((_mm_movemask_ps(_mm_castsi128_ps(ok)) & active) == active)
++        if ((m.ok & active) == active)
+         {
+             ++g_flagStats.fast;
+             const int signs = _mm_movemask_ps(_mm_castsi128_ps(bits));
+-            const int zeros = _mm_movemask_ps(_mm_castsi128_ps(zero));
++            const int zeros = _mm_movemask_ps(
++                _mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF)), _mm_setzero_si128())));
+             for (int c = 0; c < 4; ++c)
+                 laneFlags[c] = static_cast<uint8_t>(((zeros >> c) & 1) | (((signs >> c) & 1) << 1));
+             if (productSum)
+@@ -2857,7 +2900,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             return;
+         }
+         writeFlags(laneFlags, dest, extraSticky, false);
+-        applyDest(dst, flagged, dest);
++        const __m128 lanes = _mm_load_ps(reinterpret_cast<const float *>(kDestLanes[dest]));
++        _mm_storeu_ps(dst, _mm_or_ps(_mm_and_ps(lanes, _mm_loadu_ps(flagged)), _mm_andnot_ps(lanes, _mm_loadu_ps(dst))));
+     };
+ 
+     // Executes one pair's upper and lower instructions; register results land in m_state right away.
+@@ -2873,8 +2917,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             if (directOk)
+             {
+                 const uint16_t id = directIds->upper[directPair];
+-                if (isDirectFmacId(id))
+-                    directAddSubMul(decoded.upper, id >= 0x40u);
++                if (const FmacMathFn math = kFmacMath[id])
++                    directAddSubMul(math, decoded.upper, id >= 0x40u);
+                 else
+                     g_vu1UpperFn[id](*this, decoded.upper);
+             }
+@@ -3024,8 +3068,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                 }
+                 const uint32_t flagMaskBefore = m_flagMask;
+                 const int32_t oldVi = m_state.vi[p.viReg];
+-                if (isDirectFmacId(p.upperId))
+-                    directAddSubMul(p.upper, p.upperId >= 0x40u);
++                if (const FmacMathFn math = kFmacMath[p.upperId])
++                    directAddSubMul(math, p.upper, p.upperId >= 0x40u);
+                 else
+                     g_vu1UpperFn[p.upperId](*this, p.upper);
+                 if (p.iBit)
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h b/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
+@@ -2,6 +2,7 @@
+ #define PS2_VU1_DETAIL_H
+ 
+ #include <cstdint>
++#include <emmintrin.h>
+ 
+ // Instruction field extraction helpers
+ static inline uint8_t DEST(uint32_t i) { return (uint8_t)((i >> 21) & 0xF); }
+@@ -26,6 +27,21 @@ static inline int16_t IMM15(uint32_t i)
+     return (int16_t)(int32_t)((int32_t)(raw << 17) >> 17);
+ }
+ 
++// VU1Interpreter::normalizeOperand() on four lanes: exponent 0 -> signed zero, exponent 255 -> signed FLT_MAX.
++static inline __m128 vu1NormalizeOperands(__m128 value)
++{
++    const __m128i bits = _mm_castps_si128(value);
++    const __m128i exponentMask = _mm_set1_epi32(0x7F800000);
++    const __m128i exponent = _mm_and_si128(bits, exponentMask);
++    const __m128i sign = _mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u)));
++    const __m128i zero = _mm_cmpeq_epi32(exponent, _mm_setzero_si128());
++    const __m128i huge = _mm_cmpeq_epi32(exponent, exponentMask);
++    __m128i out = _mm_or_si128(_mm_andnot_si128(zero, bits), _mm_and_si128(zero, sign));
++    out = _mm_or_si128(_mm_andnot_si128(huge, out),
++                       _mm_and_si128(huge, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF))));
++    return _mm_castsi128_ps(out);
++}
++
+ // Direct handlers for the fast-block path. Ids are stored beside the decoded cache (see ps2_vu1_core.cpp);
+ // execUpper/execLower keep their own switches for the interpreter and PS2X_VU_NO_DIRECT.
+ #ifndef PS2_VU1_H
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+@@ -5,6 +5,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <limits>
++#include <string_view>
+ 
+ namespace
+ {
+@@ -36,7 +37,19 @@ namespace
+         float result[4]{};
+     };
+ 
+-    void (*g_loadUpper)(VU1Interpreter &, uint32_t, UOp &) = nullptr;
++    // Operands g_loadUpper normalizes; a handler asks only for the ones it reads.
++    constexpr unsigned kNeedVs = 1u, kNeedVt = 2u, kNeedAcc = 4u, kNeedQ = 8u, kNeedI = 16u;
++    // The U_BC/U_VV handlers derive their needs from the expression text (U_BC also reads o.vt for bc).
++    constexpr unsigned upperNeeds(std::string_view expr)
++    {
++        return (expr.find("o.vs") != std::string_view::npos ? kNeedVs : 0u) |
++               (expr.find("o.vt") != std::string_view::npos ? kNeedVt : 0u) |
++               (expr.find("o.acc") != std::string_view::npos ? kNeedAcc : 0u) |
++               (expr.find("o.q") != std::string_view::npos ? kNeedQ : 0u) |
++               (expr.find("o.i") != std::string_view::npos ? kNeedI : 0u);
++    }
++
++    void (*g_loadUpper)(VU1Interpreter &, uint32_t, UOp &, unsigned need) = nullptr;
+     bool g_vu1UpperReady = false;
+ 
+     uint32_t upperSpecialSample(uint32_t special)
+@@ -51,7 +64,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
+ {
+     if (!g_vu1UpperReady)
+     {
+-        g_loadUpper = [](VU1Interpreter &self, uint32_t word, UOp &o)
++        g_loadUpper = [](VU1Interpreter &self, uint32_t word, UOp &o, unsigned need)
+         {
+             self.m_currentUpperInstruction = word;
+             o.dest = DEST(word);
+@@ -59,14 +72,16 @@ void VU1Interpreter::execUpper(uint32_t instr)
+             o.fs = FS(word);
+             o.fd = FD(word);
+             o.vd = self.m_state.vf[o.fd];
+-            for (uint32_t component = 0; component < 4u; ++component)
+-            {
+-                o.vs[component] = self.normalizeOperand(self.m_state.vf[o.fs][component]);
+-                o.vt[component] = self.normalizeOperand(self.m_state.vf[o.ft][component]);
+-                o.acc[component] = self.normalizeOperand(self.m_state.acc[component]);
+-            }
+-            o.q = self.normalizeOperand(self.m_state.q);
+-            o.i = self.normalizeOperand(self.m_state.i);
++            if (need & kNeedVs)
++                _mm_storeu_ps(o.vs, vu1NormalizeOperands(_mm_loadu_ps(self.m_state.vf[o.fs])));
++            if (need & kNeedVt)
++                _mm_storeu_ps(o.vt, vu1NormalizeOperands(_mm_loadu_ps(self.m_state.vf[o.ft])));
++            if (need & kNeedAcc)
++                _mm_storeu_ps(o.acc, vu1NormalizeOperands(_mm_loadu_ps(self.m_state.acc)));
++            if (need & kNeedQ)
++                o.q = self.normalizeOperand(self.m_state.q);
++            if (need & kNeedI)
++                o.i = self.normalizeOperand(self.m_state.i);
+         };
+ 
+         bool seen[kVu1UpperFnCount]{};
+@@ -96,7 +111,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
+         const Vu1UpperFn reserved = [](VU1Interpreter &self, uint32_t word)
+         {
+             UOp o;
+-            g_loadUpper(self, word, o);
++            g_loadUpper(self, word, o, 0u);
+             self.reportReservedInstruction(true, word);
+         };
+         for (uint32_t i = 0; i < kVu1UpperFnCount; ++i)
+@@ -113,7 +128,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
+     [](VU1Interpreter &self, uint32_t word)                                           \
+     {                                                                                 \
+         UOp o;                                                                        \
+-        g_loadUpper(self, word, o);                                                   \
++        constexpr unsigned need = kNeedVt | upperNeeds(#expr);                        \
++        g_loadUpper(self, word, o, need);                                             \
+         const float bc = self.broadcast(o.vt, word & 3u);                             \
+         for (int c = 0; c < 4; ++c)                                                   \
+             o.result[c] = (expr);                                                     \
+@@ -123,7 +139,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
+     [](VU1Interpreter &self, uint32_t word)                                           \
+     {                                                                                 \
+         UOp o;                                                                        \
+-        g_loadUpper(self, word, o);                                                   \
++        constexpr unsigned need = upperNeeds(#expr);                                  \
++        g_loadUpper(self, word, o, need);                                             \
+         for (int c = 0; c < 4; ++c)                                                   \
+             o.result[c] = (expr);                                                     \
+         applyCall;                                                                    \
+@@ -158,7 +175,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
+         reg(0x2E, [](VU1Interpreter &self, uint32_t word)
+             {
+                 UOp o;
+-                g_loadUpper(self, word, o);
++                g_loadUpper(self, word, o, kNeedVs | kNeedVt | kNeedAcc);
+                 o.result[0] = o.acc[0] - o.vs[1] * o.vt[2];
+                 o.result[1] = o.acc[1] - o.vs[2] * o.vt[0];
+                 o.result[2] = o.acc[2] - o.vs[0] * o.vt[1];
+@@ -176,7 +193,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
+     [](VU1Interpreter &self, uint32_t word)                                           \
+     {                                                                                 \
+         UOp o;                                                                        \
+-        g_loadUpper(self, word, o);                                                   \
++        g_loadUpper(self, word, o, 0u);                                               \
+         float *vtDest = self.m_state.vf[o.ft];                                        \
+         for (int c = 0; c < 4; ++c)                                                   \
+         {                                                                             \
+@@ -190,7 +207,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
+     [](VU1Interpreter &self, uint32_t word)                                           \
+     {                                                                                 \
+         UOp o;                                                                        \
+-        g_loadUpper(self, word, o);                                                   \
++        g_loadUpper(self, word, o, kNeedVs);                                          \
+         float *vtDest = self.m_state.vf[o.ft];                                        \
+         for (int c = 0; c < 4; ++c)                                                   \
+         {                                                                             \
+@@ -213,7 +230,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
+         regS(0x1D, [](VU1Interpreter &self, uint32_t word)
+              {
+                  UOp o;
+-                 g_loadUpper(self, word, o);
++                 g_loadUpper(self, word, o, kNeedVs);
+                  float *vtDest = self.m_state.vf[o.ft];
+                  for (int c = 0; c < 4; ++c)
+                      o.result[c] = std::fabs(o.vs[c]);
+@@ -223,7 +240,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
+         regS(0x1F, [](VU1Interpreter &self, uint32_t word)
+              {
+                  UOp o;
+-                 g_loadUpper(self, word, o);
++                 g_loadUpper(self, word, o, 0u);
+                  uint32_t wBits = 0u;
+                  std::memcpy(&wBits, &self.m_state.vf[o.ft][3], sizeof(wBits));
+                  const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
+@@ -267,7 +284,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
+         regS(0x2E, [](VU1Interpreter &self, uint32_t word)
+              {
+                  UOp o;
+-                 g_loadUpper(self, word, o);
++                 g_loadUpper(self, word, o, kNeedVs | kNeedVt);
+                  o.result[0] = o.vs[1] * o.vt[2];
+                  o.result[1] = o.vs[2] * o.vt[0];
+                  o.result[2] = o.vs[0] * o.vt[1];

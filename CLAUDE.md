@@ -165,6 +165,12 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   111.1G -> 96.0G instructions, cycles -9.6%; wall 15.1 -> 13.9 s in the same (busy) session, ~+8-10%. Dumps and
   `PS2X_VU_FLAG_CHECK` (0 mismatches) unchanged. Left in VU1: FMAC math (`directAddSubMul` ~19% of the game thread),
   `g_loadUpper` normalizing every operand for non-FMAC uppers (~6%), flag writes (~5%).
+- Patch 0030 (2026-10-22, #38): FMAC math as `fmacMath<op, toAcc>` instances (`kFmacMath` by handler id: op,
+  source and kind compile-time, SSE operand normalize, blended dest write); `g_loadUpper` normalizes only the operands
+  a handler reads (needs derived from the expression text, forced `constexpr`: a runtime string scan cost 1%).
+  Game thread 1900->2300, interleaved: 96.0G -> 86.7G instructions (-9.7%), cycles ~41.4G -> ~38.6G (-7%), wall
+  ~14.2 -> ~13.9 s (noise ±1 s). Dumps/flag check unchanged. Now: `run` with the inlined FMAC tail ~23%,
+  `fmacMath` ~8%, flag queue lambda ~5%, other upper handlers ~6%, `g_loadUpper` ~3%, IOP ~14%.
 - Patch 0027 (2026-10-22, #35): `perf --call-graph dwarf` found the map/hash share was `IopKernel::beginNextReady`/
   `nextWakeCycle` walking the thread `std::map` on every idle IOP step (~7.5%) and the GIF_STAT lookup in
   `advanceEeTimers` (~2.1%). Kernel caches "nothing ready until cycle W" behind a version bumped by every public
@@ -298,6 +304,7 @@ Order is tracked with the `priority: N` labels; #13 is pinned on GitHub.
    dead-write elision) took it to ~25.6, patch 0027 (#35, IOP idle cache) to ~27.3. What is left outside VU1 is
    real IOP instruction work (~9%, incl. `servicePendingDmaInterrupts` per IOP instruction ~1.8%). Profile the game
    thread again before the next VU1 step. #36 (stats) and #37 (tight pair loop, patch 0029) are in; next per the
-   #13 plan is step 3, SSE FMAC handlers templated on dest/broadcast (also lazy operand loads in `g_loadUpper`).
+   #13 plan was step 3, SSE FMAC handlers + lazy operand loads (#38, patch 0030, in); next is steps 4-6 (AOT/
+   capture), or flag writes (`writeFlags`/`updateFmacFlags`, ~7%) first.
 2. Then #10 (box glyphs), #14 (display env), #16, #17, #3-#5. Open an issue per new blocker.
 3. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).
