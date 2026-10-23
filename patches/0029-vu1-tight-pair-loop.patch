@@ -1,0 +1,144 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -47,6 +47,18 @@ namespace
+         // Per block start pair, per block pair: 0, or the ready offset of the next FMAC flag write when this
+         // pair's MAC/status write is never read before it (see buildFastBlock). Empty: nothing to elide.
+         std::vector<std::vector<uint32_t>> elide;
++        // Per pair, for the fast-block tight loop (#37). A pair is plain when it needs none of the per-pair work
++        // of the generic block step: no branch, XGKICK, E/D/T bit or upper VF shadow (see run()).
++        struct Plan
++        {
++            uint32_t upper = 0, lower = 0;
++            uint16_t upperId = 0, lowerId = 0;
++            uint8_t viReg = 0;     // VI register the lower op writes, or 0
++            bool plain = false;
++            bool iBit = false;
++            bool recordVi = false; // viReg != 0 and the write delays the next branch's read
++        };
++        std::vector<Plan> plan;
+     };
+     std::unordered_map<const VU1Interpreter *, DirectIds> g_directIds;
+ 
+@@ -88,7 +100,7 @@ namespace
+     struct VuStats
+     {
+         uint64_t imageHash = 0;
+-        uint64_t fastPairs = 0, interpPairs = 0, blocks = 0, blockBuilds = 0, runs = 0;
++        uint64_t fastPairs = 0, tightPairs = 0, interpPairs = 0, blocks = 0, blockBuilds = 0, runs = 0;
+         uint64_t refusals[RefusalCount]{};
+         std::unordered_map<uint32_t, std::array<uint64_t, RefusalCount>> refusalsByPc;
+         std::unordered_map<uint64_t, VuImageStats> images;
+@@ -124,10 +136,10 @@ namespace
+         s.lastInterp = s.interpPairs;
+         std::fprintf(stderr,
+                      "[vu-stats:%s] last interval: fast %llu interp %llu (fast %.1f%%) | total: fast %llu interp %llu "
+-                     "(fast %.1f%%) runs %llu blocks %llu (%.1f/run, %.1f pairs/block) builds %llu\n",
++                     "(fast %.1f%%, tight loop %.1f%%) runs %llu blocks %llu (%.1f/run, %.1f pairs/block) builds %llu\n",
+                      tag, (unsigned long long)dFast, (unsigned long long)dInterp, pct(dFast, dFast + dInterp),
+                      (unsigned long long)s.fastPairs, (unsigned long long)s.interpPairs, pct(s.fastPairs, total),
+-                     (unsigned long long)s.runs, (unsigned long long)s.blocks,
++                     pct(s.tightPairs, total), (unsigned long long)s.runs, (unsigned long long)s.blocks,
+                      s.runs ? double(s.blocks) / s.runs : 0.0, s.blocks ? double(s.fastPairs) / s.blocks : 0.0,
+                      (unsigned long long)s.blockBuilds);
+         std::fprintf(stderr, "[vu-stats:%s] interp pairs by reason:", tag);
+@@ -2036,6 +2048,24 @@ void VU1Interpreter::prepareCodeCache(const uint8_t *vuCode, uint32_t codeSize,
+             ids.upper[i] = vu1UpperHandlerId(decoded.upper);
+             ids.lower[i] = decoded.iBit ? kVu1LowerNop : vu1LowerHandlerId(decoded.lower);
+         }
++        ids.plan.resize(pairCount);
++        for (uint32_t i = 0; i < pairCount; ++i)
++        {
++            const DecodedInstructionPair &decoded = m_decodedCodeCache[i];
++            DirectIds::Plan &plan = ids.plan[i];
++            const uint32_t viWriteBits = decoded.lowerUsage.viWrite & 0xFFFEu;
++            plan.upper = decoded.upper;
++            plan.lower = decoded.lower;
++            plan.upperId = ids.upper[i];
++            plan.lowerId = ids.lower[i];
++            plan.viReg = viWriteBits != 0u ? static_cast<uint8_t>(std::countr_zero(viWriteBits)) : 0u;
++            plan.iBit = decoded.iBit;
++            plan.recordVi = plan.viReg != 0u && decoded.lowerUsage.delaysNextBranchRead;
++            plan.plain = !decoded.upperUsage.reserved && !decoded.lowerUsage.reserved &&
++                         decoded.lowerUsage.pipeline != PipelineBranch &&
++                         decoded.lowerUsage.pipeline != PipelineXgkick && !decoded.eBit && !decoded.dBit &&
++                         !decoded.tBit && decoded.upperVfShadowReg == 0u;
++        }
+     }
+ }
+ 
+@@ -2965,6 +2995,74 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                     ++vuStats().current->blocks;
+             }
+         }
++        if (m_fastBlock && directPath && !m_state.ebit && m_fastIndex + 1u < m_fastBlock->pairCount &&
++            directIds->plan[m_fastBlock->startPair + m_fastIndex].plain)
++        {
++            // Tight loop (#37): a run of plain pairs, never the block's last one (the delay slot or the cut). The
++            // generic step below would find no budget/XGKICK leave, no branch, PC jump or program end, and its
++            // commit after a pair is repeated by the commit before the next one, so only that one is kept.
++            // PC, cycles and the stats are written once after the run.
++            const FastBlock &block = *m_fastBlock;
++            const DirectIds::Plan *plan = directIds->plan.data() + block.startPair;
++            const uint32_t last = block.pairCount - 1u;
++            const uint32_t first = m_fastIndex;
++            uint32_t k = first;
++            do
++            {
++                const DirectIds::Plan &p = plan[k];
++                const uint64_t issue = m_fastStart + block.issue[k];
++                if (m_nextCommitCycle <= issue)
++                    fastAdvanceTo(issue);
++                else
++                    m_cycle = issue;
++                m_fastIndex = k; // writeFlags() reads the block's elide data by it
++                if (shadowActive && isFlagReader(p.lower, p.iBit))
++                {
++                    shadowCommit();
++                    compareFlags("reader", m_state.mac, m_state.status, m_state.clip, shadow.mac, shadow.status,
++                                 shadow.clip);
++                }
++                const uint32_t flagMaskBefore = m_flagMask;
++                const int32_t oldVi = m_state.vi[p.viReg];
++                if (isDirectFmacId(p.upperId))
++                    directAddSubMul(p.upper, p.upperId >= 0x40u);
++                else
++                    g_vu1UpperFn[p.upperId](*this, p.upper);
++                if (p.iBit)
++                {
++                    float immediate = 0.0f;
++                    std::memcpy(&immediate, &p.lower, sizeof(immediate));
++                    m_state.i = normalizeOperand(immediate);
++                }
++                else
++                    g_vu1LowerFn[p.lowerId](*this, p.lower, vuData, dataSize);
++                if (shadowActive)
++                    mirrorToShadow(flagMaskBefore);
++                if (p.viReg != 0u)
++                    m_state.vi[p.viReg] = static_cast<int16_t>(m_state.vi[p.viReg]); // as the VI commit does
++                m_viBranchBackupValid = false;
++                if (p.recordVi)
++                    recordViWriteForBranch(p.viReg, oldVi);
++                m_state.vf[0][0] = 0.0f;
++                m_state.vf[0][1] = 0.0f;
++                m_state.vf[0][2] = 0.0f;
++                m_state.vf[0][3] = 1.0f;
++                m_state.vi[0] = 0;
++                ++k;
++            } while (k < last && plan[k].plain && !m_stopRequested);
++            m_state.pc = (block.startPair + k) * 8u; // the block never wraps: its pairs are below codeSize
++            fastAdvanceTo(m_fastStart + block.issue[k - 1u] + 1u);
++            m_state.cycles = m_cycle;
++            m_fastIndex = k;
++            if (stats)
++            {
++                vuStats().fastPairs += k - first;
++                vuStats().tightPairs += k - first;
++                if (vuStats().current)
++                    vuStats().current->fastPairs += k - first;
++            }
++            continue;
++        }
+         if (m_fastBlock)
+         {
+             // Block mode: the issue cycle comes from the block's static timing, no hazard scan or write queues.

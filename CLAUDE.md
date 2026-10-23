@@ -156,6 +156,12 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   mode's `_Exit` skips the atexit summary). Map to VBlank 2300: 99.75% of pairs on fast blocks, the rest liveIn
   stalls (96%) and XGKICK busy (4%); one 16 KB image loaded once, every MSCAL at pc 0 (internal dispatcher), 143
   distinct blocks / 1283 pairs, ~14 pairs per block. A capture set covers the map easily (#13 step 1).
+- Patch 0029 (2026-10-22, #37): fast-block tight loop. Per pair, a plan beside the handler ids (words, ids, VI
+  dest, plain bit); runs of plain pairs (no branch/XGKICK/E-D-T bit/VF shadow, not the block's last pair) skip the
+  generic step and write PC/cycles once. 83% of map pairs (`tight loop` in `PS2X_VU_STATS`). Game thread 1900->2300:
+  111.1G -> 96.0G instructions, cycles -9.6%; wall 15.1 -> 13.9 s in the same (busy) session, ~+8-10%. Dumps and
+  `PS2X_VU_FLAG_CHECK` (0 mismatches) unchanged. Left in VU1: FMAC math (`directAddSubMul` ~19% of the game thread),
+  `g_loadUpper` normalizing every operand for non-FMAC uppers (~6%), flag writes (~5%).
 - Patch 0027 (2026-10-22, #35): `perf --call-graph dwarf` found the map/hash share was `IopKernel::beginNextReady`/
   `nextWakeCycle` walking the thread `std::map` on every idle IOP step (~7.5%) and the GIF_STAT lookup in
   `advanceEeTimers` (~2.1%). Kernel caches "nothing ready until cycle W" behind a version bumped by every public
@@ -288,6 +294,7 @@ Order is tracked with the `priority: N` labels; #13 is pinned on GitHub.
    the game thread now waits only at present (~1.3 s per 5 s). Patch 0026 (#34, FMAC flag classification and
    dead-write elision) took it to ~25.6, patch 0027 (#35, IOP idle cache) to ~27.3. What is left outside VU1 is
    real IOP instruction work (~9%, incl. `servicePendingDmaInterrupts` per IOP instruction ~1.8%). Profile the game
-   thread again before the next VU1 step.
+   thread again before the next VU1 step. #36 (stats) and #37 (tight pair loop, patch 0029) are in; next per the
+   #13 plan is step 3, SSE FMAC handlers templated on dest/broadcast (also lazy operand loads in `g_loadUpper`).
 2. Then #10 (box glyphs), #14 (display env), #16, #17, #3-#5. Open an issue per new blocker.
 3. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).
