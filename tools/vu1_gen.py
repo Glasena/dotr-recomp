@@ -13,10 +13,16 @@ VI plans, shadow registers and pair kinds as constants, and a table keyed by (im
 a block only when its words, per-pair plans (DirectIds::Plan) and generic-step facts equal what is written here.
 Build it in with cmake -DPS2X_VU1_AOT_DIR=OUT_DIR.
 
-usage: vu1_gen.py [CAPTURE_DIR] [--emit OUT_DIR]   (default ../dotr/vu1)
+Every run compares the capture with config/vu1_manifest.txt (#43; image hash, block pc, pairs and content hash per
+line, no game bytes) and warns about manifest blocks the capture lacks or whose pairs/content differ; --check makes
+that exit 1. --write-manifest rewrites the manifest from the capture.
+
+usage: vu1_gen.py [CAPTURE_DIR] [--emit OUT_DIR] [--check | --write-manifest]   (default ../dotr/vu1)
        vu1_gen.py --self-test"""
 import collections, os, struct, sys
 
+MANIFEST = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'config',
+                                        'vu1_manifest.txt'))
 MAX_BLOCK_PAIRS = 256  # VU1Interpreter::kMaxFastBlockPairs
 
 UPPER = {}
@@ -296,6 +302,36 @@ def stats(h, image, blocks, interp):
     return len(blocks), total
 
 
+def manifest_rows(captures):
+    """(image hash, pc, pairs, content hash) per captured block; captures as yielded by load()."""
+    rows = []
+    for h, image, blocks, _ in captures:
+        for pc in sorted(blocks):
+            n = len(split_block(image, pc // 8))
+            rows.append((h, pc, n, fnv1a(image[pc:pc + 8 * n], pc // 8)))
+    return rows
+
+
+def manifest_lines(rows):
+    return [f'{h} 0x{pc:04x} {n} {key:016x}' for h, pc, n, key in rows]
+
+
+def manifest_problems(manifest, rows):
+    """Manifest lines (comments allowed) the capture rows lack or contradict."""
+    have = {(h, pc): (n, key) for h, pc, n, key in rows}
+    problems = []
+    for line in manifest:
+        if not line.strip() or line.startswith('#'):
+            continue
+        h, pc, n, key = line.split()
+        got = have.get((h, int(pc, 16)))
+        if got is None:
+            problems.append(f'{h} block {pc}: in the manifest, not in the capture')
+        elif got != (int(n), int(key, 16)):
+            problems.append(f'{h} block {pc}: manifest {n} pairs {key}, capture {got[0]} pairs {got[1]:016x}')
+    return problems
+
+
 def self_test():
     nop_upper, ebit = 0x000002FF, 0x40000000
     b_op = 0x20 << 25
@@ -318,6 +354,13 @@ def self_test():
         'A::pair', 'if (A::stopped(v)) return A::stop(v, r, 1);', 'A::sync(v, r, 1);', 'if ((st = A::after(v, r, A::step',
         'if (A::stopped(v)) return kAotStop;', 'if ((st = A::after(v, r, A::step', 'if (A::stopped(v)) return kAotStop;',
         'return A::after(v, r, A::step'], body
+    rows = manifest_rows([('00', image, {0: 4, 8: 3}, None)])
+    lines = manifest_lines(rows)
+    assert [l.split()[:3] for l in lines] == [['00', '0x0000', '4'], ['00', '0x0008', '3']]
+    assert manifest_problems(['# comment', ''] + lines, rows) == []
+    assert manifest_problems(lines, rows[1:]) == ['00 block 0x0000: in the manifest, not in the capture']
+    bad = manifest_rows([('00', image[:8] + struct.pack('<I', iaddi + 1) + image[12:], {8: 3}, None)])
+    assert manifest_problems(lines, rows[:1] + bad)[0].startswith('00 block 0x0008: manifest 3 pairs')
     print('self-test ok')
 
 
@@ -327,6 +370,8 @@ if __name__ == '__main__':
         sys.exit()
     args = sys.argv[1:]
     out = None
+    check, write = '--check' in args, '--write-manifest' in args
+    args = [a for a in args if a not in ('--check', '--write-manifest')]
     if '--emit' in args:
         i = args.index('--emit')
         out = args[i + 1]
@@ -337,5 +382,19 @@ if __name__ == '__main__':
         b, p = stats(*item)
         n_blocks, n_pairs = n_blocks + b, n_pairs + p
     print(f'total: {n_blocks} blocks, {n_pairs} pairs')
+    rows = manifest_rows(load(capture))
+    if write:
+        open(MANIFEST, 'w').write('\n'.join([
+            '# VU1 fast blocks of a PS2X_VU1_CAPTURE run, written by tools/vu1_gen.py --write-manifest (#43). No game',
+            '# bytes: image fnv1a, block start pc, pairs, fnv1a of the block\'s words seeded with its start pair index.']
+            + manifest_lines(rows)) + '\n')
+        print(f'wrote {MANIFEST}: {len(rows)} blocks')
+    problems = manifest_problems(open(MANIFEST).read().splitlines(), rows) if os.path.exists(MANIFEST) else []
+    for p in problems:
+        print('warning: ' + p, file=sys.stderr)
+    if problems:
+        print(f'warning: capture differs from {MANIFEST} in {len(problems)} blocks', file=sys.stderr)
     if out:
         emit(capture, out)
+    if check and problems:
+        sys.exit(1)
