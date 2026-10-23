@@ -152,6 +152,10 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   VBlank ~1800: ~14.1 VBlanks/s (5 s samples 12.6–15.0; 1900–2300 ~14.5) vs ~13.4. Frames 1900/2100/2300
   byte-identical to `test_before`. Tests 444/445 (same pre-existing GS callback failure). Next slice: FMAC
   flag updates on the fast-block path.
+- Patch 0028 (2026-10-22, #36): `PS2X_VU_STATS=1` prints VU1 coverage every 5 s (`[vu-stats:*]` on stderr; test
+  mode's `_Exit` skips the atexit summary). Map to VBlank 2300: 99.75% of pairs on fast blocks, the rest liveIn
+  stalls (96%) and XGKICK busy (4%); one 16 KB image loaded once, every MSCAL at pc 0 (internal dispatcher), 143
+  distinct blocks / 1283 pairs, ~14 pairs per block. A capture set covers the map easily (#13 step 1).
 - Patch 0027 (2026-10-22, #35): `perf --call-graph dwarf` found the map/hash share was `IopKernel::beginNextReady`/
   `nextWakeCycle` walking the thread `std::map` on every idle IOP step (~7.5%) and the GIF_STAT lookup in
   `advanceEeTimers` (~2.1%). Kernel caches "nothing ready until cycle W" behind a version bumped by every public

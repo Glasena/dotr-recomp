@@ -1,0 +1,371 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -5,7 +5,9 @@
+ #include "runtime/ps2_test_mode.h"
+ #include "ps2_vu1_detail.h"
+ 
++#include <array>
+ #include <bit>
++#include <chrono>
+ #include <algorithm>
+ #include <cfenv>
+ #include <cmath>
+@@ -48,6 +50,182 @@ namespace
+     };
+     std::unordered_map<const VU1Interpreter *, DirectIds> g_directIds;
+ 
++    // PS2X_VU_STATS=1 (#36): VU1 coverage counters. Off: one predictable branch on a static per hook.
++    // Only VU1 is counted. The game thread is the only caller, so the counters are plain.
++    const bool g_vuStats = std::getenv("PS2X_VU_STATS") != nullptr;
++
++    enum VuRefusal : uint8_t
++    {
++        RefuseDisabled,
++        RefuseState,  // no code cache or misaligned pc
++        RefuseBranch, // inside a branch or E-bit delay slot
++        RefuseStores, // interpreter stores still in flight
++        RefuseRange,
++        RefuseEmpty, // first pair cannot start a block (reserved op)
++        RefuseBudget,
++        RefuseLiveIn,
++        RefuseFdiv,
++        RefuseEfu,
++        RefuseWaitP,
++        LeaveXgkick, // block left before an XGKICK while PATH1 is busy
++        LeaveBudget, // block left because the next issue crosses the run budget
++        RefusalCount
++    };
++    constexpr const char *kRefusalNames[RefusalCount] = {"disabled", "state", "branch", "stores", "range", "empty", "budget", "liveIn",
++                                                         "fdiv", "efu", "waitP", "xgkickBusy", "budgetInBlock"};
++
++    struct VuProgStats
++    {
++        uint64_t image = 0;
++        uint32_t pc = 0;
++        uint64_t runs = 0, resumes = 0, fastPairs = 0, interpPairs = 0, blocks = 0;
++    };
++    struct VuImageStats
++    {
++        uint32_t pairs = 0;
++        uint64_t loads = 0, starts = 0;
++    };
++    struct VuStats
++    {
++        uint64_t imageHash = 0;
++        uint64_t fastPairs = 0, interpPairs = 0, blocks = 0, blockBuilds = 0, runs = 0;
++        uint64_t refusals[RefusalCount]{};
++        std::unordered_map<uint32_t, std::array<uint64_t, RefusalCount>> refusalsByPc;
++        std::unordered_map<uint64_t, VuImageStats> images;
++        std::unordered_map<uint64_t, VuProgStats> programs; // key: image hash ^ pc
++        std::unordered_map<uint64_t, uint32_t> blockContents; // hash of a built block's words -> pairs
++        VuProgStats *current = nullptr;
++        bool pendingStart = false, pendingResume = false;
++        uint32_t pendingPc = 0;
++        std::chrono::steady_clock::time_point lastPrint = std::chrono::steady_clock::now();
++        uint64_t lastFast = 0, lastInterp = 0;
++    };
++    VuStats &vuStats()
++    {
++        static VuStats s;
++        return s;
++    }
++
++    uint64_t fnv1a(const uint8_t *p, size_t n, uint64_t h = 1469598103934665603ull)
++    {
++        for (size_t i = 0; i < n; ++i)
++            h = (h ^ p[i]) * 1099511628211ull;
++        return h;
++    }
++
++    double pct(uint64_t part, uint64_t total) { return total ? 100.0 * part / total : 0.0; }
++
++    void printVuStats(const char *tag)
++    {
++        VuStats &s = vuStats();
++        const uint64_t total = s.fastPairs + s.interpPairs;
++        const uint64_t dFast = s.fastPairs - s.lastFast, dInterp = s.interpPairs - s.lastInterp;
++        s.lastFast = s.fastPairs;
++        s.lastInterp = s.interpPairs;
++        std::fprintf(stderr,
++                     "[vu-stats:%s] last interval: fast %llu interp %llu (fast %.1f%%) | total: fast %llu interp %llu "
++                     "(fast %.1f%%) runs %llu blocks %llu (%.1f/run, %.1f pairs/block) builds %llu\n",
++                     tag, (unsigned long long)dFast, (unsigned long long)dInterp, pct(dFast, dFast + dInterp),
++                     (unsigned long long)s.fastPairs, (unsigned long long)s.interpPairs, pct(s.fastPairs, total),
++                     (unsigned long long)s.runs, (unsigned long long)s.blocks,
++                     s.runs ? double(s.blocks) / s.runs : 0.0, s.blocks ? double(s.fastPairs) / s.blocks : 0.0,
++                     (unsigned long long)s.blockBuilds);
++        std::fprintf(stderr, "[vu-stats:%s] interp pairs by reason:", tag);
++        for (uint32_t r = 0; r < RefusalCount; ++r)
++            if (s.refusals[r])
++                std::fprintf(stderr, " %s=%llu (%.1f%%)", kRefusalNames[r], (unsigned long long)s.refusals[r],
++                             pct(s.refusals[r], s.interpPairs));
++        std::fprintf(stderr, "\n");
++
++        std::vector<std::pair<uint64_t, uint32_t>> pcs;
++        for (const auto &[pc, counts] : s.refusalsByPc)
++        {
++            uint64_t sum = 0;
++            for (uint64_t c : counts)
++                sum += c;
++            pcs.emplace_back(sum, pc);
++        }
++        std::sort(pcs.rbegin(), pcs.rend());
++        for (size_t i = 0; i < pcs.size() && i < 10u; ++i)
++        {
++            const auto &counts = s.refusalsByPc[pcs[i].second];
++            std::fprintf(stderr, "[vu-stats:%s]   interp pc 0x%04x: %llu", tag, pcs[i].second,
++                         (unsigned long long)pcs[i].first);
++            for (uint32_t r = 0; r < RefusalCount; ++r)
++                if (counts[r])
++                    std::fprintf(stderr, " %s=%llu", kRefusalNames[r], (unsigned long long)counts[r]);
++            std::fprintf(stderr, "\n");
++        }
++
++        uint32_t blockPairs = 0;
++        for (const auto &[hash, pairs] : s.blockContents)
++            blockPairs += pairs;
++        std::fprintf(stderr,
++                     "[vu-stats:%s] distinct images %zu, programs (image, start pc) %zu, block contents %zu "
++                     "(%u pairs)\n",
++                     tag, s.images.size(), s.programs.size(), s.blockContents.size(), blockPairs);
++        for (const auto &[hash, image] : s.images)
++            std::fprintf(stderr, "[vu-stats:%s]   image %016llx: %u pairs, loads %llu, starts %llu\n", tag,
++                         (unsigned long long)hash, image.pairs, (unsigned long long)image.loads,
++                         (unsigned long long)image.starts);
++        std::vector<const VuProgStats *> progs;
++        for (const auto &[key, prog] : s.programs)
++            progs.push_back(&prog);
++        std::sort(progs.begin(), progs.end(), [](const VuProgStats *a, const VuProgStats *b)
++                  { return a->fastPairs + a->interpPairs > b->fastPairs + b->interpPairs; });
++        for (size_t i = 0; i < progs.size() && i < 25u; ++i)
++        {
++            const VuProgStats &p = *progs[i];
++            const uint64_t pairs = p.fastPairs + p.interpPairs;
++            std::fprintf(stderr,
++                         "[vu-stats:%s]   prog %016llx:0x%04x runs %llu resumes %llu pairs %llu (%.1f%% of all, "
++                         "%.0f/run) fast %.1f%% blocks/run %.1f\n",
++                         tag, (unsigned long long)p.image, p.pc, (unsigned long long)p.runs,
++                         (unsigned long long)p.resumes, (unsigned long long)pairs, pct(pairs, total),
++                         p.runs ? double(pairs) / p.runs : 0.0, pct(p.fastPairs, pairs),
++                         p.runs ? double(p.blocks) / p.runs : 0.0);
++        }
++        std::fflush(stderr);
++    }
++
++    // Called once per execute()/resume() of VU1 after the code cache is ready.
++    void vuStatsBeginRun()
++    {
++        VuStats &s = vuStats();
++        static const bool registered = (std::atexit([] { printVuStats("exit"); }), true);
++        (void)registered;
++        if (s.pendingStart)
++        {
++            s.pendingStart = false;
++            ++s.runs;
++            ++s.images[s.imageHash].starts;
++            VuProgStats &p = s.programs[s.imageHash ^ s.pendingPc];
++            p.image = s.imageHash;
++            p.pc = s.pendingPc;
++            ++p.runs;
++            s.current = &p;
++        }
++        else if (s.pendingResume)
++        {
++            s.pendingResume = false;
++            if (s.current)
++                ++s.current->resumes;
++        }
++        const auto now = std::chrono::steady_clock::now();
++        if (now - s.lastPrint >= std::chrono::seconds(5))
++        {
++            s.lastPrint = now;
++            printVuStats("5s");
++        }
++    }
++
++    void vuStatsRefuse(VuRefusal reason, uint32_t pc)
++    {
++        VuStats &s = vuStats();
++        ++s.refusals[reason];
++        ++s.refusalsByPc[pc][reason];
++    }
++
+     // Upper handler ids run by directAddSubMul on the fast-block path: ADD/SUB/MUL/MADD/MSUB/OPMSUB and their
+     // ACC forms (ids 0x40+), not MAX/MINI/ABS/CLIP/ITOF/FTOI/NOP. These are every MAC/status flag writer.
+     constexpr bool isDirectFmacId(uint16_t id)
+@@ -1757,6 +1935,11 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+     }
+     resetScheduler();
+     m_state.pc = startPC & microAddressMask();
++    if (g_vuStats && m_unit == Unit::VU1)
++    {
++        vuStats().pendingStart = true;
++        vuStats().pendingPc = m_state.pc;
++    }
+     m_state.ebit = false;
+     m_state.haltAfterDelaySlot = false;
+     m_state.stoppedByD = false;
+@@ -1789,6 +1972,8 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
+     m_state.itop = itop;
+     m_state.stoppedByD = false;
+     m_state.stoppedByT = false;
++    if (g_vuStats && m_unit == Unit::VU1)
++        vuStats().pendingResume = true;
+     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+ }
+ 
+@@ -1818,6 +2003,14 @@ void VU1Interpreter::prepareCodeCache(const uint8_t *vuCode, uint32_t codeSize,
+                 m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
+             std::memcpy(m_cachedCodeCopy.data(), vuCode, pairCount * 8u);
+             m_fastBlocks.clear();
++            if (g_vuStats && m_unit == Unit::VU1)
++            {
++                VuStats &st = vuStats();
++                st.imageHash = fnv1a(vuCode, pairCount * 8u);
++                VuImageStats &image = st.images[st.imageHash];
++                image.pairs = pairCount;
++                ++image.loads;
++            }
+         }
+         m_cachedVuCode = vuCode;
+         m_cachedMemory = memory;
+@@ -2067,6 +2260,13 @@ const VU1Interpreter::FastBlock *VU1Interpreter::buildFastBlock(uint32_t startPa
+         ids.elide[startPair] = std::move(elide);
+     }
+ 
++    if (g_vuStats && m_unit == Unit::VU1)
++    {
++        VuStats &st = vuStats();
++        ++st.blockBuilds;
++        const uint64_t key = fnv1a(m_cachedCodeCopy.data() + startPair * 8u, block->pairCount * 8u, startPair);
++        st.blockContents[key] = block->pairCount;
++    }
+     m_fastBlocks[startPair] = std::move(block);
+     return m_fastBlocks[startPair].get();
+ }
+@@ -2104,21 +2304,32 @@ void VU1Interpreter::applyPendingRegisterWrites()
+ bool VU1Interpreter::tryEnterFastBlock(uint64_t budgetEnd)
+ {
+     static const bool disabled = std::getenv("PS2X_VU_NO_BLOCKS") != nullptr;
+-    if (disabled || !m_codeCachePrepared || (m_state.pc & 7u) != 0u || m_state.branchPending ||
+-        m_state.haltAfterDelaySlot || m_storeMask != 0u)
++    const auto refuse = [this](VuRefusal reason)
++    {
++        if (g_vuStats && m_unit == Unit::VU1)
++            vuStatsRefuse(reason, m_state.pc);
+         return false;
++    };
++    if (disabled)
++        return refuse(RefuseDisabled);
++    if (!m_codeCachePrepared || (m_state.pc & 7u) != 0u)
++        return refuse(RefuseState);
++    if (m_state.branchPending || m_state.haltAfterDelaySlot)
++        return refuse(RefuseBranch);
++    if (m_storeMask != 0u)
++        return refuse(RefuseStores);
+     const uint32_t pair = m_state.pc / 8u;
+     if (pair >= m_fastBlocks.size())
+-        return false;
++        return refuse(RefuseRange);
+     const FastBlock *block = m_fastBlocks[pair] ? m_fastBlocks[pair].get() : buildFastBlock(pair);
+     if (block->pairCount == 0u)
+-        return false;
++        return refuse(RefuseEmpty);
+ 
+     const uint64_t start = m_cycle;
+     // Register results become visible at issue in block mode. Keep the block and the few cycles until its last
+     // results would commit inside the budget, so a run cut by the budget leaves the interpreter's state.
+     if (start + block->issue.back() + 16u >= budgetEnd)
+-        return false;
++        return refuse(RefuseBudget);
+     if (m_regReadyMax > start)
+     {
+         for (const FastReady &req : block->liveIn)
+@@ -2129,18 +2340,18 @@ bool VU1Interpreter::tryEnterFastBlock(uint64_t budgetEnd)
+                                    : req.kind == 1u ? m_viReady[req.reg]
+                                                     : m_accReady[req.component];
+             if (ready > start + req.offset)
+-                return false;
++                return refuse(RefuseLiveIn);
+         }
+     }
+     if (block->fdivReq >= 0 && m_fdiv.valid && m_fdiv.readyCycle > start + static_cast<uint64_t>(block->fdivReq))
+-        return false;
++        return refuse(RefuseFdiv);
+     if (block->efuReq >= 0 && m_efuResourceReady > start + static_cast<uint64_t>(block->efuReq))
+-        return false;
++        return refuse(RefuseEfu);
+     if (block->waitPReq >= 0)
+     {
+         for (const ScalarPipelineEntry &entry : m_efu)
+             if (entry.valid && entry.readyCycle > start + static_cast<uint64_t>(block->waitPReq))
+-                return false;
++                return refuse(RefuseWaitP);
+     }
+ 
+     applyPendingRegisterWrites();
+@@ -2218,6 +2429,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     m_activeGs = &gs;
+     m_activeMemory = memory;
+     prepareCodeCache(vuCode, codeSize, memory);
++    const bool stats = g_vuStats && m_unit == Unit::VU1;
++    if (stats)
++        vuStatsBeginRun();
+ 
+     // Publish the direct-op tables before any pair runs. The dummy ops are NOPs; restore the upper word
+     // so a caller that inspects it across run() sees the same value.
+@@ -2742,7 +2956,15 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             break;
+ 
+         if (!m_fastBlock && tryEnterFastBlock(budgetEnd))
++        {
+             onBlockEnter();
++            if (stats)
++            {
++                ++vuStats().blocks;
++                if (vuStats().current)
++                    ++vuStats().current->blocks;
++            }
++        }
+         if (m_fastBlock)
+         {
+             // Block mode: the issue cycle comes from the block's static timing, no hazard scan or write queues.
+@@ -2760,7 +2982,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                 }
+             }
+             if (leave)
++            {
++                if (stats)
++                    vuStatsRefuse(issue >= budgetEnd ? LeaveBudget : LeaveXgkick, m_state.pc);
+                 leaveBlock(); // the interpreter runs this pair below
++            }
+             else
+             {
+                 const uint32_t viWriteBits = decoded.lowerUsage.viWrite & 0xFFFEu;
+@@ -2785,6 +3011,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                 fastAdvanceTo(issue + 1u);
+                 m_state.cycles = m_cycle;
+                 ++m_fastIndex;
++                if (stats)
++                {
++                    ++vuStats().fastPairs;
++                    if (vuStats().current)
++                        ++vuStats().current->fastPairs;
++                }
+                 if (programEnded || m_fastIndex == block.pairCount ||
+                     m_state.pc != (block.startPair + m_fastIndex) * 8u)
+                     leaveBlock();
+@@ -2887,6 +3119,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
+             recordViWriteForBranch(writtenVi, oldVi);
+ 
++        if (stats)
++        {
++            ++vuStats().interpPairs;
++            if (vuStats().current)
++                ++vuStats().current->interpPairs;
++        }
+         programEnded = finishPair(decoded);
+         advanceOneCycle();
+         if (programEnded)
