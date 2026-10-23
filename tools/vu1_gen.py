@@ -1,0 +1,165 @@
+"""VU1 AOT skeleton generator (#39): read a PS2X_VU1_CAPTURE directory and print block statistics.
+
+The runtime (patch 0031) writes, per VU1 micro memory image, <hash>.bin (the image) and <hash>.txt with lines
+"block 0x<pc> <pairs>" (fast blocks built by buildFastBlock) and "interp 0x<pc> <reason>" (tryEnterFastBlock
+refusals). This script splits every captured block start the way buildFastBlock does (stop before a reserved op,
+after the delay slot of a branch or E bit, at 256 pairs or at the end of the image), checks the pair count against
+the capture and prints blocks, pairs, ops by kind, flag readers, XGKICKs and branches. It emits no code yet (#40).
+
+usage: vu1_gen.py [CAPTURE_DIR]   (default ../dotr/vu1)
+       vu1_gen.py --self-test"""
+import collections, os, struct, sys
+
+MAX_BLOCK_PAIRS = 256  # VU1Interpreter::kMaxFastBlockPairs
+
+UPPER = {}
+for i, bc in enumerate('xyzw'):
+    for base, name in ((0x00, 'ADD'), (0x04, 'SUB'), (0x08, 'MADD'), (0x0C, 'MSUB'), (0x10, 'MAX'), (0x14, 'MINI'),
+                       (0x18, 'MUL')):
+        UPPER[base + i] = name + bc
+UPPER.update({0x1C: 'MULq', 0x1D: 'MAXi', 0x1E: 'MULi', 0x1F: 'MINIi', 0x20: 'ADDq', 0x21: 'MADDq', 0x22: 'ADDi',
+              0x23: 'MADDi', 0x24: 'SUBq', 0x25: 'MSUBq', 0x26: 'SUBi', 0x27: 'MSUBi', 0x28: 'ADD', 0x29: 'MADD',
+              0x2A: 'MUL', 0x2B: 'MAX', 0x2C: 'SUB', 0x2D: 'MSUB', 0x2E: 'OPMSUB', 0x2F: 'MINI'})
+UPPER_SPECIAL = {}
+for i, bc in enumerate('xyzw'):
+    for base, name in ((0x00, 'ADDA'), (0x04, 'SUBA'), (0x08, 'MADDA'), (0x0C, 'MSUBA'), (0x18, 'MULA')):
+        UPPER_SPECIAL[base + i] = name + bc
+UPPER_SPECIAL.update({0x10: 'ITOF0', 0x11: 'ITOF4', 0x12: 'ITOF12', 0x13: 'ITOF15', 0x14: 'FTOI0', 0x15: 'FTOI4',
+                      0x16: 'FTOI12', 0x17: 'FTOI15', 0x1C: 'MULAq', 0x1D: 'ABS', 0x1E: 'MULAi', 0x1F: 'CLIP',
+                      0x20: 'ADDAq', 0x21: 'MADDAq', 0x22: 'ADDAi', 0x23: 'MADDAi', 0x24: 'SUBAq', 0x25: 'MSUBAq',
+                      0x26: 'SUBAi', 0x27: 'MSUBAi', 0x28: 'ADDA', 0x29: 'MADDA', 0x2A: 'MULA', 0x2C: 'SUBA',
+                      0x2D: 'MSUBA', 0x2E: 'OPMULA', 0x2F: 'NOP', 0x30: 'NOP30'})
+LOWER = {0x00: 'LQ', 0x01: 'SQ', 0x04: 'ILW', 0x05: 'ISW', 0x08: 'IADDIU', 0x09: 'ISUBIU', 0x10: 'FCEQ',
+         0x11: 'FCSET', 0x12: 'FCAND', 0x13: 'FCOR', 0x14: 'FSEQ', 0x15: 'FSSET', 0x16: 'FSAND', 0x17: 'FSOR',
+         0x18: 'FMEQ', 0x1A: 'FMAND', 0x1B: 'FMOR', 0x1C: 'FCGET', 0x20: 'B', 0x21: 'BAL', 0x24: 'JR', 0x25: 'JALR',
+         0x28: 'IBEQ', 0x29: 'IBNE', 0x2C: 'IBLTZ', 0x2D: 'IBGTZ', 0x2E: 'IBLEZ', 0x2F: 'IBGEZ'}
+LOWER_DIRECT = {0x30: 'IADD', 0x31: 'ISUB', 0x32: 'IADDI', 0x34: 'IAND', 0x35: 'IOR'}
+LOWER_SPECIAL = {0x30: 'MOVE', 0x31: 'MR32', 0x34: 'LQI', 0x35: 'SQI', 0x36: 'LQD', 0x37: 'SQD', 0x38: 'DIV',
+                 0x39: 'SQRT', 0x3A: 'RSQRT', 0x3B: 'WAITQ', 0x3C: 'MTIR', 0x3D: 'MFIR', 0x3E: 'ILWR', 0x3F: 'ISWR',
+                 0x40: 'RNEXT', 0x41: 'RGET', 0x42: 'RINIT', 0x43: 'RXOR', 0x64: 'MFP', 0x68: 'XTOP', 0x69: 'XITOP',
+                 0x6C: 'XGKICK', 0x70: 'ESADD', 0x71: 'ERSADD', 0x72: 'ELENG', 0x73: 'ERLENG', 0x74: 'EATANxy',
+                 0x75: 'EATANxz', 0x76: 'ESUM', 0x77: 'ERCPR', 0x78: 'ESQRT', 0x79: 'ERSQRT', 0x7A: 'ESIN',
+                 0x7B: 'WAITP', 0x7C: 'EATAN', 0x7D: 'EEXP'}
+BRANCHES = {0x20, 0x21, 0x24, 0x25, 0x28, 0x29, 0x2C, 0x2D, 0x2E, 0x2F}
+
+
+def fnv1a(data, h=1469598103934665603):
+    for b in data:
+        h = ((h ^ b) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def special(word):
+    return (word & 3) | ((word >> 4) & 0x7C)
+
+
+def upper_name(upper):
+    """Mnemonic, or None when decodeUpperUsage() marks it reserved."""
+    op = upper & 0x3F
+    return UPPER.get(op) if op < 0x3C else UPPER_SPECIAL.get(special(upper))
+
+
+def lower_name(lower, ibit):
+    """Mnemonic, or None when decodeLowerUsage() marks it reserved (VU1). With the I bit the word is an immediate."""
+    if ibit:
+        return 'LOI'
+    if lower in (0, 0x8000033C):
+        return 'NOP'
+    op_hi = (lower >> 25) & 0x7F
+    if op_hi != 0x40:
+        return LOWER.get(op_hi)
+    if (lower & 0x3F) < 0x3C:
+        return LOWER_DIRECT.get(lower & 0x3F)
+    return LOWER_SPECIAL.get(special(lower))
+
+
+def decode(image, pair):
+    lower, upper = struct.unpack_from('<2I', image, pair * 8)
+    ibit, ebit = bool(upper & 0x80000000), bool(upper & 0x40000000)
+    lo = lower_name(lower, ibit)
+    return dict(lower=lower, upper=upper, ibit=ibit, ebit=ebit, dbit=bool(upper & 0x10000000),
+                tbit=bool(upper & 0x08000000), up=upper_name(upper), lo=lo,
+                branch=not ibit and lo is not None and (lower >> 25) in BRANCHES,
+                flag_reader=not ibit and 0x14 <= (lower >> 25) <= 0x1B and (lower >> 25) != 0x15)
+
+
+def split_block(image, start_pair):
+    """The pairs buildFastBlock(start_pair) covers."""
+    pairs, owner = [], False
+    count = len(image) // 8
+    while start_pair + len(pairs) < count and len(pairs) < MAX_BLOCK_PAIRS:
+        d = decode(image, start_pair + len(pairs))
+        if d['up'] is None or d['lo'] is None:
+            break
+        pairs.append(d)
+        if owner:
+            break
+        owner = d['branch'] or d['ebit']
+    return pairs
+
+
+def load(capture_dir):
+    for name in sorted(os.listdir(capture_dir)):
+        if not name.endswith('.bin'):
+            continue
+        h = name[:-4]
+        image = open(os.path.join(capture_dir, name), 'rb').read()
+        assert fnv1a(image) == int(h, 16), f'{name}: hash does not match its bytes'
+        blocks, interp = {}, collections.Counter()
+        txt = os.path.join(capture_dir, h + '.txt')
+        for line in open(txt) if os.path.exists(txt) else ():
+            kind, pc, value = line.split()
+            if kind == 'block':
+                blocks[int(pc, 16)] = int(value)
+            else:
+                interp[value] += 1
+        yield h, image, blocks, interp
+
+
+def stats(h, image, blocks, interp):
+    ops, kinds, contents = collections.Counter(), collections.Counter(), set()
+    total = 0
+    for pc, recorded in sorted(blocks.items()):
+        pairs = split_block(image, pc // 8)
+        assert len(pairs) == recorded, f'{h} block 0x{pc:04x}: split {len(pairs)} pairs, capture says {recorded}'
+        contents.add(fnv1a(image[pc:pc + 8 * len(pairs)], pc // 8))  # the PS2X_VU_STATS block key
+        total += len(pairs)
+        for d in pairs:
+            ops['upper ' + d['up']] += 1
+            ops['lower ' + d['lo']] += 1
+            for k in ('branch', 'flag_reader', 'ebit', 'ibit', 'dbit', 'tbit'):
+                kinds[k] += d[k]
+            kinds['xgkick'] += d['lo'] == 'XGKICK'
+            kinds['fsset'] += d['lo'] == 'FSSET'
+    print(f'image {h}: {len(image) // 8} pairs, blocks {len(blocks)} ({len(contents)} distinct contents), '
+          f'{total} pairs ({total / max(len(blocks), 1):.1f}/block)')
+    print('  ' + ', '.join(f'{k} {kinds[k]}' for k in ('branch', 'xgkick', 'flag_reader', 'fsset', 'ebit', 'ibit',
+                                                        'dbit', 'tbit')))
+    print('  interpreter entry pcs by reason: ' + (', '.join(f'{r} {n}' for r, n in interp.most_common()) or 'none'))
+    for side in ('upper', 'lower'):
+        row = sorted(((n, op[6:]) for op, n in ops.items() if op.startswith(side)), reverse=True)
+        print(f'  {side} ops: ' + ' '.join(f'{op}={n}' for n, op in row))
+    return len(blocks), total
+
+
+def self_test():
+    nop_upper, ebit = 0x000002FF, 0x40000000
+    b_op = 0x20 << 25
+    image = struct.pack('<12I', 0, nop_upper, b_op, nop_upper, 0, nop_upper,  # NOP, B, delay slot
+                        0, nop_upper | ebit, 0, nop_upper,                      # E bit, delay slot
+                        0x7F << 25, nop_upper)                                 # reserved lower
+    assert [len(split_block(image, p)) for p in range(6)] == [3, 2, 3, 2, 1, 0]
+    assert fnv1a(b'') == 1469598103934665603
+    print('self-test ok')
+
+
+if __name__ == '__main__':
+    if sys.argv[1:] == ['--self-test']:
+        self_test()
+        sys.exit()
+    capture = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), '..', '..', 'dotr', 'vu1')
+    n_blocks = n_pairs = 0
+    for item in load(capture):
+        b, p = stats(*item)
+        n_blocks, n_pairs = n_blocks + b, n_pairs + p
+    print(f'total: {n_blocks} blocks, {n_pairs} pairs')

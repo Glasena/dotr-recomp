@@ -1,0 +1,131 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -15,9 +15,13 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <filesystem>
++#include <fstream>
+ #include <limits>
+ #include <ps2_log.h>
++#include <set>
++#include <string>
+ #include <unordered_map>
++#include <unordered_set>
+ #include <utility>
+ #include <xmmintrin.h>
+ 
+@@ -232,8 +236,86 @@
+         }
+     }
+ 
++    // PS2X_VU1_CAPTURE=<dir> (#39): per VU1 micro memory image (fnv1a of its bytes), <dir>/<hash>.bin holds the
++    // image and <dir>/<hash>.txt the sorted set of lines "block 0x<pc> <pairs>" (a buildFastBlock result) and
++    // "interp 0x<pc> <reason>" (tryEnterFastBlock refused there, kRefusalNames). Leaves inside a block, such as
++    // xgkickBusy, are not recorded, so run() stays untouched; any XGKICK can cause one. The text file is merged
++    // with what earlier runs left and rewritten whole on each new line, so runs merge and test mode's _Exit loses
++    // nothing. tools/vu1_gen.py in dotr-recomp reads it.
++    const char *const g_vuCaptureDir = std::getenv("PS2X_VU1_CAPTURE");
++    const bool g_vuCapture = g_vuCaptureDir != nullptr && *g_vuCaptureDir != '\0';
++    const bool g_vuTrack = g_vuStats || g_vuCapture; // tryEnterFastBlock() reports refusals
++
++    struct VuCapture
++    {
++        std::filesystem::path txt; // empty until the first image
++        std::set<std::string> lines;
++        std::unordered_set<uint64_t> keys; // lines already handled this run
++    };
++    VuCapture &vuCapture()
++    {
++        static VuCapture c;
++        return c;
++    }
++
++    void vuCaptureWrite(const std::filesystem::path &path, const void *data, size_t size)
++    {
++        const std::filesystem::path tmp = path.string() + ".tmp";
++        if (FILE *f = std::fopen(tmp.c_str(), "wb"))
++        {
++            const bool ok = std::fwrite(data, 1, size, f) == size;
++            if (std::fclose(f) == 0 && ok)
++            {
++                std::error_code ec;
++                std::filesystem::rename(tmp, path, ec);
++            }
++        }
++    }
++
++    [[gnu::cold, gnu::noinline]] void vuCaptureImage(const uint8_t *code, uint32_t pairs)
++    {
++        VuCapture &c = vuCapture();
++        char name[32];
++        std::snprintf(name, sizeof(name), "%016llx", static_cast<unsigned long long>(fnv1a(code, pairs * 8u)));
++        const std::filesystem::path dir(g_vuCaptureDir);
++        std::error_code ec;
++        std::filesystem::create_directories(dir, ec);
++        const std::filesystem::path bin = dir / (std::string(name) + ".bin");
++        if (!std::filesystem::exists(bin, ec))
++            vuCaptureWrite(bin, code, pairs * 8u);
++        c.txt = dir / (std::string(name) + ".txt");
++        c.lines.clear();
++        c.keys.clear();
++        std::ifstream in(c.txt);
++        for (std::string line; std::getline(in, line);)
++            if (!line.empty())
++                c.lines.insert(line);
++    }
++
++    [[gnu::cold, gnu::noinline]] void vuCaptureLine(bool block, uint32_t pc, uint32_t value)
++    {
++        VuCapture &c = vuCapture();
++        if (c.txt.empty() || !c.keys.insert((uint64_t{block} << 48) | (uint64_t{pc} << 16) | value).second)
++            return;
++        char line[64];
++        if (block)
++            std::snprintf(line, sizeof(line), "block 0x%04x %u", pc, value);
++        else
++            std::snprintf(line, sizeof(line), "interp 0x%04x %s", pc, kRefusalNames[value]);
++        if (!c.lines.insert(line).second)
++            return;
++        std::string text;
++        for (const std::string &l : c.lines)
++            text += l + '\n';
++        vuCaptureWrite(c.txt, text.data(), text.size());
++    }
++
+     void vuStatsRefuse(VuRefusal reason, uint32_t pc)
+     {
++        if (g_vuCapture && reason < LeaveXgkick)
++            vuCaptureLine(false, pc, reason);
++        if (!g_vuStats)
++            return;
+         VuStats &s = vuStats();
+         ++s.refusals[reason];
+         ++s.refusalsByPc[pc][reason];
+@@ -2155,6 +2237,8 @@
+                 image.pairs = pairCount;
+                 ++image.loads;
+             }
++            if (g_vuCapture && m_unit == Unit::VU1)
++                vuCaptureImage(vuCode, pairCount);
+         }
+         m_cachedVuCode = vuCode;
+         m_cachedMemory = memory;
+@@ -2429,6 +2513,8 @@
+         const uint64_t key = fnv1a(m_cachedCodeCopy.data() + startPair * 8u, block->pairCount * 8u, startPair);
+         st.blockContents[key] = block->pairCount;
+     }
++    if (g_vuCapture && m_unit == Unit::VU1)
++        vuCaptureLine(true, startPair * 8u, block->pairCount);
+     m_fastBlocks[startPair] = std::move(block);
+     return m_fastBlocks[startPair].get();
+ }
+@@ -2468,7 +2554,7 @@
+     static const bool disabled = std::getenv("PS2X_VU_NO_BLOCKS") != nullptr;
+     const auto refuse = [this](VuRefusal reason)
+     {
+-        if (g_vuStats && m_unit == Unit::VU1)
++        if (g_vuTrack && m_unit == Unit::VU1)
+             vuStatsRefuse(reason, m_state.pc);
+         return false;
+     };
