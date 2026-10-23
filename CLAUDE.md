@@ -183,6 +183,14 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   `DirectIds::Plan` match. `PS2X_VU_NO_AOT=1` off, `PS2X_VU_AOT_VERIFY=1` compares with the tight loop (0 of 22M
   runs differ to 2300). Generated = 83.6% of pairs (all tight-loop pairs). Map 1900->2300 interleaved: 86.8G ->
   77.9G instructions (-10%), cycles ~39.3G -> ~36.9G (-6%), wall ~14.0 -> ~13.0 s. Dumps/flag check unchanged.
+- Patch 0033 (2026-10-23, #41 stage a): each generated function now runs a whole fast block from pair 0: plain
+  pairs as before, the rest (branch, XGKICK, delay slot, E/D/T, upper VF shadow) and the last pair through
+  `Vu1Aot::step<>` (run()'s generic step with constants), then the block exit (`Vu1Aot::leave`). Binding also checks
+  shadow reg and pair kind. run()'s loop is split into `loopTop`/`stepBody` lambdas; `PS2X_VU_AOT_VERIFY` now runs
+  the generated code, then run()'s own steps for the same number of fast pairs, and compares (incl. ready cycles).
+  Generated = 99.7% of pairs (all fast pairs); verify 0 mismatches in 17.8M blocks to 2300 (a broken branch
+  immediate is caught). Map 1900->2300 vs post-#40: ~77.9G -> ~75.0G instructions (-3.7%), cycles ~35.8G ->
+  ~35.3G (noise), wall ~12.7 s both: the generic step was not the cost; block transitions are next.
 - Patch 0027 (2026-10-22, #35): `perf --call-graph dwarf` found the map/hash share was `IopKernel::beginNextReady`/
   `nextWakeCycle` walking the thread `std::map` on every idle IOP step (~7.5%) and the GIF_STAT lookup in
   `advanceEeTimers` (~2.1%). Kernel caches "nothing ready until cycle W" behind a version bumped by every public
@@ -317,7 +325,7 @@ Order is tracked with the `priority: N` labels; #13 is pinned on GitHub.
    real IOP instruction work (~9%, incl. `servicePendingDmaInterrupts` per IOP instruction ~1.8%). Profile the game
    thread again before the next VU1 step. #36 (stats) and #37 (tight pair loop, patch 0029) are in; next per the
    #13 plan was step 3, SSE FMAC handlers + lazy operand loads (#38, patch 0030, in); step 4, capture + stats
-   generator (#39, patch 0031), and step 5, AOT tight-loop runs (#40, patch 0032), are in; next is #41 (chain
-   blocks into routines: generated code for the generic steps too, then block-to-block without returning to run()).
+   generator (#39, patch 0031), and step 5, AOT tight-loop runs (#40, patch 0032), are in. #41 stage a (whole
+   blocks in generated code, patch 0033) is in; next: block-to-block transitions without returning to run().
 2. Then #10 (box glyphs), #14 (display env), #16, #17, #3-#5. Open an issue per new blocker.
 3. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).

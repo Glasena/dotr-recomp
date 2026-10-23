@@ -1,0 +1,688 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h b/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
+@@ -207,19 +207,43 @@ struct Vu1AotRun
+     vu1fast::FlagElision *flags = nullptr;
+     uint8_t *vuData = nullptr;
+     uint32_t dataSize = 0;
++    uint32_t codeSize = 0;
++    uint64_t budgetEnd = 0;
++    uint64_t pairsDone = 0; // pairs of the blocks the generated code finished and left
+ };
+ 
+-// Runs one tight-loop run of plain pairs of a block, starting at pair `first` (the fast-block index). Returns
+-// false, having done nothing, when the block has no generated run starting there.
+-using Vu1AotFn = bool (*)(VU1Interpreter &s, Vu1AotRun &r, uint32_t first);
++// What a generated block returns to run() (#41).
++enum Vu1AotStatus : int
++{
++    kAotStop,  // stopped before pair m_fastIndex of the current block, as run() would at its loop top
++    kAotDone,  // the block ran to its end and was left: run() is at its loop top with no block
++    kAotEnded, // the program ended (E bit, D/T halt) and the block was left
++};
++
++// Runs a whole fast block from its first pair, the generic block step (branch, XGKICK, delay slot, E/D/T bits,
++// upper VF shadow) included. Entered right after tryEnterFastBlock() at m_fastIndex 0.
++using Vu1AotFn = int (*)(VU1Interpreter &s, Vu1AotRun &r);
++
++// Pair kinds of the generic block step (Vu1AotPair::kind).
++enum : uint8_t
++{
++    kAotXgkick = 1,
++    kAotBranch = 2,
++    kAotE = 4,
++    kAotD = 8,
++    kAotT = 16,
++};
+ 
+-// What the generator assumed about each pair; checked against DirectIds::Plan before a block is used.
++// What the generator assumed about each pair; checked against DirectIds::Plan and the decoded pair before a
++// block is used.
+ struct Vu1AotPair
+ {
+     uint32_t lower, upper;
+     uint16_t upperId, lowerId;
+     uint8_t viReg;
+     bool plain, recordVi;
++    uint8_t shadowReg; // DecodedInstructionPair::upperVfShadowReg
++    uint8_t kind;      // kAot* bits
+ };
+ 
+ struct Vu1AotBlock
+@@ -370,16 +394,10 @@ struct Vu1Aot
+         _mm_storeu_ps(dst, _mm_or_ps(_mm_and_ps(lanes, _mm_loadu_ps(flagged)), _mm_andnot_ps(lanes, _mm_loadu_ps(dst))));
+     }
+ 
+-    // One plain pair of a tight-loop run (run() in ps2_vu1_core.cpp), with its words and plan as constants.
+-    template <uint16_t UId, uint32_t Upper, uint16_t LId, uint32_t Lower, uint8_t ViReg, bool RecordVi>
+-    [[gnu::always_inline]] static inline void pair(VU1Interpreter &s, Vu1AotRun &r, uint32_t k)
++    // The upper op of pair k, with its word and handler id as constants.
++    template <uint16_t UId, uint32_t Upper>
++    [[gnu::always_inline]] static inline void upper(VU1Interpreter &s, Vu1AotRun &r, uint32_t k)
+     {
+-        const uint64_t issue = s.m_fastStart + r.issue[k];
+-        if (s.m_nextCommitCycle <= issue)
+-            s.fastAdvanceTo(issue);
+-        else
+-            s.m_cycle = issue;
+-        const int32_t oldVi = s.m_state.vi[ViReg];
+         if constexpr (UId < 0x80u && vu1fast::isDirectFmacId(UId))
+         {
+             constexpr bool toAcc = UId >= 0x40u;
+@@ -398,15 +416,30 @@ struct Vu1Aot
+             s.m_currentUpperInstruction = Upper;
+         else
+             g_vu1UpperFn[UId](s, Upper);
++    }
++
++    // The lower op, or the I immediate.
++    template <uint16_t LId, uint32_t Lower, uint32_t Upper>
++    [[gnu::always_inline]] static inline void lower(VU1Interpreter &s, Vu1AotRun &r)
++    {
+         if constexpr ((Upper & 0x80000000u) != 0u)
+             s.m_state.i = std::bit_cast<float>(vu1fast::normalizedOperandBits(Lower));
+         else if constexpr (LId != kVu1LowerNop) // the NOP handler is empty
+             g_vu1LowerFn[LId](s, Lower, r.vuData, r.dataSize);
++    }
++
++    template <uint8_t ViReg, bool RecordVi>
++    [[gnu::always_inline]] static inline void afterOps(VU1Interpreter &s, int32_t oldVi)
++    {
+         if constexpr (ViReg != 0u)
+             s.m_state.vi[ViReg] = static_cast<int16_t>(s.m_state.vi[ViReg]); // as the VI commit does
+         s.m_viBranchBackupValid = false;
+         if constexpr (RecordVi)
+             s.recordViWriteForBranch(ViReg, oldVi);
++    }
++
++    static inline void resetZeroRegs(VU1Interpreter &s)
++    {
+         s.m_state.vf[0][0] = 0.0f;
+         s.m_state.vf[0][1] = 0.0f;
+         s.m_state.vf[0][2] = 0.0f;
+@@ -414,16 +447,166 @@ struct Vu1Aot
+         s.m_state.vi[0] = 0;
+     }
+ 
++    // One plain pair of a tight-loop run (run() in ps2_vu1_core.cpp), with its words and plan as constants.
++    template <uint16_t UId, uint32_t Upper, uint16_t LId, uint32_t Lower, uint8_t ViReg, bool RecordVi>
++    [[gnu::always_inline]] static inline void pair(VU1Interpreter &s, Vu1AotRun &r, uint32_t k)
++    {
++        const uint64_t issue = s.m_fastStart + r.issue[k];
++        if (s.m_nextCommitCycle <= issue)
++            s.fastAdvanceTo(issue);
++        else
++            s.m_cycle = issue;
++        const int32_t oldVi = s.m_state.vi[ViReg];
++        upper<UId, Upper>(s, r, k);
++        lower<LId, Lower, Upper>(s, r);
++        afterOps<ViReg, RecordVi>(s, oldVi);
++        resetZeroRegs(s);
++    }
++
++    // finishPair() in run(): PC, branch delay and E/D/T bits; true when the program ends.
++    template <uint8_t Kind>
++    [[gnu::always_inline]] static inline bool finish(VU1Interpreter &s, Vu1AotRun &r)
++    {
++        resetZeroRegs(s);
++        uint32_t nextPc = s.m_state.pc + 8u;
++        if (nextPc >= r.codeSize)
++            nextPc = 0u;
++        s.m_state.pc = nextPc;
++        if (s.m_state.branchPending)
++        {
++            if (s.m_state.branchDelay == 0u)
++            {
++                s.m_state.pc = s.m_state.branchTarget & s.microAddressMask();
++                s.m_state.branchPending = false;
++            }
++            else
++                --s.m_state.branchDelay;
++        }
++        const bool dHalt = (Kind & kAotD) != 0u && s.m_state.dBitEnabled;
++        const bool tHalt = (Kind & kAotT) != 0u && s.m_state.tBitEnabled;
++        const bool haltBit = dHalt || tHalt;
++        const bool haltBranch = haltBit && (Kind & kAotBranch) != 0u;
++        if (s.m_state.haltAfterDelaySlot)
++        {
++            s.m_state.stoppedByD = s.m_pendingHaltD;
++            s.m_state.stoppedByT = s.m_pendingHaltT;
++            return true;
++        }
++        if (s.m_state.ebit)
++            return true;
++        if (haltBit && !haltBranch)
++        {
++            s.m_state.stoppedByD = dHalt;
++            s.m_state.stoppedByT = tHalt;
++            return true;
++        }
++        if constexpr ((Kind & kAotE) != 0u)
++            s.m_state.ebit = true;
++        else if (haltBranch)
++        {
++            s.m_state.haltAfterDelaySlot = true;
++            s.m_pendingHaltD = dHalt;
++            s.m_pendingHaltT = tHalt;
++        }
++        return false;
++    }
++
++    enum : int
++    {
++        kStepNext,  // pair k ran
++        kStepLeave, // the block must be left before pair k (budget, XGKICK while PATH1 is busy): run() does it
++        kStepEnded, // pair k ran and ended the program
++    };
++
++    // The generic block step of run() for pair k. The state is synchronized up to the pair before it (sync()).
++    template <uint16_t UId, uint32_t Upper, uint16_t LId, uint32_t Lower, uint8_t ViReg, bool RecordVi,
++              uint8_t ShadowReg, uint8_t Kind>
++    [[gnu::always_inline]] static inline int step(VU1Interpreter &s, Vu1AotRun &r, uint32_t k)
++    {
++        const uint64_t issue = s.m_fastStart + r.issue[k];
++        if (issue >= r.budgetEnd)
++            return kStepLeave;
++        s.fastAdvanceTo(issue);
++        if constexpr ((Kind & kAotXgkick) != 0u)
++        {
++            s.catchUpXgkick(s.m_cycle);
++            if (s.m_xgkick.active)
++                return kStepLeave; // the stall depends on the packet; let the interpreter wait
++        }
++        const int32_t oldVi = s.m_state.vi[ViReg];
++        if constexpr ((Upper & 0x80000000u) != 0u || ShadowReg == 0u)
++        {
++            upper<UId, Upper>(s, r, k);
++            lower<LId, Lower, Upper>(s, r);
++        }
++        else
++        {
++            // The lower op reads (or writes) the upper's VF destination: it sees the old value.
++            float oldVf[4], upperVf[4];
++            std::memcpy(oldVf, s.m_state.vf[ShadowReg], sizeof(oldVf));
++            upper<UId, Upper>(s, r, k);
++            std::memcpy(upperVf, s.m_state.vf[ShadowReg], sizeof(upperVf));
++            std::memcpy(s.m_state.vf[ShadowReg], oldVf, sizeof(oldVf));
++            lower<LId, Lower, Upper>(s, r);
++            std::memcpy(s.m_state.vf[ShadowReg], upperVf, sizeof(upperVf));
++        }
++        afterOps<ViReg, RecordVi>(s, oldVi);
++        const bool ended = finish<Kind>(s, r);
++        s.fastAdvanceTo(issue + 1u);
++        s.m_state.cycles = s.m_cycle;
++        s.m_fastIndex = k + 1u;
++        return ended ? kStepEnded : kStepNext;
++    }
++
+     static bool stopped(const VU1Interpreter &s) { return s.m_stopRequested; }
+ 
+-    // End of a run that stopped before pair k, as after the tight loop.
+-    static inline bool end(VU1Interpreter &s, Vu1AotRun &r, uint32_t k)
++    // The state after a tight-loop run that stopped before pair k.
++    static inline void sync(VU1Interpreter &s, Vu1AotRun &r, uint32_t k)
+     {
+         s.m_state.pc = (r.startPair + k) * 8u;
+         s.fastAdvanceTo(s.m_fastStart + r.issue[k - 1u] + 1u);
+         s.m_state.cycles = s.m_cycle;
+         s.m_fastIndex = k;
+-        return true;
++    }
++
++    static inline int stop(VU1Interpreter &s, Vu1AotRun &r, uint32_t k)
++    {
++        sync(s, r, k);
++        return kAotStop;
++    }
++
++    // leaveBlock() in run() without the flag check: elided flag writes still visible are queued, then
++    // exitFastBlock().
++    static void leave(VU1Interpreter &s, FlagElision &e)
++    {
++        if (e.count != 0u)
++        {
++            for (uint32_t n = e.count > 8u ? e.count - 8u : 0u; n < e.count; ++n)
++            {
++                const FlagElision::Write &write = e.writes[n & 7u];
++                if (write.nextReady > s.m_cycle)
++                    queueFlags(s, write.issue, write.laneFlags, write.dest, write.sticky);
++            }
++            e.count = 0u;
++            e.stickyCarry = 0u;
++            s.commitReadyPipelines(); // a write ready by now must be visible to the interpreter's next pair
++        }
++        s.exitFastBlock();
++    }
++
++    // After the generic step of pair k: the block is left when the program ended, the block is over or the PC
++    // left it, as in run().
++    static inline int after(VU1Interpreter &s, Vu1AotRun &r, int step, uint32_t k, uint32_t pairs)
++    {
++        if (step == kStepLeave)
++            return kAotStop;
++        if (step == kStepEnded || k + 1u == pairs || s.m_state.pc != (r.startPair + k + 1u) * 8u)
++        {
++            r.pairsDone += s.m_fastIndex;
++            leave(s, *r.flags);
++            return step == kStepEnded ? kAotEnded : kAotDone;
++        }
++        return -1; // go on
+     }
+ };
+ 
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -346,9 +346,11 @@ namespace
+         return !iBit && opHi >= 0x14u && opHi <= 0x1Bu && opHi != 0x15u;
+     }
+ 
+-    // The generated code for the block at startPair, if a generated block has the same image, start, words and
+-    // pair plans. Anything else keeps the tight loop and is reported once.
+-    Vu1AotFn bindAot(const DirectIds &ids, const uint8_t *code, uint32_t startPair, uint32_t pairCount)
++    // The generated code for the block at startPair, if a generated block has the same image, start, words,
++    // pair plans and generic-step facts (`facts(pair, shadowReg, kind)`). Anything else keeps the fast-block
++    // executor and is reported once.
++    template <class Facts>
++    Vu1AotFn bindAot(const DirectIds &ids, const uint8_t *code, uint32_t startPair, uint32_t pairCount, Facts &&facts)
+     {
+         const uint32_t pc = startPair * 8u;
+         for (uint32_t b = 0; b < g_aotBlockCount; ++b)
+@@ -364,6 +366,9 @@ namespace
+                 same = info.lower == plan.lower && info.upper == plan.upper && info.upperId == plan.upperId &&
+                        info.lowerId == plan.lowerId && info.viReg == plan.viReg && info.plain == plan.plain &&
+                        info.recordVi == plan.recordVi;
++                uint8_t shadowReg = 0, kind = 0;
++                facts(startPair + k, shadowReg, kind);
++                same = same && info.shadowReg == shadowReg && info.kind == kind;
+             }
+             if (same)
+                 return block.fn;
+@@ -2418,7 +2423,16 @@ const VU1Interpreter::FastBlock *VU1Interpreter::buildFastBlock(uint32_t startPa
+         {
+             if (ids.aot.size() != m_cachedPairCount)
+                 ids.aot.assign(m_cachedPairCount, nullptr);
+-            ids.aot[startPair] = bindAot(ids, m_cachedCodeCopy.data(), startPair, block->pairCount);
++            ids.aot[startPair] = bindAot(ids, m_cachedCodeCopy.data(), startPair, block->pairCount,
++                                         [this](uint32_t pair, uint8_t &shadowReg, uint8_t &kind)
++                                         {
++                                             const DecodedInstructionPair &d = m_decodedCodeCache[pair];
++                                             shadowReg = d.upperVfShadowReg;
++                                             kind = static_cast<uint8_t>(
++                                                 (d.lowerUsage.pipeline == PipelineXgkick ? kAotXgkick : 0u) |
++                                                 (d.lowerUsage.pipeline == PipelineBranch ? kAotBranch : 0u) |
++                                                 (d.eBit ? kAotE : 0u) | (d.dBit ? kAotD : 0u) | (d.tBit ? kAotT : 0u));
++                                         });
+         }
+     }
+ 
+@@ -2760,10 +2774,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             shadow.pending.clear();
+             compareFlags("exit-drained", mac, status, clip, shadow.mac, shadow.status, shadow.clip);
+         }
+-        else if (elision.count != 0u)
++        else
+         {
+-            queueVisibleElided(false);
+-            commitReadyPipelines(); // a write ready by now must be visible to the interpreter's next pair
++            Vu1Aot::leave(*this, elision);
++            return;
+         }
+         exitFastBlock();
+     };
+@@ -2914,6 +2928,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         return ended;
+     };
+ 
++    uint64_t fastPairsDone = 0; // pairs run on the fast-block path, for PS2X_VU_AOT_VERIFY
++
+     // Tight loop (#37): a run of plain pairs, never the block's last one (the delay slot or the cut). The
+     // generic step below would find no budget/XGKICK leave, no branch, PC jump or program end, and its
+     // commit after a pair is repeated by the commit before the next one, so only that one is kept.
+@@ -2972,6 +2988,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         fastAdvanceTo(m_fastStart + block.issue[k - 1u] + 1u);
+         m_state.cycles = m_cycle;
+         m_fastIndex = k;
++        fastPairsDone += k - first;
+         if (stats)
+         {
+             vuStats().fastPairs += k - first;
+@@ -2981,8 +2998,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         }
+     };
+ 
+-    // Generated runs (#40) replace tightLoop() pair for pair, with the words and plans as constants. Off under
+-    // PS2X_VU_FLAG_CHECK (its shadow lives in tightLoop); PS2X_VU_AOT_VERIFY checks them against tightLoop().
++    // Generated blocks (#40, #41) run a whole fast block from its first pair: the tight-loop runs and the generic
++    // block step, with the words and plans as constants. Off under PS2X_VU_FLAG_CHECK (its shadow lives in
++    // tightLoop and the generic step); PS2X_VU_AOT_VERIFY checks them against those.
+     const bool aotPath = directPath && !shadowActive && g_aotBlockCount != 0u;
+     struct AotSnapshot
+     {
+@@ -2999,6 +3017,13 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         uint8_t backupReg;
+         bool backupValid, stop;
+         FlagElision elision;
++        const FastBlock *fastBlock;
++        uint64_t fastStart, regReadyMax;
++        std::array<std::array<uint64_t, 4>, 32> vfReady;
++        std::array<uint64_t, 16> viReady;
++        std::array<uint64_t, 4> accReady;
++        std::array<uint64_t, 32> vfRegReadyMax;
++        uint32_t pendingMasks;
+     };
+     auto takeSnapshot = [&](AotSnapshot &x)
+     {
+@@ -3029,6 +3054,14 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         x.backupValid = m_viBranchBackupValid;
+         x.stop = m_stopRequested;
+         x.elision = elision;
++        x.fastBlock = m_fastBlock;
++        x.fastStart = m_fastStart;
++        x.regReadyMax = m_regReadyMax;
++        x.vfReady = m_vfReady;
++        x.viReady = m_viReady;
++        x.accReady = m_accReady;
++        x.vfRegReadyMax = m_vfRegReadyMax;
++        x.pendingMasks = m_vfMask | m_viMask << 16 | m_accMask << 24;
+     };
+     auto putSnapshot = [&](const AotSnapshot &x)
+     {
+@@ -3059,6 +3092,13 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         m_viBranchBackupValid = x.backupValid;
+         m_stopRequested = x.stop;
+         elision = x.elision;
++        m_fastBlock = x.fastBlock;
++        m_fastStart = x.fastStart;
++        m_regReadyMax = x.regReadyMax;
++        m_vfReady = x.vfReady;
++        m_viReady = x.viReady;
++        m_accReady = x.accReady;
++        m_vfRegReadyMax = x.vfRegReadyMax;
+     };
+     // Differences between a snapshot taken after the generated run and the current (tightLoop) state, as a list
+     // of names; empty when they match.
+@@ -3116,62 +3156,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                 a.state.branchDelay == b.state.branchDelay && a.fastIndex == b.fastIndex &&
+                 a.currentUpper == b.currentUpper && a.backupValid == b.backupValid &&
+                 (!a.backupValid || (a.backupValue == b.backupValue && a.backupReg == b.backupReg)) &&
+-                a.stop == b.stop && a.storeMask == b.storeMask,
++                a.stop == b.stop && a.storeMask == b.storeMask && a.fastBlock == b.fastBlock &&
++                (!a.fastBlock || a.fastStart == b.fastStart) && a.pendingMasks == b.pendingMasks,
+             "other");
++        add(a.regReadyMax == b.regReadyMax && same(a.vfReady, b.vfReady) && same(a.viReady, b.viReady) &&
++                same(a.accReady, b.accReady) && same(a.vfRegReadyMax, b.vfRegReadyMax),
++            "ready");
+     };
+-    std::vector<uint8_t> aotScratch; // PS2X_VU_AOT_VERIFY: VU data the generated run writes
+-    std::vector<uint8_t> aotPacket;  // and the PATH1 bytes it copied
+-    // Runs the generated run on a scratch copy of VU data with PATH1 submission off, keeps its result, restores
+-    // the state, runs tightLoop() for real and compares. Returns false (nothing ran) when `aot` has no run here.
+-    auto verifyAot = [&](Vu1AotFn aot, Vu1AotRun &aotRun, uint32_t first) -> bool
+-    {
+-        AotSnapshot before;
+-        takeSnapshot(before);
+-        aotScratch.assign(vuData, vuData + dataSize);
+-        m_activeVuData = aotScratch.data();
+-        m_activeGs = nullptr;
+-        m_activeMemory = nullptr;
+-        aotRun.vuData = aotScratch.data();
+-        const bool ran = aot(*this, aotRun, first);
+-        m_activeVuData = vuData;
+-        m_activeGs = &gs;
+-        m_activeMemory = memory;
+-        if (!ran)
+-            return false;
+-        AotSnapshot after;
+-        takeSnapshot(after);
+-        const uint32_t from = std::min(before.xCopied, m_xgkick.copiedBytes);
+-        aotPacket.assign(m_xgkick.packet.begin() + from, m_xgkick.packet.begin() + m_xgkick.copiedBytes);
+-        putSnapshot(before);
+-        tightLoop();
+-        std::string diff;
+-        diffSnapshot(after, diff);
+-        if (std::memcmp(aotScratch.data(), vuData, dataSize) != 0)
+-            diff += diff.empty() ? "stores" : " stores";
+-        if (m_xgkick.copiedBytes != after.xCopied ||
+-            std::memcmp(aotPacket.data(), m_xgkick.packet.data() + from, aotPacket.size()) != 0)
+-            diff += diff.empty() ? "packet" : " packet";
+-        AotVerifyStats &v = g_aotVerifyStats;
+-        ++v.checks;
+-        if (!diff.empty())
+-        {
+-            const uint32_t pc = (m_fastBlock->startPair + first) * 8u;
+-            ++v.byPc[pc];
+-            if (++v.mismatches <= 32u)
+-                std::fprintf(stderr, "[vu1:aot-verify] mismatch: run at 0x%04x (block 0x%04x) pairs %u-%u: %s\n", pc,
+-                             m_fastBlock->startPair * 8u, first, m_fastIndex - 1u, diff.c_str());
+-        }
+-        if ((v.checks & 0xFFFFFu) == 0u)
+-            printAotVerifyStats(); // test mode leaves with _Exit, so report as we go
+-        return true;
+-    };
+-
+-    while (m_cycle < budgetEnd && !m_stopRequested)
++    // The loop top of run(): commit, then enter a fast block when none is active. True: run() stops.
++    auto loopTop = [&]() -> bool
+     {
+         commitReadyPipelines();
+         if (m_state.pc + 8u > codeSize)
+-            break;
+-
++            return true;
+         if (!m_fastBlock && tryEnterFastBlock(budgetEnd))
+         {
+             onBlockEnter();
+@@ -3182,35 +3179,18 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                     ++vuStats().current->blocks;
+             }
+         }
++        return false;
++    };
++
++    // The rest of one loop iteration: a tight-loop run, the generic block step or an interpreter pair.
++    // True: run() stops.
++    auto stepBody = [&]() -> bool
++    {
+         if (m_fastBlock && directPath && !m_state.ebit && m_fastIndex + 1u < m_fastBlock->pairCount &&
+             directIds->plan[m_fastBlock->startPair + m_fastIndex].plain)
+         {
+-            // A run of plain pairs: the generated code of this block when it has one (#40), else tightLoop().
+-            const Vu1AotFn aot = aotPath && directIds->aot.size() == m_cachedPairCount
+-                                     ? directIds->aot[m_fastBlock->startPair]
+-                                     : nullptr;
+-            if (aot)
+-            {
+-                const uint32_t first = m_fastIndex;
+-                Vu1AotRun aotRun{m_fastBlock->issue.data(), m_fastBlock->startPair, &elision, vuData, dataSize};
+-                if (g_aotVerify ? verifyAot(aot, aotRun, first) : aot(*this, aotRun, first))
+-                {
+-                    if (stats)
+-                    {
+-                        const uint32_t ran = m_fastIndex - first;
+-                        vuStats().aotPairs += ran;
+-                        if (!g_aotVerify) // tightLoop() counted them
+-                        {
+-                            vuStats().fastPairs += ran;
+-                            if (vuStats().current)
+-                                vuStats().current->fastPairs += ran;
+-                        }
+-                    }
+-                    continue;
+-                }
+-            }
+             tightLoop();
+-            continue;
++            return false;
+         }
+         if (m_fastBlock)
+         {
+@@ -3258,6 +3238,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                 fastAdvanceTo(issue + 1u);
+                 m_state.cycles = m_cycle;
+                 ++m_fastIndex;
++                ++fastPairsDone;
+                 if (stats)
+                 {
+                     ++vuStats().fastPairs;
+@@ -3267,9 +3248,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                 if (programEnded || m_fastIndex == block.pairCount ||
+                     m_state.pc != (block.startPair + m_fastIndex) * 8u)
+                     leaveBlock();
+-                if (programEnded)
+-                    break;
+-                continue;
++                return programEnded;
+             }
+         }
+ 
+@@ -3280,7 +3259,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
+         {
+             reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
+-            break;
++            return true;
+         }
+ 
+         uint64_t readyCycle = calculatePairReadyCycle(decoded);
+@@ -3295,7 +3274,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             readyCycle = calculatePairReadyCycle(decoded);
+         }
+         if (m_cycle >= budgetEnd)
+-            break;
++            return true;
+ 
+         const uint32_t viWriteBits = decoded.lowerUsage.viWrite & 0xFFFEu;
+         const uint8_t writtenVi = viWriteBits != 0u ? static_cast<uint8_t>(std::countr_zero(viWriteBits)) : 0u;
+@@ -3374,7 +3353,130 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         }
+         programEnded = finishPair(decoded);
+         advanceOneCycle();
+-        if (programEnded)
++        return programEnded;
++    };
++
++// The generated code of the block just entered, if any.
++auto aotFor = [&]() -> Vu1AotFn
++{
++    if (!aotPath || !m_fastBlock || m_fastIndex != 0u || m_state.ebit || directIds->aot.size() != m_cachedPairCount)
++        return nullptr;
++    return directIds->aot[m_fastBlock->startPair];
++    };
++
++    // Where the generated code and run()'s own steps may legitimately differ after the same pairs, bring the state
++    // to the point both reach next anyway: the loop top's commit with no block, or the XGKICK pair's PATH1
++    // catch-up the generated code did before leaving the block there.
++    auto normalizeForVerify = [&]()
++    {
++        if (m_stopRequested)
++            return;
++        if (!m_fastBlock)
++        {
++            commitReadyPipelines();
++            return;
++        }
++        const uint32_t pair = m_fastBlock->startPair + m_fastIndex;
++        const uint64_t issue = m_fastStart + m_fastBlock->issue[m_fastIndex];
++        if (m_decodedCodeCache[pair].lowerUsage.pipeline == PipelineXgkick && issue < budgetEnd)
++        {
++            fastAdvanceTo(issue);
++            catchUpXgkick(m_cycle);
++        }
++    };
++
++    std::vector<uint8_t> aotScratch; // PS2X_VU_AOT_VERIFY: VU data the generated code writes
++    std::vector<uint8_t> aotPacket;  // and the PATH1 bytes it copied
++    // Runs the generated code on a scratch copy of VU data with PATH1 submission off, keeps its result, restores
++    // the state, runs run()'s own steps for the same number of fast-block pairs for real and compares.
++    // True: run() stops.
++    auto verifyAot = [&](Vu1AotFn aot, Vu1AotRun &aotRun) -> bool
++    {
++        AotSnapshot before;
++        takeSnapshot(before);
++        const uint32_t startPc = m_fastBlock->startPair * 8u;
++        aotScratch.assign(vuData, vuData + dataSize);
++        m_activeVuData = aotScratch.data();
++        m_activeGs = nullptr;
++        m_activeMemory = nullptr;
++        aotRun.vuData = aotScratch.data();
++        const int status = aot(*this, aotRun);
++        const uint64_t pairs = aotRun.pairsDone + (m_fastBlock ? m_fastIndex : 0u);
++        normalizeForVerify();
++        m_activeVuData = vuData;
++        m_activeGs = &gs;
++        m_activeMemory = memory;
++        AotSnapshot after;
++        takeSnapshot(after);
++        const uint32_t from = std::min(before.xCopied, m_xgkick.copiedBytes);
++        aotPacket.assign(m_xgkick.packet.begin() + from, m_xgkick.packet.begin() + m_xgkick.copiedBytes);
++        putSnapshot(before);
++
++        const uint64_t target = fastPairsDone + pairs;
++        bool stop = false;
++        while (!stop && fastPairsDone < target && m_cycle < budgetEnd && !m_stopRequested)
++            stop = loopTop() || stepBody();
++        if (!stop)
++            normalizeForVerify();
++        std::string diff;
++        diffSnapshot(after, diff);
++        if (std::memcmp(aotScratch.data(), vuData, dataSize) != 0)
++            diff += diff.empty() ? "stores" : " stores";
++        if (m_xgkick.copiedBytes != after.xCopied ||
++            std::memcmp(aotPacket.data(), m_xgkick.packet.data() + from, aotPacket.size()) != 0)
++            diff += diff.empty() ? "packet" : " packet";
++        if (stop != (status == kAotEnded) && !m_stopRequested)
++            diff += diff.empty() ? "ended" : " ended";
++        AotVerifyStats &v = g_aotVerifyStats;
++        ++v.checks;
++        if (!diff.empty())
++        {
++            ++v.byPc[startPc];
++            if (++v.mismatches <= 32u)
++                std::fprintf(stderr, "[vu1:aot-verify] mismatch: entry 0x%04x, %llu pairs, status %d: %s\n", startPc,
++                             static_cast<unsigned long long>(pairs), status, diff.c_str());
++        }
++        if ((v.checks & 0xFFFFFu) == 0u)
++            printAotVerifyStats(); // test mode leaves with _Exit, so report as we go
++        return stop;
++    };
++
++    while (m_cycle < budgetEnd && !m_stopRequested)
++    {
++        if (loopTop())
++            break;
++        if (const Vu1AotFn aot = aotFor())
++        {
++            Vu1AotRun aotRun{m_fastBlock->issue.data(), m_fastBlock->startPair, &elision, vuData, dataSize, codeSize,
++                             budgetEnd};
++            const uint64_t before = fastPairsDone;
++            if (g_aotVerify)
++            {
++                const bool stop = verifyAot(aot, aotRun);
++                if (stats)
++                    vuStats().aotPairs += fastPairsDone - before; // the steps counted them as fast pairs
++                if (stop)
++                    break;
++                continue;
++            }
++            const int status = aot(*this, aotRun);
++            const uint64_t ran = aotRun.pairsDone + (m_fastBlock ? m_fastIndex : 0u);
++            fastPairsDone += ran;
++            if (stats)
++            {
++                vuStats().aotPairs += ran;
++                vuStats().fastPairs += ran;
++                if (vuStats().current)
++                    vuStats().current->fastPairs += ran;
++            }
++            if (status == kAotEnded)
++            {
++                programEnded = true;
++                break;
++            }
++            continue;
++        }
++        if (stepBody())
+             break;
+     }
+     if (m_fastBlock)

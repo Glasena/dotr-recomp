@@ -6,11 +6,12 @@ refusals). This script splits every captured block start the way buildFastBlock 
 after the delay slot of a branch or E bit, at 256 pairs or at the end of the image), checks the pair count against
 the capture and prints blocks, pairs, ops by kind, flag readers, XGKICKs and branches.
 
-With --emit OUT_DIR it writes OUT_DIR/vu1_aot.cpp (#40): per block, the tight-loop runs of the runtime's fast-block
-executor (run() in ps2_vu1_core.cpp) as straight-line calls to Vu1Aot::pair<> (src/lib/vu/ps2_vu1_aot.h) with
-the words, handler ids and VI plans as constants, and a table keyed by (image hash, start pc). The runtime uses a
-block only when its words and per-pair plans (DirectIds::Plan) equal what is written here. Build it in with
-cmake -DPS2X_VU1_AOT_DIR=OUT_DIR.
+With --emit OUT_DIR it writes OUT_DIR/vu1_aot.cpp (#40, #41): one function per block that runs the whole fast block
+the way run() in ps2_vu1_core.cpp would (plain pairs as in the tight loop, the others and the last pair through the
+generic block step, then the block exit) as calls to Vu1Aot (src/lib/vu/ps2_vu1_aot.h) with the words, handler ids,
+VI plans, shadow registers and pair kinds as constants, and a table keyed by (image hash, start pc). The runtime uses
+a block only when its words, per-pair plans (DirectIds::Plan) and generic-step facts equal what is written here.
+Build it in with cmake -DPS2X_VU1_AOT_DIR=OUT_DIR.
 
 usage: vu1_gen.py [CAPTURE_DIR] [--emit OUT_DIR]   (default ../dotr/vu1)
        vu1_gen.py --self-test"""
@@ -189,26 +190,39 @@ def lower_usage(lower):
 
 
 def plan(d):
-    """DirectIds::Plan of a decoded pair: upperId, lowerId, viReg, plain, recordVi."""
+    """DirectIds::Plan of a decoded pair: upperId, lowerId, viReg, plain, recordVi, plus the generic-step facts the
+    runtime also checks: upper VF shadow register and kind bits (kAotXgkick 1, kAotBranch 2, E 4, D 8, T 16)."""
     reads, write, vi, delays = (set(), 0, 0, False) if d['ibit'] else lower_usage(d['lower'])
     up = upper_vf_write(d['upper'])
-    shadow = up != 0 and (up in reads or write == up)
+    shadow = up if up != 0 and (up in reads or write == up) else 0
     vi_reg = (vi & -vi).bit_length() - 1 if vi else 0
-    plain = not (d['branch'] or d['lo'] == 'XGKICK' or d['ebit'] or d['dbit'] or d['tbit'] or shadow)
-    return upper_id(d['upper']), lower_id(d['lower'], d['ibit']), vi_reg, plain, vi_reg != 0 and delays
+    xgkick = not d['ibit'] and d['lo'] == 'XGKICK'
+    plain = not (d['branch'] or xgkick or d['ebit'] or d['dbit'] or d['tbit'] or shadow)
+    kind = xgkick | d['branch'] << 1 | d['ebit'] << 2 | d['dbit'] << 3 | d['tbit'] << 4
+    return upper_id(d['upper']), lower_id(d['lower'], d['ibit']), vi_reg, plain, vi_reg != 0 and delays, shadow, kind
 
 
-def tight_runs(plans):
-    """The tight-loop runs of a block: (first, end) for each run that can start where the block step arrives."""
-    last = len(plans) - 1
-    runs = []
-    for k in range(last):
-        if plans[k][3] and (k == 0 or not plans[k - 1][3]):
-            e = k + 1
-            while e < last and plans[e][3]:
-                e += 1
-            runs.append((k, e))
-    return runs
+def block_body(pairs, plans):
+    """Statements of a generated block function (Vu1Aot in ps2_vu1_aot.h): plain pairs as in the tight loop,
+    the others and the last pair through the generic block step."""
+    lines, last, synced = [], len(pairs) - 1, True
+    for k, (d, p) in enumerate(zip(pairs, plans)):
+        ops = f'0x{p[0]:x}, 0x{d["upper"]:08x}u, 0x{p[1]:x}, 0x{d["lower"]:08x}u, {p[2]}, {str(p[4]).lower()}'
+        if p[3] and k != last:
+            lines.append(f'    A::pair<{ops}>(v, r, {k});')
+            lines.append(f'    if (A::stopped(v)) return A::stop(v, r, {k + 1});')
+            synced = False
+            continue
+        if not synced:
+            lines.append(f'    A::sync(v, r, {k});')
+        step = f'A::after(v, r, A::step<{ops}, {p[5]}, {p[6]}>(v, r, {k}), {k}, {len(pairs)})'
+        if k == last:
+            lines.append(f'    return {step};')
+        else:
+            lines.append(f'    if ((st = {step}) >= 0) return st;')
+            lines.append('    if (A::stopped(v)) return kAotStop;')
+        synced = True
+    return lines
 
 
 def emit(capture_dir, out_dir):
@@ -217,29 +231,14 @@ def emit(capture_dir, out_dir):
         for pc in sorted(blocks):
             pairs = split_block(image, pc // 8)
             plans = [plan(d) for d in pairs]
-            runs = tight_runs(plans)
             name = f'b_{h}_{pc:04x}'
             info = ', '.join(f'{{0x{d["lower"]:08x}u, 0x{d["upper"]:08x}u, 0x{p[0]:x}, 0x{p[1]:x}, {p[2]}, '
-                             f'{str(p[3]).lower()}, {str(p[4]).lower()}}}' for d, p in zip(pairs, plans))
+                             f'{str(p[3]).lower()}, {str(p[4]).lower()}, {p[5]}, {p[6]}}}' for d, p in zip(pairs, plans))
             body.append(f'const Vu1AotPair {name}_info[] = {{{info}}};')
-            fn = 'nullptr'
-            if runs:
-                fn = name
-                lines = [f'bool {name}(VU1Interpreter &v, Vu1AotRun &r, uint32_t first)', '{',
-                         '    switch (first)', '    {']
-                for first, end in runs:
-                    lines.append(f'    case {first}:')
-                    for k in range(first, end):
-                        d, p = pairs[k], plans[k]
-                        lines.append(f'        A::pair<0x{p[0]:x}, 0x{d["upper"]:08x}u, 0x{p[1]:x}, 0x{d["lower"]:08x}u, '
-                                     f'{p[2]}, {str(p[4]).lower()}>(v, r, {k});')
-                        if k + 1 < end:
-                            lines.append(f'        if (A::stopped(v)) return A::end(v, r, {k + 1});')
-                    lines.append(f'        return A::end(v, r, {end});')
-                lines += ['    default:', '        return false;', '    }', '}']
-                body.append('\n'.join(lines))
+            body.append('\n'.join([f'int {name}(VU1Interpreter &v, Vu1AotRun &r)', '{', '    [[maybe_unused]] int st;'] +
+                                  block_body(pairs, plans) + ['}']))
             key = fnv1a(image[pc:pc + 8 * len(pairs)], pc // 8)
-            table.append(f'    {{0x{h}ull, 0x{pc:04x}u, {len(pairs)}u, 0x{key:016x}ull, {name}_info, {fn}}},')
+            table.append(f'    {{0x{h}ull, 0x{pc:04x}u, {len(pairs)}u, 0x{key:016x}ull, {name}_info, {name}}},')
     os.makedirs(out_dir, exist_ok=True)
     text = '\n'.join([
         '// Generated by dotr-recomp tools/vu1_gen.py from a PS2X_VU1_CAPTURE directory. Game data: not for git.',
@@ -311,9 +310,14 @@ def self_test():
     add_vf2 = (0xF << 21) | (2 << 6) | 0x28
     image = struct.pack('<8I', iaddi, nop_upper, move, add_vf2, b_op, nop_upper, 0, nop_upper)
     plans = [plan(d) for d in split_block(image, 0)]
-    assert [p[2:] for p in plans] == [(1, True, True), (0, False, False), (0, False, False), (0, True, False)]
+    assert [p[2:] for p in plans] == [(1, True, True, 0, 0), (0, False, False, 2, 0), (0, False, False, 0, 2),
+                                      (0, True, False, 0, 0)]
     assert plans[1][:2] == (0x28, 0x170) and plans[0][1] == 0x132
-    assert tight_runs(plans) == [(0, 1)] and tight_runs([plans[0], plans[0], plans[1], plans[0], plans[0]]) == [(0, 2), (3, 4)]
+    body = block_body(split_block(image, 0), plans)
+    assert [l.split('<')[0].strip() for l in body] == [
+        'A::pair', 'if (A::stopped(v)) return A::stop(v, r, 1);', 'A::sync(v, r, 1);', 'if ((st = A::after(v, r, A::step',
+        'if (A::stopped(v)) return kAotStop;', 'if ((st = A::after(v, r, A::step', 'if (A::stopped(v)) return kAotStop;',
+        'return A::after(v, r, A::step'], body
     print('self-test ok')
 
 
