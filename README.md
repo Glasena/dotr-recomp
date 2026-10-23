@@ -122,7 +122,8 @@ ctest --test-dir ../PS2Recomp/out/build-vu1diff/ps2xTest -R vu1_diff --output-on
 #     FETCHCONTENT_SOURCE_DIR_PARALLEL_GS, CMake clones the same commit into the build directory at configure time.
 #     Only the new backend, ps2_runtime.cpp and parallel-gs itself compile (+~1 min, +42 MB binary). Selected at
 #     run time with PS2X_GS_BACKEND=pgs (headless scanout readback only, no on-screen interop yet); the CPU GS
-#     stays the default and the reference. Compare with tools/imgdiff.sh.
+#     stays the default and the reference. Compare with tools/imgdiff.sh in cross mode (pgs dithers and blends
+#     both CRTC circuits like the hardware; the CPU GS does not yet, #53).
 git clone https://github.com/Arntzen-Software/parallel-gs.git ../deps/src/parallel-gs
 git -C ../deps/src/parallel-gs checkout 3a66c1976170cbc2cb53a3593fabbc7c4b2ccfbd
 git -C ../deps/src/parallel-gs submodule update --init --recursive
@@ -130,7 +131,7 @@ cmake -DPS2X_ENABLE_PARALLEL_GS=ON -DFETCHCONTENT_SOURCE_DIR_PARALLEL_GS="$(real
   ../PS2Recomp/out/build-runtime
 cmake --build ../PS2Recomp/out/build-runtime --target ps2EntryRunner
 PS2X_GS_BACKEND=pgs PS2X_DUMP_DIR="$(realpath ../dotr)/test_pgs" tools/test_run.sh
-for f in 1200 1500 1700; do tools/imgdiff.sh ../dotr/test/frame_$f.png ../dotr/test_pgs/frame_$f.png; done
+for f in 1200 1500 1700; do IMGDIFF_MODE=cross tools/imgdiff.sh ../dotr/test/frame_$f.png ../dotr/test_pgs/frame_$f.png; done
 ```
 
 Rebuild times (12 threads): cold full build ~45 min (~4000 steps, most of it the 762 overlay modules); no change

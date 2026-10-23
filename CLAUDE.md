@@ -387,6 +387,23 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
   pgs VRAM with DTHE forced off, scanned out by the CPU presenter, is byte-identical to the CPU title frame.
   Checked against PCSX2 (`GSDrawScanline` WriteFrame dither, `Expand16To32`, `GSRenderer::Merge`).
   `PS2X_PGS_CPU_SCANOUT=1` (patch 0045) scans pgs VRAM out with the CPU presenter, to split raster from CRTC diffs.
+- Validation (`tools/imgdiff.sh`, gates frozen; `IMGDIFF_MODE=cross` for pgs vs CPU: PSNR/AE on 4x4 box-averaged
+  copies, PSNR>=20, AE(fuzz 10%)<=20%, PHASH<=30; default `same`: PSNR>=35, AE(fuzz 5%)<=1%, PHASH<=30; PHASH is
+  ignored at PSNR>=40 because it explodes on near-black frames). All pass in cross mode: title/menu/NOW LOADING
+  28-36 dB, map 1900/2100/2300 35-46 dB, story 2300/5000 32/29 dB, duel 10000/10500/11000 24.6-25.7 dB (AE <= 12.7%),
+  PHASH <= 12. The calibration pair passes (50.5 dB) and the missing 3D layer fails (7.1 dB, 35%, 315). All scenes
+  are structurally identical by eye, including the Stonehenge and duel 3D. CPU long-script dumps: `../dotr/t51_long_cpu`.
+- Census (`PS2X_PGS_CENSUS=1`, patch 0046; counts per primitive, sample every 60 presents + first sighting):
+  everything is CT16S (menu also CT16) with DTHE=1, Z24 (Z16 in menu/duel bits), TFX=0 modulate with TCC=1 always
+  (one CT32 decal at boot), T8 textures with CT16 CLUT (some CT32 CLUT, T4/CT32, CT16(S) direct), bilinear on 3D,
+  FGE on almost all 3D tristrips, FBA in menu and duel, AA1 linestrips in the duel, ATE GEQUAL, blends 0x44/0x48/
+  0x42/0x88. Never seen: DATE, PABE, points, LOCAL->HOST (one LOCAL->LOCAL at the menu). Map frame: ~12.4k
+  tristrips; duel ~12.8k.
+- Speed (uncapped, this host): map 1900->2300 CPU 14.5-14.8 s / pgs 11.5-11.7 s (27 -> 35 VBlanks/s), GameThread
+  64.3G instr both, cycles 34.5G -> 25.2G. Duel 10000->11000 CPU 57.4 s / pgs 41.0 s (17.4 -> 24.4), 234G/237G
+  instr, cycles 124G -> 96G. pgs Present averages ~11 ms on the game thread in the map (10-12 ms over the whole long
+  script with the census on): vsync 0.2 ms, scanout readback ~1.3 ms, the remaining ~9.7 ms in `gs.flush()` at its
+  start; no FINISH waits. The `[pgs] presents=` line prints these averages every 600 presents.
 
 ## Next steps (2026-10-22)
 Order is tracked with the `priority: N` labels; #13 is pinned on GitHub.
