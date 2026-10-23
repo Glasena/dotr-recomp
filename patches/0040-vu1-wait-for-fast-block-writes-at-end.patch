@@ -1,0 +1,101 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index daa297d..08bddc1 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -3657,6 +3657,22 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+ 
+     if (programEnded)
+     {
++        // A fast block or generated code writes VF/VI/ACC at issue and queues nothing, so flushPipelines() alone
++        // would not wait for a write still in flight (#45). The lane ready cycles equal the ready cycles of the
++        // writes the interpreter queues, so waiting for the last one first gives the same end cycle.
++        if (m_regReadyMax > m_cycle)
++        {
++            uint64_t end = m_cycle;
++            for (uint32_t reg = 1; reg < 32u; ++reg)
++                if (m_vfRegReadyMax[reg] > end)
++                    for (uint32_t c = 0; c < 4u; ++c)
++                        end = std::max(end, m_vfReady[reg][c]);
++            for (uint32_t reg = 1; reg < 16u; ++reg)
++                end = std::max(end, m_viReady[reg]);
++            for (uint32_t c = 0; c < 4u; ++c)
++                end = std::max(end, m_accReady[c]);
++            advanceTo(end);
++        }
+         flushPipelines();
+         m_state.ebit = false;
+         m_state.haltAfterDelaySlot = false;
+diff --git a/ps2xTest/src/ps2_vu1_diff_tests.cpp b/ps2xTest/src/ps2_vu1_diff_tests.cpp
+index b9facd1..dfe4b0d 100644
+--- a/ps2xTest/src/ps2_vu1_diff_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_diff_tests.cpp
+@@ -36,23 +36,6 @@ namespace
+     // Stores go to qwords 0x40..0xFF; loads read 0x00..0xFF. vi10 is the JR/JALR target (always the E pair, so
+     // every jump is forward), vi11 the BAL/JALR link, vi15 the loop counter: random VI writes use vi1..vi9 only.
+ 
+-    // Known engine difference (dotr-recomp #45): when one of the last pairs writes a VF/VI register without a
+-    // flag write (MAX/MINI/ITOF/FTOI/ABS, lower ops), a fast block ends the program 1-3 cycles earlier than the
+-    // interpreter, which waits for that write to land. Only that cycle count may differ; it is reported, not failed.
+-    bool knownEndCycles(const std::string &interp, const std::string &other, int64_t &carried)
+-    {
+-        unsigned pcA, pcB;
+-        unsigned long long cycA, cycB;
+-        char restA[64] = {}, restB[64] = {};
+-        if (std::sscanf(interp.c_str(), "%*d.%*d pc %x cycles %llu %63[^\n]", &pcA, &cycA, restA) != 3 ||
+-            std::sscanf(other.c_str(), "%*d.%*d pc %x cycles %llu %63[^\n]", &pcB, &cycB, restB) != 3 ||
+-            pcA != pcB || std::strcmp(restA, restB) != 0)
+-            return false;
+-        const int64_t delta = static_cast<int64_t>(cycB) - static_cast<int64_t>(cycA) - carried; // cycles add up
+-        carried += delta;
+-        return delta >= -3 && delta <= 0;
+-    }
+-
+     // Known engine differences (dotr-recomp #46): OPMSUB/OPMULA read fs/ft lanes outside their dest, which the
+     // hazard model does not see, so a fast block reads a value the interpreter still has in flight. These
+     // programs may differ in any field; they are reported, not failed.
+@@ -276,11 +259,11 @@ namespace
+         return (lower & ~0x7FFu & ~(0xFu << baseShift)) | (14u << baseShift) | (imm & 0x7FFu);
+     }
+ 
+-    // Programs 0..kFixedCount-1 are fixed code (with random inputs): minimal repros of the known differences.
++    // Programs 0..kFixedCount-1 are fixed code (with random inputs): minimal repros of fixed and known differences.
+     constexpr uint32_t kXgkick = 0x80006EFCu; // XGKICK vi13
+     const std::vector<std::vector<uint32_t>> kFixedPrograms = {
+-        // #45: MINIw.y vf1 in the E bit's delay slot, in a block entered by a branch: the fast block ends the
+-        // program without waiting for the MINI result, 3 cycles before the interpreter.
++        // #45 (fixed): MINIw.y vf1 in the E bit's delay slot, in a block entered by a branch: the fast block ended
++        // the program without waiting for the MINI result, 3 cycles before the interpreter.
+         {0x40000001u, kUpperNop, kLowerNop, kUpperNop, kLowerNop, kUpperNop | kEBit, kLowerNop, 0x00943857u},
+         // #46: ADDx.yz vf1, then OPMSUB.x vf23, vf1, vf6, which reads vf1.y: the interpreter reads the old vf1.y
+         // (its read lanes are taken from dest, x), the fast block the new one.
+@@ -638,21 +621,11 @@ namespace
+                 continue;
+             }
+             std::set<int> known;
+-            int64_t carried = 0;
+-            int carriedProg = -1;
+             for (size_t l = 0; l < ref.state.size(); ++l)
+             {
+                 const int prog = std::atoi(ref.state[l].c_str());
+-                if (prog != carriedProg)
+-                    carried = 0, carriedProg = prog;
+                 if (ref.state[l] == out.state[l])
+                     continue;
+-                if (knownEndCycles(ref.state[l], out.state[l], carried))
+-                {
+-                    if (carried != 0)
+-                        known.insert(prog);
+-                    continue;
+-                }
+                 if (kKnownOpmPrograms.count(prog))
+                 {
+                     known.insert(prog);
+@@ -663,7 +636,7 @@ namespace
+                                 engines[k].name, prog, ref.state[l].c_str(), engines[k].name, out.state[l].c_str());
+             }
+             std::printf("%s vs interpreter: %d programs, %zu differ, %zu more only in known ways "
+-                        "(dotr-recomp #45, #46); fast %.1f%%, generated %.1f%% of pairs\n",
++                        "(dotr-recomp #46); fast %.1f%%, generated %.1f%% of pairs\n",
+                         engines[k].name, count, bad.size(), known.size(), statsPercent(out, "(fast "),
+                         statsPercent(out, "generated "));
+             failures += static_cast<int>(bad.size());

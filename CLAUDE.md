@@ -211,7 +211,7 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   inputs) run once per engine in a child process (the switches are env statics); VF/VI/ACC/Q/P/I/R/flags/pc/
   cycles/data are compared with the interpreter: 10000 programs for the fast block, 120 for the generated code
   (`vu1_gen.py` on a capture of those programs, ~2 min compile). Breaking the flag-elision window (`>=` -> `>`)
-  fails 698 / 5 programs. Known, reported: #45 (end cycles), #46 (OPMSUB lanes), #47 (generated-code hang, skipped).
+  fails 698 / 5 programs. Known, reported: #45 (end cycles, fixed in 0040), #46 (OPMSUB lanes), #47 (generated-code hang, skipped).
   `ps2x_vu1_diff --list P` / `--repro P FILE` print and rerun one program for a minimal repro.
 - Patch 0037 (2026-10-23, #47): generated code that stops before pair 0 (XGKICK while PATH1 busy) is not re-called; `stepBody()`
   runs that pair. `PS2X_VU_AOT_VERIFY` now reports a second call at the same cycle/PC ("no progress") instead of hanging.
@@ -227,6 +227,9 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   instructions 73.6G -> 64.5G (-12.4% for #44), cycles ~37.9G -> ~33.0G, wall ~14.8 -> ~13.9 s. Table handlers
   are now 1.4% of the GameThread (were ~20%). Now: inlined FMAC 22%, IOP 17%, block bodies 14%, block exit/
   transitions 9%, EE code 7.5%, flag commit 5.7%, EE runtime 5.3%, VIF 3.3%, GS 2.8%, PATH1 1.6%.
+- Patch 0040 (2026-10-23, #45): at program end `run()` first advances to the last VF/VI/ACC lane ready cycle (fast
+  blocks and generated code queue no register writes), then flushes. `vu1_diff` drops the end-cycle rule; only #46
+  is left. Interpreter output unchanged; map dumps, default dumps, verify and flag check unchanged; rate +0.1% instr.
 - Patch 0027 (2026-10-22, #35): `perf --call-graph dwarf` found the map/hash share was `IopKernel::beginNextReady`/
   `nextWakeCycle` walking the thread `std::map` on every idle IOP step (~7.5%) and the GIF_STAT lookup in
   `advanceEeTimers` (~2.1%). Kernel caches "nothing ready until cycle W" behind a version bumped by every public
