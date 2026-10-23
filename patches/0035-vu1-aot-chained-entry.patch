@@ -1,0 +1,229 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h b/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
+@@ -7,6 +7,7 @@
+ #include "runtime/ps2_vu1.h"
+ #include "ps2_vu1_detail.h"
+ 
++#include <algorithm>
+ #include <array>
+ #include <bit>
+ #include <cstdint>
+@@ -210,7 +211,9 @@ struct Vu1AotRun
+     uint32_t codeSize = 0;
+     uint64_t budgetEnd = 0;
+     uint64_t pairsDone = 0; // pairs of the blocks the generated code finished and left
+-    const void *ids = nullptr;            // run()'s DirectIds (ps2_vu1_core.cpp)
++    void *ids = nullptr;                  // run()'s DirectIds (ps2_vu1_core.cpp)
++    const void *prev = nullptr;           // the FastBlock just left after running all its pairs, or null
++    uint64_t prevReadyMax = 0;            // m_regReadyMax before that block's exit
+     int (*next)(VU1Interpreter &, Vu1AotRun &) = nullptr; // kAotNext: the generated code of the block entered
+     bool refused = false;                 // kAotDone after tryEnterFastBlock() refused the next block
+ };
+@@ -291,14 +294,30 @@ struct Vu1Aot
+         }
+     }
+ 
+-    // Queues an FMAC flag write issued at `issue` into the real flag pipeline.
+-    static void queueFlags(VU1Interpreter &s, uint64_t issue, const uint8_t laneFlags[4], uint8_t dest,
+-                           uint32_t extraSticky)
++    // Queues an FMAC flag write issued at `issue` into the real flag pipeline, as updateFmacFlags() at that cycle.
++    static inline void queueFlags(VU1Interpreter &s, uint64_t issue, const uint8_t laneFlags[4], uint8_t dest,
++                                  uint32_t extraSticky)
+     {
+-        const uint64_t now = s.m_cycle;
+-        s.m_cycle = issue;
+-        s.updateFmacFlags(laneFlags, dest, extraSticky);
+-        s.m_cycle = now;
++        const uint32_t freeIndex = static_cast<uint32_t>(std::countr_one(s.m_flagMask));
++        if (dest == 0u || freeIndex >= VU1Interpreter::kMaxFlagEntries)
++        {
++            const uint64_t now = s.m_cycle; // nothing to queue, or the pipeline is full (reported there)
++            s.m_cycle = issue;
++            s.updateFmacFlags(laneFlags, dest, extraSticky);
++            s.m_cycle = now;
++            return;
++        }
++        VU1Interpreter::FlagPipelineEntry &entry = s.m_flagPipeline[freeIndex];
++        entry = {};
++        entry.valid = true;
++        entry.issueCycle = issue;
++        entry.readyCycle = issue + VU1Interpreter::kFmacLatency;
++        s.m_nextCommitCycle = std::min(s.m_nextCommitCycle, entry.readyCycle);
++        s.m_flagMask |= 1u << freeIndex;
++        macStatus(laneFlags, dest, entry.mac, entry.status);
++        entry.extraSticky = extraSticky;
++        entry.writesMac = true;
++        entry.writesStatus = true;
+     }
+ 
+     // The FMAC flag write of block pair `index`: queued through `queue(issue, laneFlags, dest, extraSticky)`, or
+@@ -607,6 +626,8 @@ struct Vu1Aot
+         if (step == kStepEnded || k + 1u == pairs || s.m_state.pc != (r.startPair + k + 1u) * 8u)
+         {
+             r.pairsDone += s.m_fastIndex;
++            r.prev = s.m_fastIndex == s.m_fastBlock->pairCount ? s.m_fastBlock : nullptr;
++            r.prevReadyMax = s.m_regReadyMax;
+             leave(s, *r.flags);
+             return step == kStepEnded ? kAotEnded : enterNext(s, r);
+         }
+@@ -617,6 +638,10 @@ struct Vu1Aot
+     // at the PC (tryEnterFastBlock(), onBlockEnter()). kAotNext when entered, else kAotDone with run() at its loop
+     // top (after the commit, which it repeats at the same cycle). Defined in ps2_vu1_core.cpp.
+     static int enterNext(VU1Interpreter &s, Vu1AotRun &r);
++
++    // tryEnterFastBlock() for the block at `pair` right after Vu1AotRun::prev ran to its end, with the liveIn
++    // check resolved once per pair of blocks. Defined in ps2_vu1_core.cpp.
++    static bool enterChained(VU1Interpreter &s, Vu1AotRun &r, uint32_t pair);
+ };
+ 
+ #endif
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -51,8 +51,22 @@ namespace
+             bool recordVi = false; // viReg != 0 and the write delays the next branch's read
+         };
+         std::vector<Plan> plan;
+-        // Per block start pair: the generated code of its tight-loop runs (#40), or null.
++        // Per block start pair: its generated code (#40, #41), or null.
+         std::vector<Vu1AotFn> aot;
++        // Per block start pair: the liveIn check of up to two successor blocks entered right after it ran to its
++        // end (Vu1Aot::enterChained). Cleared with the fast blocks.
++        struct ChainReq
++        {
++            uint32_t offset;
++            uint8_t kind, reg, component;
++        };
++        struct Chain
++        {
++            uint32_t to = ~0u; // successor start pair; ~0u: free slot
++            bool fail = false; // a liveIn lane the predecessor writes is never ready in time
++            std::vector<ChainReq> rest; // liveIn lanes the predecessor does not write, in offset order
++        };
++        std::vector<std::array<Chain, 2>> chains;
+         uint64_t imageHash = 0; // fnv1a of the code, when generated blocks exist
+     };
+     std::unordered_map<const VU1Interpreter *, DirectIds> g_directIds;
+@@ -2145,6 +2159,7 @@ void VU1Interpreter::prepareCodeCache(const uint8_t *vuCode, uint32_t codeSize,
+                 m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
+             std::memcpy(m_cachedCodeCopy.data(), vuCode, pairCount * 8u);
+             m_fastBlocks.clear();
++            g_directIds[this].chains.clear();
+             if (g_vuStats && m_unit == Unit::VU1)
+             {
+                 VuStats &st = vuStats();
+@@ -2168,6 +2183,7 @@ void VU1Interpreter::prepareCodeCache(const uint8_t *vuCode, uint32_t codeSize,
+     if (m_fastBlocks.size() != pairCount)
+     {
+         m_fastBlocks.clear();
++        g_directIds[this].chains.clear();
+         m_fastBlocks.resize(pairCount);
+     }
+     m_codeCachePrepared = true;
+@@ -2601,6 +2617,87 @@ void VU1Interpreter::catchUpXgkick(uint64_t throughCycle)
+     m_xgkickSyncCycle = std::max(m_xgkickSyncCycle, throughCycle);
+ }
+ 
++bool Vu1Aot::enterChained(VU1Interpreter &s, Vu1AotRun &r, uint32_t pair)
++{
++    using FastBlock = VU1Interpreter::FastBlock;
++    const FastBlock &from = *static_cast<const FastBlock *>(r.prev);
++    const FastBlock &to = *s.m_fastBlocks[pair];
++    const uint64_t start = s.m_cycle;
++    DirectIds &ids = *static_cast<DirectIds *>(r.ids);
++    if (ids.chains.size() != s.m_cachedPairCount)
++        ids.chains.resize(s.m_cachedPairCount);
++    std::array<DirectIds::Chain, 2> &slots = ids.chains[from.startPair];
++    DirectIds::Chain *chain = slots[0].to == pair ? &slots[0] : slots[1].to == pair ? &slots[1] : nullptr;
++    if (!chain && (slots[0].to == ~0u || slots[1].to == ~0u))
++    {
++        // From the entry at start = from's start + span: a liveIn lane `from` leaves pending past its span is
++        // ready at from's start + exit offset, so it passes or fails the same way every time. A lane it wrote
++        // earlier is ready by start, whichever of exitReady/exitLate exitFastBlock() recorded. Any other lane
++        // keeps its earlier ready cycle and is checked at entry, as tryEnterFastBlock() does.
++        chain = slots[0].to == ~0u ? &slots[0] : &slots[1];
++        chain->to = pair;
++        const uint32_t span = from.issue.back() + 1u;
++        for (const VU1Interpreter::FastReady &req : to.liveIn)
++        {
++            const auto written = std::find_if(from.exitReady.begin(), from.exitReady.end(),
++                                              [&](const VU1Interpreter::FastReady &w)
++                                              { return w.kind == req.kind && w.reg == req.reg && w.component == req.component; });
++            if (written == from.exitReady.end())
++                chain->rest.push_back({req.offset, req.kind, req.reg, req.component});
++            else if (written->offset > span + req.offset)
++                chain->fail = true;
++        }
++    }
++    if (!chain || start != s.m_fastStart + from.issue.back() + 1u)
++        return s.tryEnterFastBlock(r.budgetEnd);
++
++    // The checks of tryEnterFastBlock() that can fail here, in its order; the others hold after a block ran.
++    const auto refuse = [&](VuRefusal reason)
++    {
++        if (g_vuTrack)
++            vuStatsRefuse(reason, s.m_state.pc);
++        return false;
++    };
++    if (s.m_state.branchPending || s.m_state.haltAfterDelaySlot)
++        return refuse(RefuseBranch);
++    if (s.m_storeMask != 0u)
++        return refuse(RefuseStores);
++    if (start + to.issue.back() + 16u >= r.budgetEnd)
++        return refuse(RefuseBudget);
++    if (chain->fail)
++        return refuse(RefuseLiveIn);
++    if (r.prevReadyMax > start)
++    {
++        for (const DirectIds::ChainReq &req : chain->rest)
++        {
++            if (start + req.offset >= r.prevReadyMax)
++                break; // these lanes kept ready cycles <= r.prevReadyMax
++            const uint64_t ready = req.kind == 0u   ? s.m_vfReady[req.reg][req.component]
++                                   : req.kind == 1u ? s.m_viReady[req.reg]
++                                                    : s.m_accReady[req.component];
++            if (ready > start + req.offset)
++                return refuse(RefuseLiveIn);
++        }
++    }
++    if (to.fdivReq >= 0 && s.m_fdiv.valid && s.m_fdiv.readyCycle > start + static_cast<uint64_t>(to.fdivReq))
++        return refuse(RefuseFdiv);
++    if (to.efuReq >= 0 && s.m_efuResourceReady > start + static_cast<uint64_t>(to.efuReq))
++        return refuse(RefuseEfu);
++    if (to.waitPReq >= 0)
++    {
++        for (const VU1Interpreter::ScalarPipelineEntry &entry : s.m_efu)
++            if (entry.valid && entry.readyCycle > start + static_cast<uint64_t>(to.waitPReq))
++                return refuse(RefuseWaitP);
++    }
++    if ((s.m_vfMask | s.m_viMask | s.m_accMask) != 0u)
++        s.applyPendingRegisterWrites();
++    s.m_fastBlock = &to;
++    s.m_fastIndex = 0;
++    s.m_fastStart = start;
++    s.m_xgkickSyncCycle = s.m_cycle;
++    return true;
++}
++
+ int Vu1Aot::enterNext(VU1Interpreter &s, Vu1AotRun &r)
+ {
+     if (s.m_cycle >= r.budgetEnd || s.m_stopRequested)
+@@ -2615,7 +2712,7 @@ int Vu1Aot::enterNext(VU1Interpreter &s, Vu1AotRun &r)
+     if ((pc & 7u) != 0u || pair >= s.m_fastBlocks.size() || !s.m_fastBlocks[pair] || pair >= ids.aot.size() ||
+         !ids.aot[pair] || s.m_state.ebit)
+         return kAotDone;
+-    if (!s.tryEnterFastBlock(r.budgetEnd))
++    if (!(r.prev ? enterChained(s, r, pair) : s.tryEnterFastBlock(r.budgetEnd)))
+     {
+         r.refused = true;
+         return kAotDone;
+@@ -3501,7 +3598,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         {
+             Vu1AotRun aotRun{m_fastBlock->issue.data(), m_fastBlock->startPair, &elision, vuData, dataSize, codeSize,
+                              budgetEnd};
+-            aotRun.ids = directIds;
++            aotRun.ids = const_cast<DirectIds *>(directIds);
+             const uint64_t before = fastPairsDone;
+             if (g_aotVerify)
+             {

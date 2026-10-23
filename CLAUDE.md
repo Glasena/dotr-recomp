@@ -197,6 +197,15 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   own retry). Verify compares whole chains (0 mismatches in 262K chains to 2300). 98.3% of blocks are entered
   without returning to run(). Map vs stage a: ~75.0G -> ~74.7G instructions, cycles/wall in noise. Transitions
   left: `tryEnterFastBlock` (liveIn loop) + `exitFastBlock` + `enterNext` ~5-6% of the game thread.
+- Patch 0035 (2026-10-23, #41 stage c): a chained entry right after a block ran to its end
+  (`Vu1Aot::enterChained`) resolves the successor's liveIn once per (block, successor) pair (cached in
+  `DirectIds::chains`, two slots per block, cleared with the fast blocks): lanes the predecessor leaves pending
+  pass/fail statically, lanes it does not write are checked only when the old `m_regReadyMax` is past the entry;
+  other checks as `tryEnterFastBlock`, which stays the fallback. Non-elided FMAC flag writes are queued inline
+  (`Vu1Aot::queueFlags`). Map 1900->2300, 3 interleaved runs: post-#40 77.9G -> 73.6G instructions (-5.5%),
+  cycles ~36.3G -> ~34.6G (-4.6%), wall ~13.0 s both (noise). Dumps, verify, flag check unchanged. GameThread now:
+  generated bodies 9%, inlined FMAC 19%, non-FMAC upper ops via tables 13%, lower ops/stores/PATH1 7%, flag
+  commit 5%, transitions ~5%, IOP 14%, EE 8% -> next is #44 (specialize the table handlers), not more chaining.
 - Patch 0027 (2026-10-22, #35): `perf --call-graph dwarf` found the map/hash share was `IopKernel::beginNextReady`/
   `nextWakeCycle` walking the thread `std::map` on every idle IOP step (~7.5%) and the GIF_STAT lookup in
   `advanceEeTimers` (~2.1%). Kernel caches "nothing ready until cycle W" behind a version bumped by every public
@@ -331,7 +340,9 @@ Order is tracked with the `priority: N` labels; #13 is pinned on GitHub.
    real IOP instruction work (~9%, incl. `servicePendingDmaInterrupts` per IOP instruction ~1.8%). Profile the game
    thread again before the next VU1 step. #36 (stats) and #37 (tight pair loop, patch 0029) are in; next per the
    #13 plan was step 3, SSE FMAC handlers + lazy operand loads (#38, patch 0030, in); step 4, capture + stats
-   generator (#39, patch 0031), and step 5, AOT tight-loop runs (#40, patch 0032), are in. #41 stages a (whole
-   blocks in generated code, patch 0033) and b (chained blocks, patch 0034) are in; the gain is small (~4%).
+   generator (#39, patch 0031), and step 5, AOT tight-loop runs (#40, patch 0032), are in. #41 (whole blocks in
+   generated code, chained blocks, resolved chained entries: patches 0033-0035) is in, but the map only got ~5%
+   cheaper: the cost is per pair in the table handlers. Next is #44 (specialize non-FMAC upper and common lower
+   ops in generated code), then profile again.
 2. Then #10 (box glyphs), #14 (display env), #16, #17, #3-#5. Open an issue per new blocker.
 3. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).
