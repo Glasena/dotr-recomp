@@ -1,0 +1,758 @@
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 3eaa8b3..ea2fb4b 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -104,3 +104,39 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
+     EnableFastReleaseMode(ps2_test_lib)
+     EnableFastReleaseMode(ps2x_tests)
+ endif()
++
++# VU1 differential test (dotr-recomp #42): random VU1 microprograms through the interpreter and the fast-block
++# executor, plus, with PS2X_VU1_GEN_SCRIPT (dotr-recomp tools/vu1_gen.py), code generated for those programs at
++# build time from a capture of the fast-block run. Run with `ctest -R vu1_diff`.
++if(UNIX)
++    add_executable(ps2x_vu1_diff src/ps2_vu1_diff_tests.cpp)
++    target_link_libraries(ps2x_vu1_diff PRIVATE ps2_runtime)
++    add_test(NAME vu1_diff COMMAND ps2x_vu1_diff 10000)
++
++    set(PS2X_VU1_GEN_SCRIPT "" CACHE FILEPATH "dotr-recomp tools/vu1_gen.py; set to also test generated VU1 code")
++    if(PS2X_VU1_GEN_SCRIPT)
++        find_package(Python3 REQUIRED COMPONENTS Interpreter)
++        set(PS2X_VU1_DIFF_PROGRAMS 120) # ~3000 generated pairs, about a minute to compile
++        set(VU1_DIFF_GEN "${CMAKE_CURRENT_BINARY_DIR}/vu1_diff_gen")
++        set(VU1_SRC "${CMAKE_SOURCE_DIR}/ps2xRuntime/src/lib/vu")
++        add_custom_command(
++            OUTPUT "${VU1_DIFF_GEN}/vu1_aot.cpp"
++            COMMAND "${CMAKE_COMMAND}" -E rm -rf "${VU1_DIFF_GEN}/capture"
++            COMMAND "${CMAKE_COMMAND}" -E env "PS2X_VU1_CAPTURE=${VU1_DIFF_GEN}/capture" PS2X_VU_NO_AOT=1
++                    "$<TARGET_FILE:ps2x_vu1_diff>" --capture ${PS2X_VU1_DIFF_PROGRAMS}
++            COMMAND "${Python3_EXECUTABLE}" "${PS2X_VU1_GEN_SCRIPT}" "${VU1_DIFF_GEN}/capture" --emit "${VU1_DIFF_GEN}"
++                    > "${VU1_DIFF_GEN}/vu1_gen.log"
++            DEPENDS ps2x_vu1_diff "${PS2X_VU1_GEN_SCRIPT}"
++            COMMENT "Generating VU1 code for the differential test programs"
++            VERBATIM)
++        # Its own copy of the VU1 sources with PS2X_VU1_AOT, linked ahead of ps2_runtime's.
++        add_executable(ps2x_vu1_diff_aot src/ps2_vu1_diff_tests.cpp "${VU1_SRC}/ps2_vu1_core.cpp"
++                       "${VU1_SRC}/ps2_vu1_upper.cpp" "${VU1_SRC}/ps2_vu1_lower.cpp" "${VU1_DIFF_GEN}/vu1_aot.cpp")
++        set_source_files_properties("${VU1_SRC}/ps2_vu1_core.cpp" "${VU1_SRC}/ps2_vu1_upper.cpp"
++            "${VU1_SRC}/ps2_vu1_lower.cpp" "${VU1_DIFF_GEN}/vu1_aot.cpp" PROPERTIES COMPILE_OPTIONS "-O3")
++        target_include_directories(ps2x_vu1_diff_aot PRIVATE "${CMAKE_SOURCE_DIR}/ps2xRuntime/src/lib" "${VU1_SRC}")
++        target_compile_definitions(ps2x_vu1_diff_aot PRIVATE PS2X_VU1_AOT=1 PS2X_VU1_DIFF_AOT=1)
++        target_link_libraries(ps2x_vu1_diff_aot PRIVATE ps2_runtime)
++        add_test(NAME vu1_diff_aot COMMAND ps2x_vu1_diff_aot ${PS2X_VU1_DIFF_PROGRAMS})
++    endif()
++endif()
+diff --git a/ps2xTest/src/ps2_vu1_diff_tests.cpp b/ps2xTest/src/ps2_vu1_diff_tests.cpp
+new file mode 100644
+index 0000000..862acec
+--- /dev/null
++++ b/ps2xTest/src/ps2_vu1_diff_tests.cpp
+@@ -0,0 +1,708 @@
++// VU1 differential test (dotr-recomp #42). Random but valid VU1 microprograms run through the interpreter
++// (PS2X_VU_NO_BLOCKS=1), the fast-block executor (PS2X_VU_NO_AOT=1) and, in ps2x_vu1_diff_aot, the code that
++// dotr-recomp's tools/vu1_gen.py generated for these same programs from a capture of the fast-block run.
++// The engine switches are read once per process, so the test runs itself once per engine and compares the dumps
++// of VF/VI/ACC/Q/P/I/R/MAC/status/clip, pc, cycles and VU data memory line by line.
++// Design adapted from PR #254's VU1 differential tests (raw operand bits, oracle vs candidate, budget cuts).
++//
++// usage: ps2x_vu1_diff [N]            compare the engines over programs 0..N-1 (exit 0 when they all match)
++//        ps2x_vu1_diff --run N        dump the state after each program with the engine the environment selects
++//        ps2x_vu1_diff --capture N    run quietly (with PS2X_VU1_CAPTURE set: the capture vu1_gen.py reads)
++//        ps2x_vu1_diff --list P       print program P (pc: lower upper)
++//        ps2x_vu1_diff --repro P FILE dump program P's inputs run on the code in FILE (--list format)
++
++#include "runtime/gs/gs_frontend.h"
++#include "runtime/ps2_memory.h"
++#include "runtime/ps2_vu1.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <set>
++#include <string>
++#include <vector>
++
++namespace
++{
++    constexpr uint32_t kUpperNop = 0x000002FFu;
++    constexpr uint32_t kLowerNop = 0x8000033Cu;
++    constexpr uint32_t kIBit = 0x80000000u, kEBit = 0x40000000u;
++    constexpr uint32_t kKickQword = 0x300u; // vi13: a small GIF packet (PACKED NOP), never stored to
++    constexpr uint32_t kIlwrQword = 0x50u;  // vi14: ILWR/ISWR base
++    constexpr uint32_t kStreamQword = 0x80u; // vi12: LQI/SQI/LQD/SQD pointer
++    // Stores go to qwords 0x40..0xFF; loads read 0x00..0xFF. vi10 is the JR/JALR target (always the E pair, so
++    // every jump is forward), vi11 the BAL/JALR link, vi15 the loop counter: random VI writes use vi1..vi9 only.
++
++    // Known engine difference (dotr-recomp #45): when one of the last pairs writes a VF/VI register without a
++    // flag write (MAX/MINI/ITOF/FTOI/ABS, lower ops), a fast block ends the program 1-3 cycles earlier than the
++    // interpreter, which waits for that write to land. Only that cycle count may differ; it is reported, not failed.
++    bool knownEndCycles(const std::string &interp, const std::string &other, int64_t &carried)
++    {
++        unsigned pcA, pcB;
++        unsigned long long cycA, cycB;
++        char restA[64] = {}, restB[64] = {};
++        if (std::sscanf(interp.c_str(), "%*d.%*d pc %x cycles %llu %63[^\n]", &pcA, &cycA, restA) != 3 ||
++            std::sscanf(other.c_str(), "%*d.%*d pc %x cycles %llu %63[^\n]", &pcB, &cycB, restB) != 3 ||
++            pcA != pcB || std::strcmp(restA, restB) != 0)
++            return false;
++        const int64_t delta = static_cast<int64_t>(cycB) - static_cast<int64_t>(cycA) - carried; // cycles add up
++        carried += delta;
++        return delta >= -3 && delta <= 0;
++    }
++
++    // Known engine differences (dotr-recomp #46): OPMSUB/OPMULA read fs/ft lanes outside their dest, which the
++    // hazard model does not see, so a fast block reads a value the interpreter still has in flight. These
++    // programs may differ in any field; they are reported, not failed.
++    const std::set<int> kKnownOpmPrograms = {1, 2354, 3079, 5282, 6902, 7042, 9212};
++    // Known (dotr-recomp #47): generated code livelocks on a block whose first pair is an XGKICK while PATH1 is
++    // busy. ps2x_vu1_diff_aot skips these programs in every engine, or the generated run would never return.
++    const std::set<int> kKnownAotHangs = {2, 27};
++
++    struct Rng
++    {
++        uint64_t s;
++        uint32_t u32()
++        {
++            s ^= s << 13;
++            s ^= s >> 7;
++            s ^= s << 17;
++            return static_cast<uint32_t>(s >> 16);
++        }
++        uint32_t n(uint32_t bound) { return u32() % bound; }
++        bool chance(uint32_t percent) { return n(100) < percent; }
++    };
++
++    // Zero, denormal, Inf, NaN, near FLT_MAX and near FLT_MIN inputs as well as ordinary values.
++    uint32_t floatBits(Rng &r)
++    {
++        const uint32_t sign = r.n(2) << 31;
++        switch (r.n(12))
++        {
++        case 0: return sign;
++        case 1: return sign | (1u + r.n(0x7FFFFFu));
++        case 2: return sign | 0x7F800000u;
++        case 3: return sign | 0x7F800000u | (1u + r.n(0x7FFFFFu));
++        case 4: return sign | ((250u + r.n(5)) << 23) | r.n(0x800000u);
++        case 5: return sign | ((1u + r.n(4)) << 23) | r.n(0x800000u);
++        case 6: return sign | 0x3F800000u;
++        default: return sign | ((118u + r.n(18)) << 23) | r.n(0x800000u);
++        }
++    }
++
++    uint32_t lowerSpecial(uint32_t op, uint32_t dest, uint32_t it, uint32_t is)
++    {
++        return (0x40u << 25) | (dest << 21) | (it << 16) | (is << 11) | ((op & 0x7Cu) << 4) | (op & 3u) | 0x3Cu;
++    }
++    uint32_t lowerDirect(uint32_t funct, uint32_t it, uint32_t is, uint32_t id)
++    {
++        return (0x40u << 25) | (it << 16) | (is << 11) | (id << 6) | funct;
++    }
++    uint32_t lowerOp(uint32_t op, uint32_t dest, uint32_t it, uint32_t is, uint32_t imm11)
++    {
++        return (op << 25) | (dest << 21) | (it << 16) | (is << 11) | (imm11 & 0x7FFu);
++    }
++    uint32_t imm15(uint32_t op, uint32_t it, uint32_t is, uint32_t imm)
++    {
++        return (op << 25) | (((imm >> 11) & 0xFu) << 21) | (it << 16) | (is << 11) | (imm & 0x7FFu);
++    }
++    uint32_t imm12(uint32_t op, uint32_t it, uint32_t imm)
++    {
++        return (op << 25) | (((imm >> 11) & 1u) << 21) | (it << 16) | (imm & 0x7FFu);
++    }
++
++    // MAC/status writers: ADD/SUB/MUL/MADD/MSUB/OPMSUB and their ACC forms (vu1fast::isDirectFmacId).
++    bool writesFlags(uint32_t upper)
++    {
++        if (((upper >> 21) & 0xFu) == 0u)
++            return false;
++        const uint32_t op = upper & 0x3Fu;
++        const uint32_t id = op >= 0x3Cu ? ((upper & 3u) | ((upper >> 4) & 0x7Cu)) : op;
++        return id <= 0x0Fu || (id >= 0x18u && id <= 0x1Cu) ||
++               (id >= 0x1Eu && id <= 0x2Eu && id != 0x1Fu && id != 0x2Bu);
++    }
++
++    struct Program
++    {
++        std::vector<uint32_t> code; // lower, upper per pair
++        std::vector<uint32_t> data; // VU data memory words
++        uint32_t vf[32][4], acc[4], q, p, i, r, mac, status, clip;
++        int32_t vi[16];
++        uint32_t top, itop, budget;
++    };
++
++    struct Coverage
++    {
++        uint64_t readerDistance[7]{};
++        uint64_t readerAcrossBlock = 0, fmacs = 0, branches = 0, kicks = 0, loi = 0;
++    };
++
++    uint32_t vfSrc(Rng &r) { return r.chance(85) ? r.n(9) : r.n(32); }
++    uint32_t vfDst(Rng &r) { return r.chance(85) ? 1u + r.n(8) : 1u + r.n(31); }
++    uint32_t viDst(Rng &r) { return 1u + r.n(9); }
++    uint32_t viSrc(Rng &r) { return r.n(16); }
++    uint32_t mask(Rng &r) { return r.chance(40) ? 0xFu : 1u + r.n(15); }
++    uint32_t lane(Rng &r) { return r.n(4); }
++
++    uint32_t randomUpper(Rng &r)
++    {
++        if (r.chance(8))
++            return kUpperNop;
++        const uint32_t dest = r.chance(3) ? 0u : mask(r);
++        if (r.chance(55))
++        {
++            const uint32_t op = r.n(0x30);
++            return (dest << 21) | (vfSrc(r) << 16) | (vfSrc(r) << 11) | (vfDst(r) << 6) | op;
++        }
++        static const uint8_t specials[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
++                                           0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
++                                           0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23,
++                                           0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2C, 0x2D, 0x2E};
++        const uint32_t op = specials[r.n(sizeof(specials))];
++        const bool writesFt = (op >= 0x10u && op <= 0x17u) || op == 0x1Du; // ITOF/FTOI/ABS: ft is the destination
++        const uint32_t ft = writesFt ? vfDst(r) : vfSrc(r);
++        const uint32_t d = op == 0x1Fu ? 0xEu : dest; // CLIP fs.xyz, ft.w
++        return (d << 21) | (ft << 16) | (vfSrc(r) << 11) | ((op & 0x7Cu) << 4) | (op & 3u) | 0x3Cu;
++    }
++
++    // Any lower op that is not a branch.
++    uint32_t randomLower(Rng &r)
++    {
++        switch (r.n(20))
++        {
++        case 0:
++        case 1:
++        case 2: return kLowerNop;
++        case 3:
++        case 4:
++        case 5:
++        case 6: // MAC/status/clip readers and writers
++            switch (r.n(12))
++            {
++            case 0: return imm12(0x14, viDst(r), r.n(0x1000)); // FSEQ
++            case 1: return imm12(0x16, viDst(r), r.n(0x1000)); // FSAND
++            case 2: return imm12(0x17, viDst(r), r.n(0x1000)); // FSOR
++            case 3: return imm12(0x15, 0, r.n(0x1000));         // FSSET
++            case 4: return lowerOp(0x18, 0, viDst(r), viSrc(r), 0); // FMEQ
++            case 5: return lowerOp(0x1A, 0, viDst(r), viSrc(r), 0); // FMAND
++            case 6: return lowerOp(0x1B, 0, viDst(r), viSrc(r), 0); // FMOR
++            case 7: return (0x10u << 25) | (r.u32() & 0xFFFFFFu);   // FCEQ
++            case 8: return (0x11u << 25) | (r.u32() & 0xFFFFFFu);   // FCSET
++            case 9: return (0x12u << 25) | (r.u32() & 0xFFFFFFu);   // FCAND
++            case 10: return (0x13u << 25) | (r.u32() & 0xFFFFFFu);  // FCOR
++            default: return lowerOp(0x1C, 0, viDst(r), 0, 0);     // FCGET
++            }
++        case 7:
++        case 8: // integer ops
++            switch (r.n(7))
++            {
++            case 0: return lowerDirect(0x30, viSrc(r), viSrc(r), viDst(r)); // IADD id, is, it
++            case 1: return lowerDirect(0x31, viSrc(r), viSrc(r), viDst(r)); // ISUB
++            case 2: return lowerDirect(0x34, viSrc(r), viSrc(r), viDst(r)); // IAND
++            case 3: return lowerDirect(0x35, viSrc(r), viSrc(r), viDst(r)); // IOR
++            case 4: return lowerDirect(0x32, viDst(r), viSrc(r), r.n(32));  // IADDI it, is, imm5
++            case 5: return imm15(0x08, viDst(r), viSrc(r), r.n(0x8000));   // IADDIU
++            default: return imm15(0x09, viDst(r), viSrc(r), r.n(0x8000));  // ISUBIU
++            }
++        case 9:
++        case 10:
++        case 11: // loads and stores
++            switch (r.n(10))
++            {
++            case 0:
++            case 1: return lowerOp(0x00, mask(r), vfDst(r), 0, r.n(0x100));            // LQ ft, imm(vi0)
++            case 2: return lowerOp(0x01, mask(r), 0, vfSrc(r), 0x40 + r.n(0xC0));      // SQ fs, imm(vi0)
++            case 3: return lowerOp(0x04, 8u >> lane(r), viDst(r), 0, r.n(0x100));      // ILW it, imm(vi0)
++            case 4: return lowerOp(0x05, mask(r), viSrc(r), 0, 0x40 + r.n(0xC0));      // ISW it, imm(vi0)
++            case 5: return lowerSpecial(0x34, mask(r), vfDst(r), 12);                  // LQI ft, (vi12++)
++            case 6: return lowerSpecial(0x35, mask(r), 12, vfSrc(r));                  // SQI fs, (vi12++)
++            case 7: return lowerSpecial(0x36, mask(r), vfDst(r), 12);                  // LQD ft, (--vi12)
++            case 8: return lowerSpecial(0x37, mask(r), 12, vfSrc(r));                  // SQD fs, (--vi12)
++            default: return r.chance(50) ? lowerSpecial(0x3E, 8u >> lane(r), viDst(r), 14)  // ILWR it, (vi14)
++                                         : lowerSpecial(0x3F, mask(r), viSrc(r), 14);       // ISWR it, (vi14)
++            }
++        case 12:
++        case 13: // Q
++            switch (r.n(4))
++            {
++            case 0: return lowerSpecial(0x38, lane(r) << 2 | lane(r), vfSrc(r), vfSrc(r)); // DIV Q, fs.fsf, ft.ftf
++            case 1: return lowerSpecial(0x39, lane(r) << 2, vfSrc(r), 0);                // SQRT Q, ft.ftf
++            case 2: return lowerSpecial(0x3A, lane(r) << 2 | lane(r), vfSrc(r), vfSrc(r)); // RSQRT
++            default: return lowerSpecial(0x3B, 0, 0, 0);                                 // WAITQ
++            }
++        case 14: // EFU and P
++        {
++            static const uint8_t efu[] = {0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7C,
++                                          0x7D};
++            if (r.chance(20))
++                return lowerSpecial(0x7B, 0, 0, 0); // WAITP
++            if (r.chance(25))
++                return lowerSpecial(0x64, mask(r), vfDst(r), 0); // MFP ft
++            return lowerSpecial(efu[r.n(sizeof(efu))], lane(r), 0, vfSrc(r));
++        }
++        case 15:
++        case 16: // moves
++            switch (r.n(4))
++            {
++            case 0: return lowerSpecial(0x30, mask(r), vfDst(r), vfSrc(r)); // MOVE ft, fs
++            case 1: return lowerSpecial(0x31, mask(r), vfDst(r), vfSrc(r)); // MR32
++            case 2: return lowerSpecial(0x3C, lane(r), viDst(r), vfSrc(r)); // MTIR it, fs.fsf
++            default: return lowerSpecial(0x3D, mask(r), vfDst(r), viSrc(r)); // MFIR ft, is
++            }
++        case 17: // R
++            switch (r.n(4))
++            {
++            case 0: return lowerSpecial(0x40, mask(r), vfDst(r), 0); // RNEXT
++            case 1: return lowerSpecial(0x41, mask(r), vfDst(r), 0); // RGET
++            case 2: return lowerSpecial(0x42, lane(r), 0, vfSrc(r)); // RINIT
++            default: return lowerSpecial(0x43, lane(r), 0, vfSrc(r)); // RXOR
++            }
++        case 18: return lowerSpecial(r.chance(50) ? 0x68 : 0x69, 0, viDst(r), 0); // XTOP / XITOP
++        default: return lowerSpecial(0x6C, 0, 0, 13);                           // XGKICK vi13
++        }
++    }
++
++    // Programs 0..kFixedCount-1 are fixed code (with random inputs): minimal repros of the known differences.
++    constexpr uint32_t kXgkick = 0x80006EFCu; // XGKICK vi13
++    const std::vector<std::vector<uint32_t>> kFixedPrograms = {
++        // #45: MINIw.y vf1 in the E bit's delay slot, in a block entered by a branch: the fast block ends the
++        // program without waiting for the MINI result, 3 cycles before the interpreter.
++        {0x40000001u, kUpperNop, kLowerNop, kUpperNop, kLowerNop, kUpperNop | kEBit, kLowerNop, 0x00943857u},
++        // #46: ADDx.yz vf1, then OPMSUB.x vf23, vf1, vf6, which reads vf1.y: the interpreter reads the old vf1.y
++        // (its read lanes are taken from dest, x), the fast block the new one.
++        {kLowerNop, 0x00C81040u, kLowerNop, 0x01060DEEu, kLowerNop, kUpperNop | kEBit, kLowerNop, kUpperNop},
++        // #47: a block whose first pair is an XGKICK while PATH1 is still busy: the generated code leaves at pair 0
++        // and run() enters the same generated block again, forever.
++        {kXgkick, kUpperNop, 0x40000001u, kUpperNop, kLowerNop, kUpperNop, kXgkick, kUpperNop, kLowerNop,
++         kUpperNop | kEBit, kLowerNop, kUpperNop},
++    };
++    const uint32_t kFixedCount = static_cast<uint32_t>(kFixedPrograms.size());
++
++    Program generate(int index, Coverage *cov = nullptr)
++    {
++        Rng r{0x9E3779B97F4A7C15ull * static_cast<uint64_t>(index + 1) + 0x1234567ull};
++        for (int k = 0; k < 4; ++k)
++            r.u32();
++        Program p{};
++        const std::vector<uint32_t> *fixed =
++            static_cast<uint32_t>(index) < kFixedCount ? &kFixedPrograms[index] : nullptr;
++        // Pairs, including the E pair and its delay slot.
++        const uint32_t n = fixed ? static_cast<uint32_t>(fixed->size() / 2u) : 16u + r.n(40);
++        const uint32_t ePair = n - 2u;
++        // A counted loop: IADDI vi15, vi15, -1 at loopEnd-1 (or earlier), IBGTZ vi15 back to loopStart at loopEnd.
++        const bool loop = !fixed && n >= 12u && r.chance(60);
++        const uint32_t loopEnd = loop ? 4u + r.n(ePair - 6u) : ~0u;
++        const uint32_t loopStart = loop ? r.n(loopEnd - 1u) : 0u;
++        const uint32_t decAt =
++            loop ? loopEnd - 1u - (r.chance(50) ? 0u : std::min(loopEnd - 1u - loopStart, r.n(3))) : ~0u;
++        const auto reserved = [&](uint32_t k) { return loop && (k == decAt || k == loopEnd || k == loopEnd + 1u); };
++
++        std::vector<uint32_t> lower(n), upper(n);
++        std::vector<bool> blockEnd(n); // pair k ends a fast block (a branch delay slot or the E delay slot)
++        for (uint32_t k = 0; k < n; ++k)
++        {
++            upper[k] = randomUpper(r);
++            lower[k] = randomLower(r);
++        }
++        for (uint32_t k = 0; k < n;)
++        {
++            if (k == decAt)
++                lower[k] = lowerDirect(0x32, 15, 15, 0x1F); // IADDI vi15, vi15, -1
++            if (k == loopEnd)
++            {
++                lower[k] = lowerOp(0x2D, 0, 0, 15, (loopStart - (k + 1u)) & 0x7FFu); // IBGTZ vi15, loopStart
++                blockEnd[k + 1u] = true;
++                k += 2u;
++                continue;
++            }
++            // A forward branch with its delay slot, never into the E pair's delay slot and never with the loop's
++            // own pairs in the delay slot.
++            if (k + 3u < ePair && !reserved(k) && !reserved(k + 1u) && r.chance(18))
++            {
++                uint32_t target = k + 2u + r.n(ePair - k - 1u); // k+2 .. ePair
++                if (loop && k < decAt && target > decAt && target <= loopEnd)
++                    target = decAt; // never skip the loop counter's decrement
++                const uint32_t off = (target - (k + 1u)) & 0x7FFu;
++                switch (r.n(10))
++                {
++                case 0: lower[k] = lowerOp(0x20, 0, 0, 0, off); break;              // B
++                case 1: lower[k] = lowerOp(0x21, 0, 11, 0, off); break;             // BAL vi11
++                case 2: lower[k] = lowerOp(0x28, 0, viSrc(r), viSrc(r), off); break; // IBEQ
++                case 3: lower[k] = lowerOp(0x29, 0, viSrc(r), viSrc(r), off); break; // IBNE
++                case 4: lower[k] = lowerOp(0x2C, 0, 0, viSrc(r), off); break;       // IBLTZ
++                case 5: lower[k] = lowerOp(0x2D, 0, 0, viSrc(r), off); break;       // IBGTZ
++                case 6: lower[k] = lowerOp(0x2E, 0, 0, viSrc(r), off); break;       // IBLEZ
++                case 7: lower[k] = lowerOp(0x2F, 0, 0, viSrc(r), off); break;       // IBGEZ
++                case 8: lower[k] = lowerOp(0x24, 0, 0, 10, 0); break;               // JR vi10 (the E pair)
++                default: lower[k] = lowerOp(0x25, 0, 11, 10, 0); break;             // JALR vi11, vi10
++                }
++                upper[k] &= ~kIBit;
++                if (cov)
++                    ++cov->branches;
++                blockEnd[k + 1u] = true;
++                k += 2u;
++                continue;
++            }
++            ++k;
++        }
++        // LOI (I bit) on random pairs that are not branches or the loop's own pairs.
++        for (uint32_t k = 0; k < n; ++k)
++        {
++            const uint32_t opHi = lower[k] >> 25;
++            const bool branch = opHi >= 0x20u && opHi <= 0x2Fu;
++            if (!branch && !reserved(k) && (upper[k] & kIBit) == 0u && r.chance(7))
++            {
++                upper[k] |= kIBit;
++                lower[k] = floatBits(r);
++                if (cov)
++                    ++cov->loi;
++            }
++        }
++        upper[ePair] |= kEBit;
++        blockEnd[n - 1u] = true;
++        if (fixed)
++            for (uint32_t k = 0; k < n; ++k)
++                lower[k] = (*fixed)[2u * k], upper[k] = (*fixed)[2u * k + 1u];
++
++        // Coverage: MAC/status readers by static distance to the latest flag-writing FMAC, and across block ends.
++        if (cov)
++        {
++            int64_t lastFmac = -100;
++            bool crossed = false;
++            for (uint32_t k = 0; k < n; ++k)
++            {
++                const uint32_t opHi = lower[k] >> 25;
++                const bool reader = (upper[k] & kIBit) == 0u && opHi >= 0x14u && opHi <= 0x1Bu && opHi != 0x15u;
++                if (writesFlags(upper[k]))
++                {
++                    lastFmac = k; // a reader in the same pair sees the flags from before it (distance 0)
++                    crossed = false;
++                    ++cov->fmacs;
++                }
++                if (reader && k - lastFmac <= 6)
++                {
++                    ++cov->readerDistance[k - lastFmac];
++                    cov->readerAcrossBlock += crossed;
++                }
++                if (blockEnd[k])
++                    crossed = true;
++                cov->kicks += (upper[k] & kIBit) == 0u && lower[k] == lowerSpecial(0x6C, 0, 0, 13);
++            }
++        }
++
++        for (uint32_t k = 0; k < n; ++k)
++        {
++            p.code.push_back(lower[k]);
++            p.code.push_back(upper[k]);
++        }
++        // Never executed, but a reserved lower op ends a fast block built at the E bit's delay slot, which
++        // would otherwise run on through 256 pairs of zeros (costly to generate code for).
++        p.code.push_back(0x7Fu << 25);
++        p.code.push_back(kUpperNop);
++        p.data.assign(PS2_VU1_DATA_SIZE / 4u, 0u);
++        for (uint32_t w = 0; w < 0x100u * 4u; ++w)
++            p.data[w] = r.chance(70) ? floatBits(r) : r.u32();
++        // GIF packet: PACKED, NLOOP 3, EOP, one register (NOP), then three data qwords.
++        p.data[kKickQword * 4u + 0u] = 3u | 0x8000u;
++        p.data[kKickQword * 4u + 1u] = 1u << 28;
++        p.data[kKickQword * 4u + 2u] = 0xFu;
++        for (uint32_t w = 4; w < 16u; ++w)
++            p.data[kKickQword * 4u + w] = r.u32();
++
++        for (uint32_t reg = 1; reg < 32u; ++reg)
++            for (uint32_t c = 0; c < 4u; ++c)
++                p.vf[reg][c] = floatBits(r);
++        p.vf[0][3] = 0x3F800000u;
++        for (uint32_t c = 0; c < 4u; ++c)
++            p.acc[c] = floatBits(r);
++        for (uint32_t v = 1; v < 10u; ++v)
++            p.vi[v] = r.chance(50) ? static_cast<int32_t>(r.n(17)) - 8 : static_cast<int16_t>(r.u32());
++        p.vi[10] = static_cast<int32_t>(ePair);
++        p.vi[11] = static_cast<int32_t>(r.n(0x100));
++        p.vi[12] = kStreamQword;
++        p.vi[13] = kKickQword;
++        p.vi[14] = kIlwrQword;
++        p.vi[15] = 1 + static_cast<int32_t>(r.n(3));
++        p.q = floatBits(r);
++        p.p = floatBits(r);
++        p.i = floatBits(r);
++        p.r = 0x3F800000u | r.n(0x800000u);
++        p.mac = r.n(0x10000u);
++        p.status = r.n(0x1000u);
++        p.clip = r.n(0x1000000u);
++        p.top = r.n(0x400u);
++        p.itop = r.n(0x400u);
++        p.budget = 8u + r.n(400u);
++        return p;
++    }
++
++    template <class T>
++    void bitsFrom(T &dst, uint32_t bits) { std::memcpy(&dst, &bits, sizeof(bits)); }
++    uint32_t bitsOf(float f)
++    {
++        uint32_t b;
++        std::memcpy(&b, &f, sizeof(b));
++        return b;
++    }
++
++    uint64_t fnv1a(const uint8_t *p, size_t n)
++    {
++        uint64_t h = 1469598103934665603ull;
++        for (size_t i = 0; i < n; ++i)
++            h = (h ^ p[i]) * 1099511628211ull;
++        return h;
++    }
++
++    void dump(int prog, int run, const VU1State &s, const uint8_t *data)
++    {
++        for (int reg = 0; reg < 32; ++reg)
++            std::printf("%d.%d vf%d %08x %08x %08x %08x\n", prog, run, reg, bitsOf(s.vf[reg][0]), bitsOf(s.vf[reg][1]),
++                        bitsOf(s.vf[reg][2]), bitsOf(s.vf[reg][3]));
++        std::printf("%d.%d vi", prog, run);
++        for (int v = 0; v < 16; ++v)
++            std::printf(" %d", s.vi[v]);
++        std::printf("\n%d.%d acc %08x %08x %08x %08x\n", prog, run, bitsOf(s.acc[0]), bitsOf(s.acc[1]),
++                    bitsOf(s.acc[2]), bitsOf(s.acc[3]));
++        std::printf("%d.%d q %08x p %08x i %08x r %08x\n", prog, run, bitsOf(s.q), bitsOf(s.p), bitsOf(s.i), s.r);
++        std::printf("%d.%d mac %04x status %03x clip %06x\n", prog, run, s.mac, s.status, s.clip);
++        std::printf("%d.%d pc %04x cycles %llu ebit %d branch %d %04x %u\n", prog, run, s.pc,
++                    static_cast<unsigned long long>(s.cycles), s.ebit, s.branchPending, s.branchTarget, s.branchDelay);
++        std::printf("%d.%d data", prog, run);
++        for (uint32_t kb = 0; kb < PS2_VU1_DATA_SIZE; kb += 1024u)
++            std::printf(" %016llx", static_cast<unsigned long long>(fnv1a(data + kb, 1024u)));
++        std::printf("\n");
++    }
++
++    // One process, one engine (chosen by the environment): run every program twice on the same interpreter,
++    // the way a game reuses VU1. Run 0 runs to the E bit. Run 1 starts again from pc 0 with the state run 0 left
++    // (and the loop counter reset) under a random cycle budget, so it is often cut mid-program and resumed.
++    int runPrograms(int count, bool print, const char *codeFile = nullptr)
++    {
++        PS2Memory mem;
++        if (!mem.initialize())
++            return 2;
++        GS gs;
++        gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
++        uint8_t *code = mem.getVU1Code(), *data = mem.getVU1Data();
++        VU1Interpreter vu;
++        for (int prog = 0; prog < count; ++prog)
++        {
++#ifdef PS2X_VU1_DIFF_AOT
++            if (kKnownAotHangs.count(prog) && !codeFile)
++                continue;
++#endif
++            Program p = generate(prog);
++            if (codeFile)
++            {
++                // --repro: program `count - 1`'s inputs with the code from a --list style file.
++                if (prog != count - 1)
++                    continue;
++                p.code.clear();
++                FILE *f = std::fopen(codeFile, "r");
++                unsigned pc, lo, up;
++                while (f && std::fscanf(f, "%x: %x %x", &pc, &lo, &up) == 3)
++                {
++                    p.code.push_back(lo);
++                    p.code.push_back(up);
++                }
++                if (f)
++                    std::fclose(f);
++            }
++            std::memset(code, 0, PS2_VU1_CODE_SIZE);
++            std::memcpy(code, p.code.data(), p.code.size() * 4u);
++            std::memcpy(data, p.data.data(), PS2_VU1_DATA_SIZE);
++            vu.reset();
++            VU1State &s = vu.state();
++            for (int reg = 0; reg < 32; ++reg)
++                for (int c = 0; c < 4; ++c)
++                    bitsFrom(s.vf[reg][c], p.vf[reg][c]);
++            for (int c = 0; c < 4; ++c)
++                bitsFrom(s.acc[c], p.acc[c]);
++            std::memcpy(s.vi, p.vi, sizeof(s.vi));
++            bitsFrom(s.q, p.q);
++            bitsFrom(s.p, p.p);
++            bitsFrom(s.i, p.i);
++            s.r = p.r;
++            s.mac = p.mac;
++            s.status = p.status;
++            s.clip = p.clip;
++            // No PS2Memory: the code is written directly, so the cache checks the bytes instead of the generation.
++            vu.execute(code, PS2_VU1_CODE_SIZE, data, PS2_VU1_DATA_SIZE, gs, nullptr, 0u, p.top, p.itop, 1u << 20);
++            if (print)
++                dump(prog, 0, vu.state(), data);
++            vu.state().vi[12] = p.vi[12];
++            vu.state().vi[15] = p.vi[15];
++            vu.execute(code, PS2_VU1_CODE_SIZE, data, PS2_VU1_DATA_SIZE, gs, nullptr, 0u, p.top, p.itop, p.budget);
++            // Results still in flight at a cut are not in VU1State yet (the fast path writes them at issue), so
++            // compare after the program has finished: it ends right after the E bit's delay slot, the last pair.
++            if (vu.state().pc != (p.code.size() - 2u) * 4u)
++                vu.resume(code, PS2_VU1_CODE_SIZE, data, PS2_VU1_DATA_SIZE, gs, nullptr, p.top, p.itop, 1u << 20);
++            if (print)
++                dump(prog, 1, vu.state(), data);
++        }
++        std::fflush(stdout);
++        return 0;
++    }
++
++    struct Output
++    {
++        std::vector<std::string> state, other; // dump lines; everything else (stderr: stats, warnings)
++    };
++
++    bool runChild(const std::string &env, int count, Output &out)
++    {
++        const std::string self = std::filesystem::read_symlink("/proc/self/exe").string();
++        const std::string cmd = env + " '" + self + "' --run " + std::to_string(count) + " 2>&1";
++        FILE *f = popen(cmd.c_str(), "r");
++        if (!f)
++            return false;
++        std::string line;
++        char buf[4096];
++        while (std::fgets(buf, sizeof(buf), f))
++        {
++            line += buf;
++            if (line.back() != '\n')
++                continue;
++            line.pop_back();
++            const bool isState = !line.empty() && line[0] >= '0' && line[0] <= '9';
++            (isState ? out.state : out.other).push_back(line);
++            line.clear();
++        }
++        return pclose(f) == 0;
++    }
++
++    double statsPercent(const Output &out, const char *key)
++    {
++        for (const std::string &l : out.other)
++            if (l.rfind("[vu-stats:exit] last interval", 0) == 0)
++                if (const size_t at = l.find(key); at != std::string::npos)
++                    return std::atof(l.c_str() + at + std::strlen(key));
++        return -1.0;
++    }
++
++    int compare(int count)
++    {
++        struct Engine
++        {
++            const char *name, *env;
++            Output out;
++        };
++        std::vector<Engine> engines = {{"interpreter", "PS2X_VU_NO_BLOCKS=1", {}},
++                                       {"fast block", "PS2X_VU_NO_AOT=1 PS2X_VU_STATS=1", {}}};
++#ifdef PS2X_VU1_DIFF_AOT
++        engines.push_back({"generated", "PS2X_VU_STATS=1", {}});
++#endif
++        int failures = 0;
++        for (Engine &e : engines)
++        {
++            if (!runChild(std::string("env ") + e.env, count, e.out) || e.out.state.empty())
++            {
++                std::printf("FAIL %s: child run failed\n", e.name);
++                ++failures;
++            }
++            for (const std::string &l : e.out.other)
++                if (l.rfind("[vu1:aot]", 0) == 0 || l.find("mismatch") != std::string::npos)
++                {
++                    std::printf("FAIL %s: %s\n", e.name, l.c_str());
++                    ++failures;
++                }
++        }
++        if (failures)
++            return 1;
++
++        const Output &ref = engines[0].out;
++        for (size_t k = 1; k < engines.size(); ++k)
++        {
++            const Output &out = engines[k].out;
++            std::set<int> bad;
++            int shown = 0;
++            if (out.state.size() != ref.state.size())
++            {
++                std::printf("FAIL %s: %zu dump lines, interpreter %zu\n", engines[k].name, out.state.size(),
++                            ref.state.size());
++                ++failures;
++                continue;
++            }
++            std::set<int> known;
++            int64_t carried = 0;
++            int carriedProg = -1;
++            for (size_t l = 0; l < ref.state.size(); ++l)
++            {
++                const int prog = std::atoi(ref.state[l].c_str());
++                if (prog != carriedProg)
++                    carried = 0, carriedProg = prog;
++                if (ref.state[l] == out.state[l])
++                    continue;
++                if (knownEndCycles(ref.state[l], out.state[l], carried))
++                {
++                    if (carried != 0)
++                        known.insert(prog);
++                    continue;
++                }
++                if (kKnownOpmPrograms.count(prog))
++                {
++                    known.insert(prog);
++                    continue;
++                }
++                if (bad.insert(prog).second && shown++ < 8)
++                    std::printf("  %s differs from the interpreter, program %d:\n    interp: %s\n    %s: %s\n",
++                                engines[k].name, prog, ref.state[l].c_str(), engines[k].name, out.state[l].c_str());
++            }
++            std::printf("%s vs interpreter: %d programs, %zu differ, %zu more only in known ways "
++                        "(dotr-recomp #45, #46); fast %.1f%%, generated %.1f%% of pairs\n",
++                        engines[k].name, count, bad.size(), known.size(), statsPercent(out, "(fast "),
++                        statsPercent(out, "generated "));
++            failures += static_cast<int>(bad.size());
++        }
++#ifdef PS2X_VU1_DIFF_AOT
++        std::printf("skipped %zu programs whose generated code is known to hang (dotr-recomp #47)\n",
++                    kKnownAotHangs.size());
++        // Every program was captured and generated: most VU1 pairs must have run in generated code.
++        const double generated = statsPercent(engines.back().out, "generated ");
++        if (generated < 50.0)
++        {
++            std::printf("FAIL generated code ran only %.1f%% of the pairs\n", generated);
++            ++failures;
++        }
++#endif
++        Coverage cov;
++        for (int prog = 0; prog < count; ++prog)
++            generate(prog, &cov);
++        std::printf("coverage: %llu FMAC flag writers, %llu branches, %llu XGKICKs, %llu LOI; readers at distance",
++                    static_cast<unsigned long long>(cov.fmacs), static_cast<unsigned long long>(cov.branches),
++                    static_cast<unsigned long long>(cov.kicks), static_cast<unsigned long long>(cov.loi));
++        bool covered = cov.readerAcrossBlock != 0u && cov.kicks != 0u;
++        for (int d = 0; d <= 6; ++d)
++        {
++            std::printf(" %d:%llu", d, static_cast<unsigned long long>(cov.readerDistance[d]));
++            covered = covered && cov.readerDistance[d] != 0u;
++        }
++        std::printf(", across a block end %llu\n", static_cast<unsigned long long>(cov.readerAcrossBlock));
++        if (!covered)
++        {
++            std::printf("FAIL coverage\n");
++            ++failures;
++        }
++        std::printf(failures ? "FAILED\n" : "OK\n");
++        return failures ? 1 : 0;
++    }
++}
++
++int main(int argc, char **argv)
++{
++    const std::string mode = argc > 1 ? argv[1] : "";
++    if ((mode == "--run" || mode == "--capture") && argc > 2)
++        return runPrograms(std::atoi(argv[2]), mode == "--run");
++    if (mode == "--repro" && argc > 3)
++        return runPrograms(std::atoi(argv[2]) + 1, true, argv[3]);
++    if (mode == "--list" && argc > 2)
++    {
++        const Program p = generate(std::atoi(argv[2]));
++        for (size_t k = 0; k < p.code.size(); k += 2)
++            std::printf("%04zx: %08x %08x\n", k * 4u, p.code[k], p.code[k + 1]);
++        return 0;
++    }
++    return compare(argc > 1 ? std::atoi(argv[1]) : 1000);
++}

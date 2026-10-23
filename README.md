@@ -97,6 +97,15 @@ PS2X_VU1_CAPTURE="$(realpath ../dotr/vu1)" PS2X_DUMP_FRAMES=2300 PS2X_EXIT_AT=23
 python3 tools/vu1_gen.py ../dotr/vu1 --emit ../dotr/vu1/gen
 cmake -DPS2X_VU1_AOT_DIR="$(realpath ../dotr/vu1/gen)" ../PS2Recomp/out/build-runtime
 cmake --build ../PS2Recomp/out/build-runtime --target ps2EntryRunner
+
+# 9. (optional) VU1 differential test (patch 0036, no game data): random VU1 programs through the interpreter, the
+#    fast-block executor and code tools/vu1_gen.py generates for them at build time (~2 min, once). In its own build
+#    directory, so out/build-runtime is not touched.
+cmake -S ../PS2Recomp -B ../PS2Recomp/out/build-vu1diff -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_STUDIO=OFF -DPS2X_ENABLE_FFMPEG=OFF \
+  -DPS2X_ENABLE_AGRESSIVE_LOGS=OFF -DPS2X_VU1_GEN_SCRIPT="$(realpath tools/vu1_gen.py)"
+cmake --build ../PS2Recomp/out/build-vu1diff --target ps2x_vu1_diff ps2x_vu1_diff_aot
+ctest --test-dir ../PS2Recomp/out/build-vu1diff/ps2xTest -R vu1_diff --output-on-failure   # ~4 s
 ```
 
 Rebuild times (12 threads): cold full build ~45 min (~4000 steps, most of it the 762 overlay modules); no change

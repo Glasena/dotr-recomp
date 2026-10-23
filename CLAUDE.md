@@ -206,6 +206,13 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   cycles ~36.3G -> ~34.6G (-4.6%), wall ~13.0 s both (noise). Dumps, verify, flag check unchanged. GameThread now:
   generated bodies 9%, inlined FMAC 19%, non-FMAC upper ops via tables 13%, lower ops/stores/PATH1 7%, flag
   commit 5%, transitions ~5%, IOP 14%, EE 8% -> next is #44 (specialize the table handlers), not more chaining.
+- Patch 0036 (2026-10-23, #42): VU1 differential test, README step 9 (`ctest -R vu1_diff`, ~4 s). Random programs
+  (every FMAC kind, masks, broadcast, Q/I, flag readers, branches, a counted loop, XGKICK, LOI, Inf/NaN/denormal
+  inputs) run once per engine in a child process (the switches are env statics); VF/VI/ACC/Q/P/I/R/flags/pc/
+  cycles/data are compared with the interpreter: 10000 programs for the fast block, 120 for the generated code
+  (`vu1_gen.py` on a capture of those programs, ~2 min compile). Breaking the flag-elision window (`>=` -> `>`)
+  fails 698 / 5 programs. Known, reported: #45 (end cycles), #46 (OPMSUB lanes), #47 (generated-code hang, skipped).
+  `ps2x_vu1_diff --list P` / `--repro P FILE` print and rerun one program for a minimal repro.
 - Patch 0027 (2026-10-22, #35): `perf --call-graph dwarf` found the map/hash share was `IopKernel::beginNextReady`/
   `nextWakeCycle` walking the thread `std::map` on every idle IOP step (~7.5%) and the GIF_STAT lookup in
   `advanceEeTimers` (~2.1%). Kernel caches "nothing ready until cycle W" behind a version bumped by every public
