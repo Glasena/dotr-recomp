@@ -1,0 +1,81 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp b/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp
+index 873c1aa..9602d1d 100644
+--- a/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp
+@@ -244,7 +244,10 @@ namespace
+             if (!context.init_instance_and_device(nullptr, 0, nullptr, 0))
+                 throw std::runtime_error("parallel-gs: Vulkan instance/device initialization failed");
+             device.set_context(context);
+-            device.init_frame_contexts(2);
++            // Every flush_submit (Present makes 3, GIF pressure flushes ~1 per frame) recycles a frame context
++            // and waits for its GPU work. With 2, Present and the GameThread waited ~13 ms per frame for work
++            // they had just submitted (#54); 8 keep the recycled context ~70 ms old.
++            device.init_frame_contexts(8);
+             VkPhysicalDeviceProperties props{};
+             vkGetPhysicalDeviceProperties(context.get_gpu(), &props);
+             std::cerr << "[pgs] Vulkan device: " << props.deviceName << " (driver 0x" << std::hex << props.driverVersion
+@@ -255,8 +258,10 @@ namespace
+ 
+     class ParallelBackend final : public GSRasterBackend, private ParallelGS::SignalInterface
+     {
+-        // All GSInterface/Device entry points are serialized, including presentation.
++        // All GSInterface/Device entry points are serialized, including presentation. Present waits for its
++        // readback fence outside `mutex` (#54), so presentMutex keeps the one readback buffer to one caller.
+         mutable std::recursive_mutex mutex;
++        std::mutex presentMutex;
+         HeadlessDevice vk;
+         mutable ParallelGS::GSInterface gs;
+         GSRegisters &priv;
+@@ -276,7 +281,7 @@ namespace
+         uint64_t presents = 0;
+         // Host time per 600-present window (#51): whole Present, its scanout readback, and FINISH waits.
+         using Clock = std::chrono::steady_clock;
+-        double presentMs = 0, vsyncMs = 0, readbackMs = 0, finishMs = 0;
++        double presentMs = 0, flushMs = 0, vsyncMs = 0, readbackMs = 0, finishMs = 0;
+         uint64_t finishes = 0;
+         static double msSince(Clock::time_point t)
+         {
+@@ -587,7 +592,9 @@ namespace
+ 
+         PresentationFrame Present(const GSPresentationRequest &request) override
+         {
+-            Lock lock(mutex);
++            std::lock_guard<std::mutex> presentLock(presentMutex);
++            std::unique_lock<std::recursive_mutex> lock(mutex);
++            Util::register_thread_index(0);
+             const auto t0 = Clock::now();
+             struct AddTime
+             {
+@@ -596,6 +603,7 @@ namespace
+                 ~AddTime() { sum += msSince(t); }
+             } addPresent{presentMs, t0};
+             gs.flush();
++            flushMs += msSince(t0);
+             if (census)
+                 census->present(presents + 1);
+             if (cpuScanout)
+@@ -630,10 +638,10 @@ namespace
+                           << " pmode=" << request.pmode << " smode2=" << request.smode2 << " dispfb1=" << request.dispfb1
+                           << " display1=" << request.display1 << " dispfb2=" << request.dispfb2
+                           << " display2=" << request.display2 << std::dec << " | last 600: present "
+-                          << presentMs / 600 << " ms avg, vsync " << vsyncMs / 600 << " ms avg, readback " << readbackMs / 600 << " ms avg, " << finishes
++                          << presentMs / 600 << " ms avg, flush " << flushMs / 600 << " ms avg, vsync " << vsyncMs / 600 << " ms avg, readback " << readbackMs / 600 << " ms avg, " << finishes
+                           << " FINISH waits " << finishMs << " ms" << std::endl;
+             if (presents % 600 == 0)
+-                presentMs = vsyncMs = readbackMs = finishMs = 0, finishes = 0;
++                presentMs = flushMs = vsyncMs = readbackMs = finishMs = 0, finishes = 0;
+             if (!scanout.image)
+                 return {};
+ 
+@@ -667,7 +675,11 @@ namespace
+                          VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+             Vulkan::Fence fence;
+             vk.device.submit(cmd, &fence);
++            // The frame's GS work only reaches the GPU at the flush above; let the GameThread keep feeding GIF
++            // packets while the GPU renders it and copies the scanout (#54).
++            lock.unlock();
+             fence->wait();
++            lock.lock();
+ 
+             PresentationFrame frame;
+             frame.width = w;

@@ -408,6 +408,10 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
   instr, cycles 124G -> 96G. pgs Present averages ~11 ms on the game thread in the map (10-12 ms over the whole long
   script with the census on): vsync 0.2 ms, scanout readback ~1.3 ms, the remaining ~9.7 ms in `gs.flush()` at its
   start; no FINISH waits. The `[pgs] presents=` line prints these averages every 600 presents.
+- Patch 0048 (2026-10-23, #54): that "flush" was Granite recycling one of only 2 frame contexts and waiting for the
+  frame's GPU work (the GPU stays at P8/300 MHz here, ~13 ms per frame), on the main thread's Present while holding
+  the backend lock, and on the GameThread in GIF pressure flushes. Now 8 frame contexts and the readback fence wait
+  outside the lock: map 1900->2300 pgs 12.5-12.7 -> 9.2 s, duel 10000->11000 39.9-47.9 -> 33.4-36.6 s; dumps unchanged.
 
 ## Next steps (2026-10-22)
 Order is tracked with the `priority: N` labels; #13 is pinned on GitHub.
