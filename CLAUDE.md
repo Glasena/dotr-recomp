@@ -363,6 +363,17 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
   card, empty 3D view). Warmup 30 is byte-identical to warmup 3 on those three frames: a few real frames do not
   rebuild a VU-rendered layer that was produced on skipped frames. Not for performance numbers.
 
+## GPU GS spike: paraLLEl-GS (2026-10-23, #50)
+- Patch 0043: upstream PR #285's paraLLEl-GS backend (GS parts only), headless Vulkan, scanout read back into
+  `PresentationFrame::pixels`. CMake `PS2X_ENABLE_PARALLEL_GS` (OFF; README step 10, parallel-gs pinned at 3a66c19 in
+  `../deps/src`, LGPL-3), run time `PS2X_GS_BACKEND=pgs` (unthreaded; raw GIF per PATH + register writes). Turning the
+  option on compiles only the backend lib, `ps2_runtime.cpp` and parallel-gs. Works on the RTX 2060 (Turing).
+- Our HLE never sets SMODE1; the backend defaults it to NTSC or paraLLEl scans out nothing. The HLE swap's CPU colour
+  clear is a no-op there (the clear packet follows). DotR scans out with both circuits one line apart, ALP=0x7F.
+- Title/menu/NOW LOADING vs CPU: PHASH 1-8 (same structure), PSNR 23-29 dB: textured sprites ~12% darker under pgs
+  (cause not found yet; step 2). Menu uncapped 62 -> ~181 VBlanks/s. `tools/imgdiff.sh a b [montage]` gates
+  PSNR>=35, AE(fuzz 2%)<=1%, PHASH<=30. pgs dumps vary slightly run to run.
+
 ## Next steps (2026-10-22)
 Order is tracked with the `priority: N` labels; #13 is pinned on GitHub.
 1. #13 (priority 3) is the parent. #22 (async VU1) did not help: the EE waits on the kick. #23 (patch 0016) and

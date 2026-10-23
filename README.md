@@ -42,6 +42,7 @@ workspace/
                   overlays.py (recompiles the overlay modules in DATA/*MODULE.MRG one by one)
                   sync_runner.sh (copies generated code into the PS2Recomp runner)
                   test_run.sh (headless scripted run with PNG frame dumps)
+                  imgdiff.sh (PSNR / pixels off / PHASH of two dumps, plus a diff montage)
 ```
 
 ## Building
@@ -115,6 +116,21 @@ cmake -S ../PS2Recomp -B ../PS2Recomp/out/build-vu1diff -G Ninja -DCMAKE_BUILD_T
   -DPS2X_ENABLE_AGRESSIVE_LOGS=OFF -DPS2X_VU1_GEN_SCRIPT="$(realpath tools/vu1_gen.py)"
 cmake --build ../PS2Recomp/out/build-vu1diff --target ps2x_vu1_diff ps2x_vu1_diff_aot
 ctest --test-dir ../PS2Recomp/out/build-vu1diff/ps2xTest -R vu1_diff --output-on-failure   # ~4 s
+
+# 10. (optional, experimental) paraLLEl-GS, a Vulkan compute GS (patch 0043, #50). Needs a Vulkan 1.3 GPU and
+#     loader. Pinned commit 3a66c19 (the one upstream PR #285 uses); the submodules take ~1.4 GB. Without
+#     FETCHCONTENT_SOURCE_DIR_PARALLEL_GS, CMake clones the same commit into the build directory at configure time.
+#     Only the new backend, ps2_runtime.cpp and parallel-gs itself compile (+~1 min, +42 MB binary). Selected at
+#     run time with PS2X_GS_BACKEND=pgs (headless scanout readback only, no on-screen interop yet); the CPU GS
+#     stays the default and the reference. Compare with tools/imgdiff.sh.
+git clone https://github.com/Arntzen-Software/parallel-gs.git ../deps/src/parallel-gs
+git -C ../deps/src/parallel-gs checkout 3a66c1976170cbc2cb53a3593fabbc7c4b2ccfbd
+git -C ../deps/src/parallel-gs submodule update --init --recursive
+cmake -DPS2X_ENABLE_PARALLEL_GS=ON -DFETCHCONTENT_SOURCE_DIR_PARALLEL_GS="$(realpath ../deps/src/parallel-gs)" \
+  ../PS2Recomp/out/build-runtime
+cmake --build ../PS2Recomp/out/build-runtime --target ps2EntryRunner
+PS2X_GS_BACKEND=pgs PS2X_DUMP_DIR="$(realpath ../dotr)/test_pgs" tools/test_run.sh
+for f in 1200 1500 1700; do tools/imgdiff.sh ../dotr/test/frame_$f.png ../dotr/test_pgs/frame_$f.png; done
 ```
 
 Rebuild times (12 threads): cold full build ~45 min (~4000 steps, most of it the 762 overlay modules); no change
@@ -172,6 +188,9 @@ On Ubuntu the runtime needs `sudo apt install libxinerama-dev libasound2-dev`.
 - [**PS2Recomp**](https://github.com/ran-j/PS2Recomp) by ran-j and contributors — recompiler and runtime (GPL-3.0).
 - [**Tobiichi-Port**](https://github.com/YYOzcan/Tobiichi-Port) (God of War PS2 recomp) — `tools/find_functions.py`
   is adapted from its function finder, and its docs guided the approach (GPL-3.0).
+- [**paraLLEl-GS**](https://github.com/Arntzen-Software/parallel-gs) by Arntzen Software (LGPL-3.0+) — optional
+  Vulkan GS backend (patch 0043). It is not vendored: it is fetched at a pinned commit and only linked when
+  `PS2X_ENABLE_PARALLEL_GS=ON`. Distributing such a binary must follow the LGPL-3.0 (its source and license with it).
 - *Yu-Gi-Oh! The Duelists of the Roses* © Konami. This project is not affiliated with or endorsed by Konami.
   No game content is distributed.
 
