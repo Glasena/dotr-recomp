@@ -1,5 +1,4 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index 5078a90..f80a4c5 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 @@ -15,6 +15,7 @@
@@ -10,10 +9,11 @@ index 5078a90..f80a4c5 100644
  
  namespace
  {
-@@ -34,6 +35,14 @@ namespace
+@@ -33,6 +34,15 @@
+     {
          return static_cast<uint8_t>(1u << (3u - component));
      }
- 
++
 +    // Handler ids for each decoded pair, indexed like m_decodedCodeCache. Not on VU1Interpreter:
 +    // ps2_vu1.h is included by ps2_runtime.h, and touching it rebuilds every overlay.
 +    struct DirectIds
@@ -25,7 +25,7 @@ index 5078a90..f80a4c5 100644
  }
  
  void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
-@@ -1754,6 +1763,7 @@ void VU1Interpreter::prepareCodeCache(const uint8_t *vuCode, uint32_t codeSize,
+@@ -1753,6 +1763,7 @@
      if (codeSize / 8u > kMaxDecodedPairs)
          return;
      const uint32_t pairCount = codeSize / 8u;
@@ -33,7 +33,7 @@ index 5078a90..f80a4c5 100644
      const bool tracked = memory != nullptr &&
                           ((m_unit == Unit::VU1 && vuCode == memory->getVU1Code()) ||
                            (m_unit == Unit::VU0 && vuCode == memory->getVU0Code()));
-@@ -1768,6 +1778,7 @@ void VU1Interpreter::prepareCodeCache(const uint8_t *vuCode, uint32_t codeSize,
+@@ -1767,6 +1778,7 @@
          if (!(m_decodedCodeCacheValid && m_cachedPairCount == pairCount &&
                std::memcmp(m_cachedCodeCopy.data(), vuCode, pairCount * 8u) == 0))
          {
@@ -41,7 +41,7 @@ index 5078a90..f80a4c5 100644
              for (uint32_t i = 0; i < pairCount; ++i)
                  m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
              std::memcpy(m_cachedCodeCopy.data(), vuCode, pairCount * 8u);
-@@ -1786,6 +1797,18 @@ void VU1Interpreter::prepareCodeCache(const uint8_t *vuCode, uint32_t codeSize,
+@@ -1785,6 +1797,18 @@
          m_fastBlocks.resize(pairCount);
      }
      m_codeCachePrepared = true;
@@ -60,7 +60,7 @@ index 5078a90..f80a4c5 100644
  }
  
  const VU1Interpreter::FastBlock *VU1Interpreter::buildFastBlock(uint32_t startPair)
-@@ -2114,17 +2137,54 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -2113,17 +2137,54 @@
      m_activeMemory = memory;
      prepareCodeCache(vuCode, codeSize, memory);
  
@@ -116,7 +116,7 @@ index 5078a90..f80a4c5 100644
              float immediate = 0.0f;
              std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
              m_state.i = normalizeOperand(immediate);
-@@ -2136,22 +2196,22 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -2135,22 +2196,22 @@
              std::memcpy(oldVf,
                          m_state.vf[decoded.upperVfShadowReg],
                          sizeof(oldVf));
