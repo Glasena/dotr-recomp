@@ -1,0 +1,190 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index c6e7c1f..3949e86 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -18,6 +18,7 @@
+ #include <filesystem>
+ #include <fstream>
+ #include <limits>
++#include <map>
+ #include <ps2_log.h>
+ #include <set>
+ #include <string>
+@@ -68,6 +69,7 @@ namespace
+         };
+         std::vector<std::array<Chain, 2>> chains;
+         uint64_t imageHash = 0; // fnv1a of the code, when generated blocks exist
++        bool exact = false;     // PS2X_VU_RESULTS_VERIFY's reference twin: always bind the exact variant
+     };
+     std::unordered_map<const VU1Interpreter *, DirectIds> g_directIds;
+ 
+@@ -391,7 +393,7 @@ namespace
+                 same = same && info.shadowReg == shadowReg && info.kind == kind;
+             }
+             if (same)
+-                return g_aotRelaxed ? block.relaxed : block.fn;
++                return g_aotRelaxed && !ids.exact ? block.relaxed : block.fn;
+             std::fprintf(stderr, "[vu1:aot] block %016llx:0x%04x does not match the generated code; not used\n",
+                          static_cast<unsigned long long>(ids.imageHash), pc);
+             return nullptr;
+@@ -405,6 +407,36 @@ namespace
+         std::unordered_map<uint32_t, uint64_t> byPc; // run start pc -> mismatches
+     } g_aotVerifyStats;
+ 
++    // PS2X_VU_RESULTS_VERIFY=1 (#57): every VU1 run (MSCAL/MSCNT) also runs on a twin interpreter that binds the
++    // exact generated variant, from a copy of the run state and of VU data, with PATH1 hashed instead of
++    // submitted. VF/VI/ACC/Q/P/I/R/CLIP, pc, end state, VU data and the hash of the XGKICK packets must match;
++    // cycles and MAC/status are not compared. The twin keeps its own MAC/status from its previous (exact) runs, so
++    // a reader of a flag write the relaxed code dropped shows up as a VI mismatch.
++    const bool g_resultsVerify = std::getenv("PS2X_VU_RESULTS_VERIFY") != nullptr;
++    struct ResultsVerify
++    {
++        std::unique_ptr<VU1Interpreter> twin;
++        uint64_t packetHash = 1469598103934665603ull; // fnv1a of the PATH1 packets of the current run
++        bool isTwin = false, nested = false;
++    };
++    std::unordered_map<const VU1Interpreter *, ResultsVerify> g_resultsVerifyState;
++    struct ResultsVerifyStats
++    {
++        uint64_t checks = 0, mismatches = 0;
++        std::map<uint32_t, uint64_t> byPc; // run start pc -> mismatches
++    } g_resultsVerifyStats;
++
++    void printResultsVerifyStats()
++    {
++        const ResultsVerifyStats &v = g_resultsVerifyStats;
++        std::fprintf(stderr, "[vu1:results-verify] runs=%llu mismatches=%llu", static_cast<unsigned long long>(v.checks),
++                     static_cast<unsigned long long>(v.mismatches));
++        for (const auto &[pc, n] : v.byPc)
++            std::fprintf(stderr, " 0x%04x=%llu", pc, static_cast<unsigned long long>(n));
++        std::fprintf(stderr, "\n");
++        std::fflush(stderr);
++    }
++
+     void printAotVerifyStats()
+     {
+         AotVerifyStats &v = g_aotVerifyStats;
+@@ -1376,6 +1408,16 @@ void VU1Interpreter::finishXgkick()
+     if (!m_xgkick.active)
+         return;
+ 
++    if (g_resultsVerify && m_unit == Unit::VU1)
++    {
++        ResultsVerify &rv = g_resultsVerifyState[this];
++        rv.packetHash = fnv1a(m_xgkick.packet.data(), m_xgkick.totalBytes, rv.packetHash);
++        if (rv.isTwin)
++        {
++            m_xgkick.active = false;
++            return;
++        }
++    }
+     if (m_activeMemory)
+         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
+     else if (m_activeGs)
+@@ -2756,6 +2798,106 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                          uint8_t *vuData, uint32_t dataSize,
+                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
+ {
++    if (g_resultsVerify && m_unit == Unit::VU1 && g_aotBlockCount != 0u)
++    {
++        ResultsVerify &rv = g_resultsVerifyState[this];
++        if (!rv.isTwin && !rv.nested)
++        {
++            if (!rv.twin)
++            {
++                rv.twin = std::make_unique<VU1Interpreter>(Unit::VU1);
++                rv.twin->m_state = m_state;
++                g_resultsVerifyState[rv.twin.get()].isTwin = true;
++                g_directIds[rv.twin.get()].exact = true;
++                static const bool registered = (std::atexit(printResultsVerifyStats), true);
++                (void)registered;
++            }
++            VU1Interpreter &t = *rv.twin;
++            // The run state (everything but the code caches); m_fastBlock is null between runs.
++            const uint32_t twinMac = t.m_state.mac, twinStatus = t.m_state.status;
++            t.m_state = m_state;
++            t.m_state.mac = twinMac;
++            t.m_state.status = twinStatus;
++            t.m_fastBlock = nullptr;
++            t.m_fastIndex = m_fastIndex;
++            t.m_fastStart = m_fastStart;
++            t.m_xgkickSyncCycle = m_xgkickSyncCycle;
++            t.m_flagPipeline = m_flagPipeline; // at an MSCNT resume: without the flag writes this run dropped
++            t.m_fdiv = m_fdiv;
++            t.m_efu = m_efu;
++            t.m_storePipeline = m_storePipeline;
++            t.m_vfWritePipeline = m_vfWritePipeline;
++            t.m_viWritePipeline = m_viWritePipeline;
++            t.m_accWritePipeline = m_accWritePipeline;
++            t.m_xgkick = m_xgkick;
++            t.m_vfReady = m_vfReady;
++            t.m_viReady = m_viReady;
++            t.m_accReady = m_accReady;
++            t.m_vfLatestWrite = m_vfLatestWrite;
++            t.m_viLatestWrite = m_viLatestWrite;
++            t.m_accLatestWrite = m_accLatestWrite;
++            t.m_regReadyMax = m_regReadyMax;
++            t.m_vfRegReadyMax = m_vfRegReadyMax;
++            t.m_cycle = m_cycle;
++            t.m_nextCommitCycle = m_nextCommitCycle;
++            t.m_flagMask = m_flagMask;
++            t.m_efuMask = m_efuMask;
++            t.m_storeMask = m_storeMask;
++            t.m_vfMask = m_vfMask;
++            t.m_viMask = m_viMask;
++            t.m_accMask = m_accMask;
++            t.m_nextWriteSequence = m_nextWriteSequence;
++            t.m_efuResourceReady = m_efuResourceReady;
++            t.m_workingClip = m_workingClip;
++            t.m_currentUpperInstruction = m_currentUpperInstruction;
++            t.m_viBranchBackupValue = m_viBranchBackupValue;
++            t.m_viBranchBackupReg = m_viBranchBackupReg;
++            t.m_viBranchBackupValid = m_viBranchBackupValid;
++            t.m_stopRequested = m_stopRequested;
++            t.m_pendingHaltD = m_pendingHaltD;
++            t.m_pendingHaltT = m_pendingHaltT;
++            const uint32_t startPc = m_state.pc;
++            std::vector<uint8_t> scratch(vuData, vuData + dataSize);
++            ResultsVerify &trv = g_resultsVerifyState[&t];
++            trv.packetHash = rv.packetHash = 1469598103934665603ull;
++            t.run(vuCode, codeSize, scratch.data(), dataSize, gs, memory, maxCycles);
++            rv.nested = true;
++            run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
++            rv.nested = false;
++
++            const VU1State &a = m_state, &b = t.m_state;
++            std::string diff;
++            const auto check = [&](bool same, const char *what)
++            {
++                if (!same)
++                    diff += diff.empty() ? what : std::string(" ") + what;
++            };
++            check(std::memcmp(a.vf, b.vf, sizeof(a.vf)) == 0, "vf");
++            check(std::memcmp(a.vi, b.vi, sizeof(a.vi)) == 0, "vi");
++            check(std::memcmp(a.acc, b.acc, sizeof(a.acc)) == 0, "acc");
++            check(std::memcmp(&a.q, &b.q, sizeof(float)) == 0 && std::memcmp(&a.p, &b.p, sizeof(float)) == 0 &&
++                      std::memcmp(&a.i, &b.i, sizeof(float)) == 0 && a.r == b.r,
++                  "q/p/i/r");
++            check(a.clip == b.clip, "clip");
++            check(a.pc == b.pc && a.ebit == b.ebit && a.stoppedByD == b.stoppedByD && a.stoppedByT == b.stoppedByT &&
++                      a.branchPending == b.branchPending && a.branchTarget == b.branchTarget &&
++                      a.branchDelay == b.branchDelay,
++                  "pc/end");
++            check(std::memcmp(scratch.data(), vuData, dataSize) == 0, "data");
++            check(trv.packetHash == rv.packetHash, "packets");
++            ResultsVerifyStats &v = g_resultsVerifyStats;
++            ++v.checks;
++            if (!diff.empty())
++            {
++                ++v.byPc[startPc];
++                if (++v.mismatches <= 32u)
++                    std::fprintf(stderr, "[vu1:results-verify] mismatch: run from 0x%04x: %s\n", startPc, diff.c_str());
++            }
++            if ((v.checks & 0xFFFu) == 0u)
++                printResultsVerifyStats(); // test mode leaves with _Exit, so report as we go
++            return;
++        }
++    }
+     m_activeVuData = vuData;
+     m_activeVuDataSize = dataSize;
+     m_activeGs = &gs;
