@@ -1,0 +1,114 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 3949e86..2eef583 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -83,9 +83,11 @@ namespace
+     const uint32_t g_aotBlockCount = 0u;
+ #endif
+     const bool g_aotVerify = std::getenv("PS2X_VU_AOT_VERIFY") != nullptr;
+-    // #48 experiment: bind the generated blocks' relaxed variant (no MAC/status flags, CLIP at once, the cycle
+-    // advanced only for pairs that read it). Values can differ from the exact engine.
+-    const bool g_aotRelaxed = std::getenv("PS2X_VU_RELAXED") != nullptr;
++    // Generated blocks bind their relaxed variant (#48, #57): no MAC/status work for flag writes that no reader in
++    // the whole micro image can see (tools/vu1_gen.py proves which), the cycle advanced only for pairs that read
++    // it; CLIP, Q and P stay exact. PS2X_VU_EXACT=1 binds the exact variant, the reference; so does
++    // PS2X_VU_AOT_VERIFY, which compares MAC/status too.
++    const bool g_aotRelaxed = std::getenv("PS2X_VU_EXACT") == nullptr && !g_aotVerify;
+     const bool noElide = std::getenv("PS2X_VU_NO_FLAG_ELIDE") != nullptr;
+ 
+     // PS2X_VU_STATS=1 (#36): VU1 coverage counters. Off: one predictable branch on a static per hook.
+diff --git a/ps2xTest/src/ps2_vu1_diff_tests.cpp b/ps2xTest/src/ps2_vu1_diff_tests.cpp
+index a38123c..df8f449 100644
+--- a/ps2xTest/src/ps2_vu1_diff_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_diff_tests.cpp
+@@ -1,8 +1,10 @@
+ // VU1 differential test (dotr-recomp #42). Random but valid VU1 microprograms run through the interpreter
+ // (PS2X_VU_NO_BLOCKS=1), the fast-block executor (PS2X_VU_NO_AOT=1) and, in ps2x_vu1_diff_aot, the code that
+-// dotr-recomp's tools/vu1_gen.py generated for these same programs from a capture of the fast-block run.
++// dotr-recomp's tools/vu1_gen.py generated for these same programs from a capture of the fast-block run: its exact
++// variant (PS2X_VU_EXACT=1) and its relaxed one (the default, #57).
+ // The engine switches are read once per process, so the test runs itself once per engine and compares the dumps
+-// of VF/VI/ACC/Q/P/I/R/MAC/status/clip, pc, cycles and VU data memory line by line.
++// of VF/VI/ACC/Q/P/I/R/MAC/status/clip, pc, cycles and VU data memory line by line. The relaxed variant is compared
++// on results only: MAC/status and cycles are left out (it drops the flag writes no reader can see).
+ // Design adapted from PR #254's VU1 differential tests (raw operand bits, oracle vs candidate, budget cuts).
+ //
+ // usage: ps2x_vu1_diff [N]            compare the engines over programs 0..N-1 (exit 0 when they all match)
+@@ -21,6 +23,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <filesystem>
++#include <regex>
+ #include <set>
+ #include <string>
+ #include <vector>
+@@ -118,6 +121,10 @@ namespace
+         uint64_t readerAcrossBlock = 0, fmacs = 0, branches = 0, kicks = 0, loi = 0;
+     };
+ 
++    // Odd programs read no sticky status bit (FSEQ/FSOR become FSAND, FSAND masks only Z/S/U/O/I/D), so
++    // vu1_gen.py keeps only the flag writes a reader can see and the relaxed variant drops the others (#57).
++    bool g_noStickyReaders = false;
++
+     uint32_t vfSrc(Rng &r) { return r.chance(85) ? r.n(9) : r.n(32); }
+     uint32_t vfDst(Rng &r) { return r.chance(85) ? 1u + r.n(8) : 1u + r.n(31); }
+     uint32_t viDst(Rng &r) { return 1u + r.n(9); }
+@@ -160,9 +167,9 @@ namespace
+         case 6: // MAC/status/clip readers and writers
+             switch (r.n(12))
+             {
+-            case 0: return imm12(0x14, viDst(r), r.n(0x1000)); // FSEQ
+-            case 1: return imm12(0x16, viDst(r), r.n(0x1000)); // FSAND
+-            case 2: return imm12(0x17, viDst(r), r.n(0x1000)); // FSOR
++            case 0: return imm12(g_noStickyReaders ? 0x16 : 0x14, viDst(r), r.n(0x1000) & (g_noStickyReaders ? 0x3Fu : 0xFFFu)); // FSEQ
++            case 1: return imm12(0x16, viDst(r), r.n(0x1000) & (g_noStickyReaders ? 0x3Fu : 0xFFFu)); // FSAND
++            case 2: return imm12(g_noStickyReaders ? 0x16 : 0x17, viDst(r), r.n(0x1000) & (g_noStickyReaders ? 0x3Fu : 0xFFFu)); // FSOR
+             case 3: return imm12(0x15, 0, r.n(0x1000));         // FSSET
+             case 4: return lowerOp(0x18, 0, viDst(r), viSrc(r), 0); // FMEQ
+             case 5: return lowerOp(0x1A, 0, viDst(r), viSrc(r), 0); // FMAND
+@@ -274,6 +281,7 @@ namespace
+     Program generate(int index, Coverage *cov = nullptr)
+     {
+         Rng r{0x9E3779B97F4A7C15ull * static_cast<uint64_t>(index + 1) + 0x1234567ull};
++        g_noStickyReaders = (index & 1) != 0;
+         for (int k = 0; k < 4; ++k)
+             r.u32();
+         Program p{};
+@@ -573,17 +581,26 @@ namespace
+         return -1.0;
+     }
+ 
++    // A dump line without what the relaxed variant may change: MAC/status and cycles.
++    std::string resultsOnly(const std::string &line)
++    {
++        static const std::regex dropped(" mac [0-9a-f]+ status [0-9a-f]+| cycles [0-9]+");
++        return std::regex_replace(line, dropped, "");
++    }
++
+     int compare(int count)
+     {
+         struct Engine
+         {
+             const char *name, *env;
+             Output out;
++            bool relaxed = false; // compared on results only
+         };
+         std::vector<Engine> engines = {{"interpreter", "PS2X_VU_NO_BLOCKS=1", {}},
+                                        {"fast block", "PS2X_VU_NO_AOT=1 PS2X_VU_STATS=1", {}}};
+ #ifdef PS2X_VU1_DIFF_AOT
+-        engines.push_back({"generated", "PS2X_VU_STATS=1", {}});
++        engines.push_back({"generated", "PS2X_VU_EXACT=1 PS2X_VU_STATS=1", {}});
++        engines.push_back({"relaxed", "PS2X_VU_STATS=1", {}, true});
+ #endif
+         int failures = 0;
+         for (Engine &e : engines)
+@@ -619,7 +636,8 @@ namespace
+             for (size_t l = 0; l < ref.state.size(); ++l)
+             {
+                 const int prog = std::atoi(ref.state[l].c_str());
+-                if (ref.state[l] == out.state[l])
++                if (ref.state[l] == out.state[l] ||
++                    (engines[k].relaxed && resultsOnly(ref.state[l]) == resultsOnly(out.state[l])))
+                     continue;
+                 if (bad.insert(prog).second && shown++ < 8)
+                     std::printf("  %s differs from the interpreter, program %d:\n    interp: %s\n    %s: %s\n",

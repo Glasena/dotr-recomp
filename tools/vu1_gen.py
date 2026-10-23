@@ -12,8 +12,8 @@ generic block step, then the block exit) as calls to Vu1Aot (src/lib/vu/ps2_vu1_
 VI plans, shadow registers and pair kinds as constants, and a table keyed by (image hash, start pc). The runtime uses
 a block only when its words, per-pair plans (DirectIds::Plan) and generic-step facts equal what is written here.
 Build it in with cmake -DPS2X_VU1_AOT_DIR=OUT_DIR.
-Each block is emitted twice (#48, #57): exact, and relaxed (PS2X_VU_RELAXED=1). The relaxed one
-drops the MAC/status work of every FMAC whose flags no MAC/status reader in the whole micro image can see
+Each block is emitted twice (#48, #57): exact, and relaxed (the runtime default; PS2X_VU_EXACT=1 picks exact). The
+relaxed one drops the MAC/status work of every FMAC whose flags no MAC/status reader in the whole micro image can see
 (observable_flag_writes: a CFG search over all pairs, not only the captured ones); the others stay exact.
 
 Every run compares the capture with config/vu1_manifest.txt (#43; image hash, block pc, pairs and content hash per

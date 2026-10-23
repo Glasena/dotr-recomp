@@ -241,6 +241,15 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   blocks (manifest refreshed, no runtime change). Duel `PS2X_VU_STATS`: generated 99.6% of pairs, tight loop 0.0%,
   interpreter 0.4% (liveIn 96%, xgkickBusy 4%). Duel 10000-11000, 2 interleaved pairs: ~15.5 -> ~15.65 VBlanks/s
   (+1%, near noise). All map/default/duel dumps identical; verify 0 mismatches (map 262K, duel 8.0M checks).
+- Patches 0049-0051 (2026-10-23, #57): relaxed generated VU1 code is the default; `PS2X_VU_EXACT=1` binds the exact
+  variant (so does `PS2X_VU_AOT_VERIFY`). `vu1_gen.py` proves over the whole image (CFG search, E/JR/D/T = anywhere,
+  a write dies once a later one is 4 pairs before the reader; sticky readers keep all) which FMAC flag writes a
+  MAC/status reader can see; those pairs stay exact. DotR: 6 FSAND (S bit only), 0 MAC/sticky readers, 46 of 935
+  writes kept. CLIP is queued at issue in relaxed too (exact). `PS2X_VU_RESULTS_VERIFY=1` reruns every VU1 run on an
+  exact twin (state + VU data copy, PATH1 hashed): map 90k runs, duel 1.54M, 0 mismatches. `vu1_diff` adds the
+  relaxed engine on results only (odd programs have no sticky readers; dropping all writes fails 40/120). All
+  dumps identical. pgs: duel 10000->11000 36.2 -> 25.7 s (~27.6 -> ~39 VBlanks/s), GameThread 215G -> 144G instr,
+  93G -> 63G cycles; map 1900->2300 9.1 -> 6.3 s, 56.9G -> 39.8G instr.
 - Patch 0027 (2026-10-22, #35): `perf --call-graph dwarf` found the map/hash share was `IopKernel::beginNextReady`/
   `nextWakeCycle` walking the thread `std::map` on every idle IOP step (~7.5%) and the GIF_STAT lookup in
   `advanceEeTimers` (~2.1%). Kernel caches "nothing ready until cycle W" behind a version bumped by every public
