@@ -1,0 +1,161 @@
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 941cc03..a8d58e2 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -126,6 +126,8 @@ namespace ps2x::iop::detail
+             vblank.reset();
+             ioman.reset();
+             pendingDmaInterrupts.clear();
++            nextDmaDue = UINT64_MAX;
++            idleUntil = 0;
+             pendingGuestCallbacks.clear();
+             nextModuleId = 1;
+             moduleCursor = kModuleLoadBase;
+@@ -178,7 +180,10 @@ namespace ps2x::iop::detail
+         void schedulePendingDma()
+         {
+             if (const auto dma = memory.takeDmaStart())
++            {
+                 pendingDmaInterrupts[dma->irq] = totalCycles + dma->delayCycles;
++                nextDmaDue = std::min(nextDmaDue, totalCycles + dma->delayCycles);
++            }
+         }
+ 
+         bool readRam(uint32_t address, void *destination, size_t size) const
+@@ -407,7 +412,7 @@ namespace ps2x::iop::detail
+             {
+                 if (!step(cpu))
+                     break;
+-                if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
++                if (!servicingDmaInterrupts && totalCycles >= nextDmaDue)
+                     servicePendingDmaInterrupts();
+                 if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
+                     servicePendingGuestCallbacks();
+@@ -508,9 +513,18 @@ namespace ps2x::iop::detail
+             catch (...)
+             {
+                 servicingDmaInterrupts = false;
++                updateNextDmaDue();
+                 throw;
+             }
+             servicingDmaInterrupts = false;
++            updateNextDmaDue();
++        }
++
++        void updateNextDmaDue()
++        {
++            nextDmaDue = UINT64_MAX;
++            for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
++                nextDmaDue = std::min(nextDmaDue, completionCycle);
+         }
+ 
+         void servicePendingGuestCallbacks()
+@@ -556,11 +570,19 @@ namespace ps2x::iop::detail
+ 
+         void runCycles(uint64_t cycles) noexcept
+         {
++            // The last pass found no ready thread and nothing due before idleUntil, and nothing has entered the
++            // IOP since: the loop below would only advance the clock.
++            if (totalCycles + cycles <= idleUntil)
++            {
++                totalCycles += cycles;
++                return;
++            }
+             try
+             {
+                 const uint64_t target = totalCycles + cycles;
+                 while (totalCycles < target)
+                 {
++                    idleUntil = 0;
+                     servicePendingDmaInterrupts();
+                     servicePendingGuestCallbacks();
+                     timrman.serviceDue(totalCycles, *this);
+@@ -568,13 +590,15 @@ namespace ps2x::iop::detail
+                     IopThread *next = kernel.beginNextReady(totalCycles);
+                     if (!next)
+                     {
+-                        uint64_t nextWake = kernel.nextWakeCycle(target);
++                        uint64_t nextWake = kernel.nextWakeCycle(UINT64_MAX);
+                         for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
+                             nextWake = std::min(nextWake, completionCycle);
+                         if (!pendingGuestCallbacks.empty())
+                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
+                         nextWake = timrman.nextEventCycle(nextWake);
+                         nextWake = vblank.nextEventCycle(nextWake);
++                        if (nextWake > totalCycles)
++                            idleUntil = nextWake;
+                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
+                         continue;
+                     }
+@@ -705,6 +729,8 @@ namespace ps2x::iop::detail
+         uint64_t totalCycles = 0;
+         uint64_t totalInstructions = 0;
+         uint64_t eeCycleCarry = 0;
++        uint64_t nextDmaDue = UINT64_MAX; // earliest pendingDmaInterrupts cycle (may be early, never late)
++        uint64_t idleUntil = 0;           // see runCycles; cleared by every other entry into the IOP
+         CpuState *activeCpu = nullptr;
+         std::string lastError;
+         bool servicingDmaInterrupts = false;
+@@ -729,16 +755,19 @@ namespace ps2x::iop::detail
+ 
+     ModuleLoadResult IopEmulator::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
+     {
++        m_impl->idleUntil = 0;
+         return m_impl->loadModule(path, arguments, argumentSize);
+     }
+ 
+     ModuleLoadResult IopEmulator::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
+     {
++        m_impl->idleUntil = 0;
+         return m_impl->loadModuleBuffer(guestAddress, arguments, argumentSize);
+     }
+ 
+     bool IopEmulator::stopModule(int32_t moduleId, int32_t *result)
+     {
++        m_impl->idleUntil = 0;
+         return m_impl->stopModule(moduleId, result);
+     }
+ 
+@@ -753,6 +782,7 @@ namespace ps2x::iop::detail
+ 
+     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
+     {
++        m_impl->idleUntil = 0;
+         return m_impl->rpc.handleRpc(request, *m_impl);
+     }
+ 
+@@ -763,16 +793,19 @@ namespace ps2x::iop::detail
+ 
+     void IopEmulator::onSifTransfer(const SifTransfer &transfer)
+     {
++        m_impl->idleUntil = 0;
+         m_impl->rpc.onSifTransfer(transfer);
+     }
+ 
+     uint32_t IopEmulator::allocateMemory(uint32_t size, uint32_t alignment)
+     {
++        m_impl->idleUntil = 0;
+         return m_impl->memory.allocate(size, alignment);
+     }
+ 
+     bool IopEmulator::freeMemory(uint32_t address)
+     {
++        m_impl->idleUntil = 0;
+         return m_impl->memory.freeAllocation(address);
+     }
+ 
+@@ -784,12 +817,14 @@ namespace ps2x::iop::detail
+ 
+     bool IopEmulator::writeMemory(uint32_t address, const void *source, size_t size)
+     {
++        m_impl->idleUntil = 0;
+         return isMemoryRange(address, size) &&
+                m_impl->memory.writeRam(address, source, size);
+     }
+ 
+     bool IopEmulator::zeroMemory(uint32_t address, size_t size)
+     {
++        m_impl->idleUntil = 0;
+         return isMemoryRange(address, size) &&
+                m_impl->memory.zeroRam(address, size);
+     }

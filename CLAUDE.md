@@ -246,6 +246,10 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   `advanceEeTimers` (~2.1%). Kernel caches "nothing ready until cycle W" behind a version bumped by every public
   mutator; GIF_STAT node pointer cached. IOP `runCycles` 14.9% -> 9.3% of the game thread; map 1900->2300
   15.8 s -> 14.65 s (~25.3 -> ~27.3 VBlanks/s). Dumps and log identical, IOP tests pass.
+- Patch 0047 (2026-10-23, #52): IOP threads stay idle on map/duel, but each of ~1M `runCycles` calls/s re-ran every
+  service and next-event scan; now an "idle until W" cache (cleared by any other IOP entry) plus a DMA-due gate per
+  step. IOP share of the duel game thread ~11% -> ~5.4% (rest: KCEJEAST vblank handler `SpuRGetAllKeysStatus`, real
+  work). Duel 10000->11000 ~59.6 -> ~56.5 s (pgs 52.0 -> 48.2 s); map instr -12%. Dumps, log identical; IOP tests pass.
 - Patch 0022 (2026-10-22, #30): fast-block MADD/MSUB (vector, broadcast, Q/I) and OPMSUB into VF with SSE (0020/0021
   did ADD/SUB/MUL). Map samples after VBlank ~1800: ~14.6 VBlanks/s (14.1-15.0) vs ~14.2; dumps byte-identical.
 - Patch 0023 (2026-10-22, #31): the same SSE path for the ACC forms (ADDA/SUBA/MULA/MADDA/MSUBA, broadcast, Q/I,
