@@ -374,6 +374,14 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
   (cause not found yet; step 2). Menu uncapped 62 -> ~181 VBlanks/s. `tools/imgdiff.sh a b [montage]` gates
   PSNR>=35, AE(fuzz 2%)<=1%, PHASH<=30. pgs dumps vary slightly run to run.
 
+## GPU GS step 2 (2026-10-23, #51)
+- Squeezed movie (patch 0044): the HLE `sceGsSetDefDBuff` writes DISPLAY in CPU-backend units (MAGH=0, DW=639,
+  DH=223, DY=32; movie runs PMODE 0x8007, SMODE2=3 frame mode). Hardware counts DW in VCK and DH in raster lines, so
+  paraLLEl scanned out a quarter-width, half-height picture. The pgs backend rewrites MAGH=0/DW<1024 values as
+  libgraph NTSC ones (636, 50, MAGH=2560/w-1, DH doubled in frame mode); the CPU path and HLE are untouched. The
+  movie now matches the CPU dump scaled 1x2 (PSNR 31-34 dB, PHASH <= 9; the rest is interlace edges).
+  `[pgs] scanout WxH ...` logs every scanout size/DISPLAY1 change.
+
 ## Next steps (2026-10-22)
 Order is tracked with the `priority: N` labels; #13 is pinned on GitHub.
 1. #13 (priority 3) is the parent. #22 (async VU1) did not help: the EE waits on the kick. #23 (patch 0016) and

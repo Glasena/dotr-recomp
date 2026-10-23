@@ -1,0 +1,66 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp b/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp
+index f005229..c6f2c0e 100644
+--- a/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp
+@@ -84,6 +84,23 @@ namespace
+         }
+     }
+ 
++    // HLE sceGsSetDefDBuff/DefDBuffDc/DefDispEnv (used by the movie player, #51) write DISPLAY in the CPU
++    // backend's units: MAGH=0, DW=width-1 pixels, DH=height-1 buffer lines, DY=32. Hardware counts DW in VCK
++    // (MAGH+1 per pixel) and, in interlaced frame mode, DH in raster lines, so paraLLEl-GS scanned the movie out
++    // at a quarter width and half height. Rewrite such values as libgraph's NTSC ones (636, 50, MAGH=2560/w-1).
++    // ponytail: MAGH=0 with DW < 1024 is taken as HLE-written; no real NTSC display is that narrow.
++    uint64_t hardwareDisplay(uint64_t display, uint64_t smode2)
++    {
++        const uint64_t dw = (display >> 32) & 0xfff, dh = (display >> 44) & 0x7ff, magh = (display >> 23) & 15;
++        if (magh != 0 || dw >= 1024)
++            return display;
++        const uint64_t width = dw + 1, newMagh = std::max<uint64_t>(1, 2560 / width) - 1;
++        const bool interlaced = smode2 & 1, frameMode = (smode2 >> 1) & 1;
++        const uint64_t lines = interlaced && frameMode ? (dh + 1) * 2 : dh + 1;
++        const uint64_t dy = interlaced ? 50 : 25;
++        return 636 | (dy << 12) | (newMagh << 23) | ((width * (newMagh + 1) - 1) << 32) | ((lines - 1) << 44);
++    }
++
+     // Headless Vulkan device (no surface, no GL). Granite picks the discrete GPU first;
+     // GRANITE_VULKAN_DEVICE_INDEX overrides it.
+     struct HeadlessDevice
+@@ -128,6 +145,8 @@ namespace
+         size_t fifoOffset = 16;
+         mutable uint64_t readbacks = 0; // VRAM maps and LOCAL->HOST transfers (not scanout readbacks)
+         uint64_t presents = 0;
++        uint32_t lastW = 0, lastH = 0;
++        uint64_t lastDisplay1 = 0;
+         Vulkan::BufferHandle readbackBuffer;
+ 
+         void observeRegister(uint8_t addr, uint64_t value)
+@@ -385,9 +404,9 @@ namespace
+             p.qwords_lo[4] = request.smode2;
+             p.qwords_lo[12] = priv.syncv;
+             p.qwords_lo[14] = request.dispfb1;
+-            p.qwords_lo[16] = request.display1;
++            p.qwords_lo[16] = hardwareDisplay(request.display1, request.smode2);
+             p.qwords_lo[18] = request.dispfb2;
+-            p.qwords_lo[20] = request.display2;
++            p.qwords_lo[20] = hardwareDisplay(request.display2, request.smode2);
+             p.qwords_lo[28] = request.bgcolor;
+             ParallelGS::VSyncInfo info{};
+             info.phase = uint32_t(priv.csr.load() >> 13) & 1u;
+@@ -407,6 +426,16 @@ namespace
+             // ponytail: synchronous scanout readback every present; GL interop (#285) replaces it for on-screen use.
+             const auto &image = *scanout.image;
+             const uint32_t w = image.get_width(), h = image.get_height();
++            if (w != lastW || h != lastH || request.display1 != lastDisplay1)
++            {
++                lastW = w;
++                lastH = h;
++                lastDisplay1 = request.display1;
++                std::cerr << "[pgs] scanout " << w << "x" << h << std::hex << " pmode=" << request.pmode
++                          << " smode2=" << request.smode2 << " dispfb1=" << request.dispfb1
++                          << " display1=" << request.display1 << " dispfb2=" << request.dispfb2
++                          << " display2=" << request.display2 << std::dec << std::endl;
++            }
+             const VkDeviceSize bytes = VkDeviceSize(w) * h * 4;
+             if (!readbackBuffer || readbackBuffer->get_create_info().size < bytes)
+             {
