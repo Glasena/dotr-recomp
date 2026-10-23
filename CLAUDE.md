@@ -230,6 +230,9 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
 - Patch 0040 (2026-10-23, #45): at program end `run()` first advances to the last VF/VI/ACC lane ready cycle (fast
   blocks and generated code queue no register writes), then flushes. `vu1_diff` drops the end-cycle rule; only #46
   is left. Interpreter output unchanged; map dumps, default dumps, verify and flag check unchanged; rate +0.1% instr.
+- Patch 0041 (2026-10-23, #46): `decodeUpperUsage` declares OPMSUB/OPMULA reads as fs.yzx/ft.zxy of dest (w reads w:
+  its product feeds the sticky flags), so all engines stall alike; `vu1_diff` has no known differences left. DotR's
+  captured microcode has no OPM ops: generated code, map/default dumps, verify, flag check and rate unchanged.
 - Patch 0027 (2026-10-22, #35): `perf --call-graph dwarf` found the map/hash share was `IopKernel::beginNextReady`/
   `nextWakeCycle` walking the thread `std::map` on every idle IOP step (~7.5%) and the GIF_STAT lookup in
   `advanceEeTimers` (~2.1%). Kernel caches "nothing ready until cycle W" behind a version bumped by every public

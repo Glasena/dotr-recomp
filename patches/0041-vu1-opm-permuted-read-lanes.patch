@@ -1,0 +1,108 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 08bddc1..c1c1348 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1550,6 +1550,21 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
+     }
+ }
+ 
++// OPMULA/OPMSUB (cross product) read fs.yzx and ft.zxy: dest lane x reads fs.y/ft.z, y reads fs.z/ft.x,
++// z reads fs.x/ft.y. w reads fs.w/ft.w (its product only feeds the sticky flags, calculateFmacProductSticky).
++// Lane bits: x=8, y=4, z=2, w=1.
++static uint8_t opmFsLanes(uint8_t dest)
++{
++    return static_cast<uint8_t>(((dest & 8u) ? 4u : 0u) | ((dest & 4u) ? 2u : 0u) | ((dest & 2u) ? 8u : 0u) |
++                                (dest & 1u));
++}
++
++static uint8_t opmFtLanes(uint8_t dest)
++{
++    return static_cast<uint8_t>(((dest & 8u) ? 2u : 0u) | ((dest & 4u) ? 8u : 0u) | ((dest & 2u) ? 4u : 0u) |
++                                (dest & 1u));
++}
++
+ VU1Interpreter::InstructionUsage VU1Interpreter::decodeUpperUsage(uint32_t upper) const
+ {
+     InstructionUsage usage;
+@@ -1564,12 +1579,12 @@ VU1Interpreter::InstructionUsage VU1Interpreter::decodeUpperUsage(uint32_t upper
+ 
+     if (op <= 0x2Fu)
+     {
+-        addVfRead(usage, fs, dest);
++        addVfRead(usage, fs, op == 0x2Eu ? opmFsLanes(dest) : dest);
+         addVfWrite(usage, fd, dest);
+         if (op <= 0x1Bu)
+             addVfRead(usage, ft, laneForComponent(op & 3u));
+         else if (op >= 0x28u)
+-            addVfRead(usage, ft, op == 0x2Eu ? 0xEu : dest);
++            addVfRead(usage, ft, op == 0x2Eu ? opmFtLanes(dest) : dest);
+         if (op == 0x08u || op == 0x09u || op == 0x0Au || op == 0x0Bu ||
+             op == 0x0Cu || op == 0x0Du || op == 0x0Eu || op == 0x0Fu ||
+             op == 0x21u || op == 0x23u || op == 0x25u || op == 0x27u ||
+@@ -1591,11 +1606,11 @@ VU1Interpreter::InstructionUsage VU1Interpreter::decodeUpperUsage(uint32_t upper
+             (special >= 0x2Cu && special <= 0x2Eu);
+         if (writesAcc)
+         {
+-            addVfRead(usage, fs, dest);
++            addVfRead(usage, fs, special == 0x2Eu ? opmFsLanes(dest) : dest);
+             if (special <= 0x1Bu)
+                 addVfRead(usage, ft, laneForComponent(special & 3u));
+             else if ((special >= 0x28u && special <= 0x2Eu))
+-                addVfRead(usage, ft, special == 0x2Eu ? 0xEu : dest);
++                addVfRead(usage, ft, special == 0x2Eu ? opmFtLanes(dest) : dest);
+             usage.accWrite = dest;
+             if ((special >= 0x08u && special <= 0x0Fu) ||
+                 special == 0x21u || special == 0x23u || special == 0x25u ||
+diff --git a/ps2xTest/src/ps2_vu1_diff_tests.cpp b/ps2xTest/src/ps2_vu1_diff_tests.cpp
+index dfe4b0d..a38123c 100644
+--- a/ps2xTest/src/ps2_vu1_diff_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_diff_tests.cpp
+@@ -36,10 +36,6 @@ namespace
+     // Stores go to qwords 0x40..0xFF; loads read 0x00..0xFF. vi10 is the JR/JALR target (always the E pair, so
+     // every jump is forward), vi11 the BAL/JALR link, vi15 the loop counter: random VI writes use vi1..vi9 only.
+ 
+-    // Known engine differences (dotr-recomp #46): OPMSUB/OPMULA read fs/ft lanes outside their dest, which the
+-    // hazard model does not see, so a fast block reads a value the interpreter still has in flight. These
+-    // programs may differ in any field; they are reported, not failed.
+-    const std::set<int> kKnownOpmPrograms = {1, 2354, 3079, 5282, 6902, 7042, 9212};
+     // Programs whose generated code is known to hang; ps2x_vu1_diff_aot skips them in every engine, or the
+     // generated run would never return. Empty since dotr-recomp #47 (XGKICK at a block's first pair) was fixed.
+     const std::set<int> kKnownAotHangs = {};
+@@ -265,8 +261,8 @@ namespace
+         // #45 (fixed): MINIw.y vf1 in the E bit's delay slot, in a block entered by a branch: the fast block ended
+         // the program without waiting for the MINI result, 3 cycles before the interpreter.
+         {0x40000001u, kUpperNop, kLowerNop, kUpperNop, kLowerNop, kUpperNop | kEBit, kLowerNop, 0x00943857u},
+-        // #46: ADDx.yz vf1, then OPMSUB.x vf23, vf1, vf6, which reads vf1.y: the interpreter reads the old vf1.y
+-        // (its read lanes are taken from dest, x), the fast block the new one.
++        // #46 (fixed): ADDx.yz vf1, then OPMSUB.x vf23, vf1, vf6, which reads vf1.y: the hazard model took the read
++        // lanes from dest (x), so the interpreter read the old vf1.y and the fast block the new one without a stall.
+         {kLowerNop, 0x00C81040u, kLowerNop, 0x01060DEEu, kLowerNop, kUpperNop | kEBit, kLowerNop, kUpperNop},
+         // #47: a block whose first pair is an XGKICK while PATH1 is still busy: the generated code leaves at pair 0
+         // and run() enters the same generated block again, forever.
+@@ -620,24 +616,17 @@ namespace
+                 ++failures;
+                 continue;
+             }
+-            std::set<int> known;
+             for (size_t l = 0; l < ref.state.size(); ++l)
+             {
+                 const int prog = std::atoi(ref.state[l].c_str());
+                 if (ref.state[l] == out.state[l])
+                     continue;
+-                if (kKnownOpmPrograms.count(prog))
+-                {
+-                    known.insert(prog);
+-                    continue;
+-                }
+                 if (bad.insert(prog).second && shown++ < 8)
+                     std::printf("  %s differs from the interpreter, program %d:\n    interp: %s\n    %s: %s\n",
+                                 engines[k].name, prog, ref.state[l].c_str(), engines[k].name, out.state[l].c_str());
+             }
+-            std::printf("%s vs interpreter: %d programs, %zu differ, %zu more only in known ways "
+-                        "(dotr-recomp #46); fast %.1f%%, generated %.1f%% of pairs\n",
+-                        engines[k].name, count, bad.size(), known.size(), statsPercent(out, "(fast "),
++            std::printf("%s vs interpreter: %d programs, %zu differ; fast %.1f%%, generated %.1f%% of pairs\n",
++                        engines[k].name, count, bad.size(), statsPercent(out, "(fast "),
+                         statsPercent(out, "generated "));
+             failures += static_cast<int>(bad.size());
+         }
