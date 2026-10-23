@@ -12,6 +12,9 @@ generic block step, then the block exit) as calls to Vu1Aot (src/lib/vu/ps2_vu1_
 VI plans, shadow registers and pair kinds as constants, and a table keyed by (image hash, start pc). The runtime uses
 a block only when its words, per-pair plans (DirectIds::Plan) and generic-step facts equal what is written here.
 Build it in with cmake -DPS2X_VU1_AOT_DIR=OUT_DIR.
+Each block is emitted twice (#48, #57): exact, and relaxed (PS2X_VU_RELAXED=1). The relaxed one
+drops the MAC/status work of every FMAC whose flags no MAC/status reader in the whole micro image can see
+(observable_flag_writes: a CFG search over all pairs, not only the captured ones); the others stay exact.
 
 Every run compares the capture with config/vu1_manifest.txt (#43; image hash, block pc, pairs and content hash per
 line, no game bytes) and warns about manifest blocks the capture lacks or whose pairs/content differ; --check makes
@@ -208,20 +211,103 @@ def plan(d):
     return upper_id(d['upper']), lower_id(d['lower'], d['ibit']), vi_reg, plain, vi_reg != 0 and delays, shadow, kind
 
 
-def block_body(pairs, plans):
-    """Statements of a generated block function template (Vu1Aot in ps2_vu1_aot.h; R = PS2X_VU_RELAXED, #48):
-    plain pairs as in the tight loop, the others and the last pair through the generic block step."""
+def is_fmac_flag_writer(d):
+    """Vu1Aot's direct FMAC ops (vu1fast::isDirectFmacId: ADD/SUB/MUL/MADD/MSUB/OPMSUB and their ACC forms) with a
+    nonzero dest: the only ops whose MAC/status flag write the relaxed variant drops."""
+    uid = upper_id(d['upper'])
+    op = uid - 0x40 if uid >= 0x40 else uid
+    fmac = uid < 0x80 and (op <= 0x0F or 0x18 <= op <= 0x1C or (0x1E <= op <= 0x2E and op not in (0x1F, 0x2B)))
+    return fmac and (d['upper'] >> 21) & 0xF != 0
+
+
+def flag_reads(d):
+    """(reads MAC or the Z/S/U/O status bits, reads sticky status bits) of a pair's lower op. FSAND bits 0x30 (D/I)
+    only change with DIV/SQRT/RSQRT, which stay exact."""
+    if d['ibit'] or d['lo'] not in ('FSEQ', 'FSAND', 'FSOR', 'FMEQ', 'FMAND', 'FMOR'):
+        return False, False
+    if d['lo'] == 'FSAND':
+        imm = ((d['lower'] >> 10) & 0x800) | (d['lower'] & 0x7FF)
+        return imm & 0xF != 0, imm & 0xFC0 != 0
+    return True, d['lo'] != 'FMEQ' and d['lo'] not in ('FMAND', 'FMOR')
+
+
+def successors(image):
+    """Pair -> next pairs over the whole image, over-approximated: always the next pair, plus the target after a
+    branch delay slot; None (anywhere) after a JR/JALR delay slot, an E-bit delay slot (the next program may start
+    anywhere with the flags this one left), a D/T bit or a reserved pair."""
+    count = len(image) // 8
+    succ = [{(p + 1) % count} for p in range(count)]
+    for p in range(count):
+        d = decode(image, p)
+        slot = (p + 1) % count
+        if d['up'] is None or d['lo'] is None or d['dbit'] or d['tbit']:
+            succ[p] = None
+        elif d['ebit'] or (d['branch'] and d['lo'] in ('JR', 'JALR')):
+            succ[slot] = None
+        elif d['branch'] and succ[slot] is not None:
+            imm = d['lower'] & 0x7FF
+            succ[slot].add((slot + (imm - 0x800 if imm & 0x400 else imm)) % count)
+    return succ
+
+
+def observable_flag_writes(image):
+    """Pairs of the whole image whose FMAC MAC/status write some reader can see; the relaxed variant keeps exactly
+    those (#57). A reader sees the newest write ready by its issue (4 cycles after the write's), so a later write at
+    least 4 pairs before the reader on the path hides every older one (pairs issue >= 1 cycle apart). Search state
+    on entering a pair: pairs since the first write after the one tested (0 = none yet), dead at 4. A sticky-bit
+    reader sees every write: then all are kept. Returns (kept pair set, summary)."""
+    count = len(image) // 8
+    pairs = [decode(image, p) for p in range(count)]
+    reads = [flag_reads(d) for d in pairs]
+    writers = [p for p, d in enumerate(pairs) if d['up'] is not None and is_fmac_flag_writer(d)]
+    readers = [p for p in range(count) if reads[p][0] or reads[p][1]]
+    summary = f'{len(readers)} MAC/status readers, {sum(r[1] for r in reads)} of them read sticky bits'
+    if not readers:
+        return set(), summary + ', no flag write kept'
+    if any(r[1] for r in reads):
+        return set(writers), summary + f', all {len(writers)} flag writes kept'
+    succ = successors(image)
+    writes = [p in set(writers) for p in range(count)]
+    # live[p][s]: entering pair p in state s, a reader can still see the tested write. Least fixpoint.
+    live = [[False] * 4 for _ in range(count)]
+
+    def out_state(p, s):
+        n = (1 if writes[p] else 0) if s == 0 else s + 1
+        return None if n >= 4 else n
+
+    def reaches(p, s):
+        n = out_state(p, s)
+        if n is None:
+            return False
+        return succ[p] is None or any(live[t][n] for t in succ[p])
+
+    changed = True
+    while changed:
+        changed = False
+        for p in range(count - 1, -1, -1):
+            for s in range(4):
+                if not live[p][s] and (reads[p][0] or reaches(p, s)):
+                    live[p][s] = changed = True
+    kept = {w for w in writers if succ[w] is None or any(live[t][0] for t in succ[w])}
+    return kept, summary + f', {len(kept)} of {len(writers)} flag writes kept'
+
+
+def block_body(pairs, plans, kept=()):
+    """Statements of a generated block function template (Vu1Aot in ps2_vu1_aot.h; R = relaxed, #48/#57):
+    plain pairs as in the tight loop, the others and the last pair through the generic block step. Pairs whose
+    index is in `kept` (a flag write some reader may see) are exact in both variants."""
     lines, last, synced = [], len(pairs) - 1, True
     for k, (d, p) in enumerate(zip(pairs, plans)):
         ops = f'0x{p[0]:x}, 0x{d["upper"]:08x}u, 0x{p[1]:x}, 0x{d["lower"]:08x}u, {p[2]}, {str(p[4]).lower()}'
+        mode = 'false' if k in kept else 'R'
         if p[3] and k != last:
-            lines.append(f'    A::pair<R, {ops}>(v, r, {k});')
+            lines.append(f'    A::pair<{mode}, {ops}>(v, r, {k});')
             lines.append(f'    if (A::stopped(v)) return A::stop(v, r, {k + 1});')
             synced = False
             continue
         if not synced:
             lines.append(f'    A::sync(v, r, {k});')
-        step = f'A::after(v, r, A::step<R, {ops}, {p[5]}, {p[6]}>(v, r, {k}), {k}, {len(pairs)})'
+        step = f'A::after(v, r, A::step<{mode}, {ops}, {p[5]}, {p[6]}>(v, r, {k}), {k}, {len(pairs)})'
         if k == last:
             lines.append(f'    return {step};')
         else:
@@ -234,6 +320,9 @@ def block_body(pairs, plans):
 def emit(capture_dir, out_dir):
     body, table = [], []
     for h, image, blocks, _ in load(capture_dir):
+        kept, summary = observable_flag_writes(image)
+        print(f'image {h}: {summary}')
+        body.append(f'// image {h}: {summary}')
         for pc in sorted(blocks):
             pairs = split_block(image, pc // 8)
             plans = [plan(d) for d in pairs]
@@ -243,7 +332,7 @@ def emit(capture_dir, out_dir):
             body.append(f'const Vu1AotPair {name}_info[] = {{{info}}};')
             body.append('\n'.join([f'template <bool R> int {name}(VU1Interpreter &v, Vu1AotRun &r)', '{',
                                    '    [[maybe_unused]] int st;'] +
-                                  block_body(pairs, plans) + ['}']))
+                                  block_body(pairs, plans, {p - pc // 8 for p in kept}) + ['}']))
             key = fnv1a(image[pc:pc + 8 * len(pairs)], pc // 8)
             table.append(f'    {{0x{h}ull, 0x{pc:04x}u, {len(pairs)}u, 0x{key:016x}ull, {name}_info, {name}<false>, {name}<true>}},')
     os.makedirs(out_dir, exist_ok=True)
@@ -362,6 +451,15 @@ def self_test():
     assert manifest_problems(lines, rows[1:]) == ['00 block 0x0000: in the manifest, not in the capture']
     bad = manifest_rows([('00', image[:8] + struct.pack('<I', iaddi + 1) + image[12:], {8: 3}, None)])
     assert manifest_problems(lines, rows[:1] + bad)[0].startswith('00 block 0x0008: manifest 3 pairs')
+    # Flag proof: ADD, ADD, 4 NOPs, FSAND S, E bit, delay slot. The second ADD is 5 pairs before the reader, so it
+    # hides the first one; a sticky FSAND sees both; without a reader nothing is kept.
+    add = (0xF << 21) | (2 << 16) | (1 << 11) | (3 << 6) | 0x28
+    fsand = lambda imm: (0x16 << 25) | (2 << 16) | ((imm & 0x800) << 10) | (imm & 0x7FF)
+    prog = lambda reader: struct.pack('<18I', 0, add, 0, add, 0, nop_upper, 0, nop_upper, 0, nop_upper, 0, nop_upper,
+                                      reader, nop_upper, 0, nop_upper | ebit, 0, nop_upper)
+    assert observable_flag_writes(prog(fsand(2)))[0] == {1}
+    assert observable_flag_writes(prog(fsand(0x40)))[0] == {0, 1}
+    assert observable_flag_writes(prog(0))[0] == set()
     print('self-test ok')
 
 

@@ -1,0 +1,90 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h b/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
+index ed92eac..ad59778 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
+@@ -261,7 +261,7 @@ struct Vu1AotBlock
+     uint64_t key;      // fnv1a of the block's words seeded with its start pair (the PS2X_VU_STATS block key)
+     const Vu1AotPair *info;
+     Vu1AotFn fn;
+-    Vu1AotFn relaxed; // the same block for PS2X_VU_RELAXED=1 (#48)
++    Vu1AotFn relaxed; // the same block without unobservable MAC/status work (#48, #57)
+ };
+ 
+ // Defined by the generated file (CMake PS2X_VU1_AOT_DIR); ps2_vu1_core.cpp reads them only with PS2X_VU1_AOT.
+@@ -452,16 +452,9 @@ struct Vu1Aot
+         entry.writesClip = true;
+     }
+ 
+-    // PS2X_VU_RELAXED (#48): CLIP visible at once, and no older queued CLIP write may land after it.
+-    static inline void clipNow(VU1Interpreter &s, uint32_t clip)
+-    {
+-        s.m_workingClip = ((s.m_workingClip << 6) | (clip & 0x3Fu)) & 0xFFFFFFu;
+-        s.m_state.clip = s.m_workingClip;
+-        for (uint32_t bits = s.m_flagMask; bits != 0u; bits &= bits - 1u)
+-            s.m_flagPipeline[std::countr_zero(bits)].writesClip = false;
+-    }
+-
+-    // PS2X_VU_RELAXED (#48): fmac() without MAC/status flags. Same math, same normalization of the result.
++    // Relaxed variant (#48, #57): fmac() without MAC/status flags. Same math, same normalization of the result.
++    // tools/vu1_gen.py emits it only for flag writes no reader in the whole micro image can see; the others run
++    // the exact pair.
+     template <uint8_t Op, bool ToAcc, uint32_t Upper>
+     [[gnu::always_inline]] static inline void fmacRelaxed(VU1Interpreter &s)
+     {
+@@ -496,7 +489,7 @@ struct Vu1Aot
+     // The ps2_vu1_upper.cpp handlers of those ops with the word as a constant: the same operand normalization,
+     // the same compare order for MAX/MINI ((vs > t) ? vs : t is MAXPS, (vs < t) ? vs : t is MINPS), the same
+     // FTOI saturation and the same CLIP flag queueing.
+-    template <bool Relaxed, uint16_t UId, uint32_t Upper>
++    template <uint16_t UId, uint32_t Upper>
+     [[gnu::always_inline]] static inline void inlineUpper(VU1Interpreter &s)
+     {
+         constexpr uint8_t dest = static_cast<uint8_t>((Upper >> 21) & 0xFu);
+@@ -556,10 +549,7 @@ struct Vu1Aot
+                 flags |= static_cast<int32_t>(bits[c]) > limit ? 1u << (2u * c) : 0u;
+                 flags |= static_cast<int32_t>(bits[c] ^ 0x80000000u) > limit ? 2u << (2u * c) : 0u;
+             }
+-            if constexpr (Relaxed)
+-                clipNow(s, flags);
+-            else
+-                queueClip(s, flags);
++            queueClip(s, flags); // relaxed too: CLIP keeps its exact 4-cycle visibility (#57)
+         }
+     }
+ 
+@@ -568,7 +558,7 @@ struct Vu1Aot
+     [[gnu::always_inline]] static inline void upper(VU1Interpreter &s, Vu1AotRun &r, uint32_t k)
+     {
+         if constexpr (isInlineUpper(UId))
+-            inlineUpper<Relaxed, UId, Upper>(s);
++            inlineUpper<UId, Upper>(s);
+         else if constexpr (UId < 0x80u && vu1fast::isDirectFmacId(UId) && Relaxed)
+             fmacRelaxed<static_cast<uint8_t>(UId >= 0x40u ? UId - 0x40u : UId), UId >= 0x40u, Upper>(s);
+         else if constexpr (UId < 0x80u && vu1fast::isDirectFmacId(UId))
+@@ -781,14 +771,14 @@ struct Vu1Aot
+         s.m_state.vi[0] = 0;
+     }
+ 
+-    // PS2X_VU_RELAXED (#48): with no flag writes queued by the block, only these pairs look at the cycle: Q
+-    // readers (FMAC q forms), stores (PATH1 catch-up) and every op left to a handler (DIV/WAITQ/MFP/FCAND...).
++    // Relaxed variant (#48): only these pairs look at the cycle: Q readers (FMAC q forms), CLIP (queued at its
++    // issue cycle, #57), stores (PATH1 catch-up) and every op left to a handler (DIV/WAITQ/MFP/FCAND...).
+     static constexpr bool relaxedNeedsCycle(uint16_t uId, uint32_t upper, uint16_t lId)
+     {
+         const uint16_t op = uId >= 0x40u ? static_cast<uint16_t>(uId - 0x40u) : uId;
+         const bool fmac = uId < 0x80u && vu1fast::isDirectFmacId(uId);
+         const bool nop = uId == 0x40u + 0x2Fu || uId == 0x40u + 0x30u;
+-        if ((!isInlineUpper(uId) && !fmac && !nop) ||
++        if ((!isInlineUpper(uId) && !fmac && !nop) || uId == 0x5Fu ||
+             (fmac && (op == 0x1Cu || op == 0x20u || op == 0x21u || op == 0x24u || op == 0x25u)))
+             return true;
+         if ((upper & 0x80000000u) != 0u || lId == kVu1LowerNop)
+@@ -797,7 +787,7 @@ struct Vu1Aot
+                lId == 0x17Fu;
+     }
+ 
+-    // PS2X_VU_RELAXED: whether the pair can write VF0/VI0 (else resetZeroRegs() is skipped).
++    // Relaxed variant: whether the pair can write VF0/VI0 (else resetZeroRegs() is skipped).
+     static constexpr bool relaxedMayWriteZero(uint16_t uId, uint32_t upper, uint16_t lId, uint32_t lower)
+     {
+         const bool upperDest = ((upper >> 21) & 0xFu) != 0u;
