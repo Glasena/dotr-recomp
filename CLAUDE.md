@@ -213,6 +213,8 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   (`vu1_gen.py` on a capture of those programs, ~2 min compile). Breaking the flag-elision window (`>=` -> `>`)
   fails 698 / 5 programs. Known, reported: #45 (end cycles), #46 (OPMSUB lanes), #47 (generated-code hang, skipped).
   `ps2x_vu1_diff --list P` / `--repro P FILE` print and rerun one program for a minimal repro.
+- Patch 0037 (2026-10-23, #47): generated code that stops before pair 0 (XGKICK while PATH1 busy) is not re-called; `stepBody()`
+  runs that pair. `PS2X_VU_AOT_VERIFY` now reports a second call at the same cycle/PC ("no progress") instead of hanging.
 - #43 (2026-10-23): `config/vu1_manifest.txt` = `<image> 0x<pc> <pairs> <content fnv1a>` per captured block (143,
   no game bytes); `vu1_gen.py` warns on missing/changed blocks (`--check` exits 1), `--write-manifest` refreshes it.
 - Patch 0027 (2026-10-22, #35): `perf --call-graph dwarf` found the map/hash share was `IopKernel::beginNextReady`/

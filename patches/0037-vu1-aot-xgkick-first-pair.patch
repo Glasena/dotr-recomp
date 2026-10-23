@@ -1,0 +1,85 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 2543908..daa297d 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -3589,12 +3589,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     };
+ 
+     bool aotRefused = false; // the generated code's last entry attempt was refused: do not repeat it
++    // The generated code stopped before the first pair of a block (XGKICK while PATH1 is busy): calling it again
++    // would stop there again without advancing the clock, so stepBody() runs that pair, as for a refused entry (#47).
++    bool aotStepPair = false;
++    uint64_t aotLastCycle = ~0ull; // PS2X_VU_AOT_VERIFY: where the generated code was last called
++    uint32_t aotLastPc = 0;
+     while (m_cycle < budgetEnd && !m_stopRequested)
+     {
+         if (loopTop(!aotRefused))
+             break;
+         aotRefused = false;
+-        if (const Vu1AotFn aot = aotFor())
++        const Vu1AotFn aot = aotStepPair ? nullptr : aotFor();
++        aotStepPair = false;
++        if (aot)
+         {
+             Vu1AotRun aotRun{m_fastBlock->issue.data(), m_fastBlock->startPair, &elision, vuData, dataSize, codeSize,
+                              budgetEnd};
+@@ -3602,11 +3609,25 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             const uint64_t before = fastPairsDone;
+             if (g_aotVerify)
+             {
++                // A second call at the same cycle and PC would livelock run(): report it and step instead.
++                if (m_cycle == aotLastCycle && m_state.pc == aotLastPc)
++                {
++                    AotVerifyStats &v = g_aotVerifyStats;
++                    ++v.byPc[m_state.pc];
++                    if (++v.mismatches <= 32u)
++                        std::fprintf(stderr, "[vu1:aot-verify] mismatch: entry 0x%04x: no progress\n", m_state.pc);
++                    if (stepBody())
++                        break;
++                    continue;
++                }
++                aotLastCycle = m_cycle;
++                aotLastPc = m_state.pc;
+                 const bool stop = verifyAot(aot, aotRun);
+                 if (stats)
+                     vuStats().aotPairs += fastPairsDone - before; // the steps counted them as fast pairs
+                 if (stop)
+                     break;
++                aotStepPair = m_fastBlock && m_fastIndex == 0u;
+                 continue;
+             }
+             const int status = runAot(aot, aotRun);
+@@ -3625,6 +3646,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                 programEnded = true;
+                 break;
+             }
++            aotStepPair = m_fastBlock && m_fastIndex == 0u;
+             continue;
+         }
+         if (stepBody())
+diff --git a/ps2xTest/src/ps2_vu1_diff_tests.cpp b/ps2xTest/src/ps2_vu1_diff_tests.cpp
+index 862acec..c24e82f 100644
+--- a/ps2xTest/src/ps2_vu1_diff_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_diff_tests.cpp
+@@ -57,9 +57,9 @@ namespace
+     // hazard model does not see, so a fast block reads a value the interpreter still has in flight. These
+     // programs may differ in any field; they are reported, not failed.
+     const std::set<int> kKnownOpmPrograms = {1, 2354, 3079, 5282, 6902, 7042, 9212};
+-    // Known (dotr-recomp #47): generated code livelocks on a block whose first pair is an XGKICK while PATH1 is
+-    // busy. ps2x_vu1_diff_aot skips these programs in every engine, or the generated run would never return.
+-    const std::set<int> kKnownAotHangs = {2, 27};
++    // Programs whose generated code is known to hang; ps2x_vu1_diff_aot skips them in every engine, or the
++    // generated run would never return. Empty since dotr-recomp #47 (XGKICK at a block's first pair) was fixed.
++    const std::set<int> kKnownAotHangs = {};
+ 
+     struct Rng
+     {
+@@ -657,7 +657,7 @@ namespace
+             failures += static_cast<int>(bad.size());
+         }
+ #ifdef PS2X_VU1_DIFF_AOT
+-        std::printf("skipped %zu programs whose generated code is known to hang (dotr-recomp #47)\n",
++        std::printf("skipped %zu programs whose generated code is known to hang\n",
+                     kKnownAotHangs.size());
+         // Every program was captured and generated: most VU1 pairs must have run in generated code.
+         const double generated = statsPercent(engines.back().out, "generated ");
