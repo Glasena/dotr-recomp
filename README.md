@@ -91,11 +91,18 @@ cmake -S ../PS2Recomp -B ../PS2Recomp/out/build-runtime -G Ninja -DCMAKE_BUILD_T
   -DCMAKE_CXX_COMPILER_LAUNCHER="$(realpath ../deps/bin/ccache)" -DCMAKE_C_COMPILER_LAUNCHER="$(realpath ../deps/bin/ccache)"
 cmake --build ../PS2Recomp/out/build-runtime --target ps2EntryRunner
 
-# 8. (optional, faster 3D) generated VU1 blocks: capture the map's VU1 microcode once, generate C++ from it into
-#    ../dotr/vu1/gen, and build it in. Without PS2X_VU1_AOT_DIR the runtime builds as in step 7. vu1_gen.py warns when
-#    the capture lacks or changes a block config/vu1_manifest.txt lists (--check: exit 1); after a capture that
-#    reaches new VU1 code, refresh the manifest with --write-manifest (hashes only) and commit it.
+# 8. (optional, faster 3D) generated VU1 blocks: capture the VU1 microcode of the map and of the tutorial duel (both
+#    runs merge into the same ../dotr/vu1/<image>.txt), generate C++ from it into ../dotr/vu1/gen, and build it in.
+#    The two runs below give the 187 blocks of config/vu1_manifest.txt (map alone: 143; the duel adds 44). Without
+#    PS2X_VU1_AOT_DIR the runtime builds as in step 7. vu1_gen.py warns when the capture lacks or changes a block
+#    config/vu1_manifest.txt lists (--check: exit 1); after a capture that reaches new VU1 code, refresh the manifest
+#    with --write-manifest (hashes only) and commit it.
 PS2X_VU1_CAPTURE="$(realpath ../dotr/vu1)" PS2X_DUMP_FRAMES=2300 PS2X_EXIT_AT=2300 tools/test_run.sh
+sc="start@1000,start@1400,cross@1500"; for v in $(seq 2200 60 5600); do sc="$sc,cross@$v"; done
+sc="$sc,start@5750"; for v in $(seq 5810 60 9100); do sc="$sc,cross@$v"; done
+sc="$sc,start@9300"; for v in $(seq 9380 80 11000); do sc="$sc,cross@$v"; done   # practice duel, ~7 min
+PS2X_VU1_CAPTURE="$(realpath ../dotr/vu1)" PS2X_INPUT_SCRIPT="$sc" PS2X_DUMP_FRAMES=11000 PS2X_EXIT_AT=11000 \
+  TEST_TIMEOUT=1500 tools/test_run.sh
 python3 tools/vu1_gen.py ../dotr/vu1 --emit ../dotr/vu1/gen
 cmake -DPS2X_VU1_AOT_DIR="$(realpath ../dotr/vu1/gen)" ../PS2Recomp/out/build-runtime
 cmake --build ../PS2Recomp/out/build-runtime --target ps2EntryRunner

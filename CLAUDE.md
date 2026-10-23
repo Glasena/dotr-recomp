@@ -237,6 +237,10 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   MAC/status, CLIP at once, cycle/commit only on pairs that read it). All dumps identical on and off. Map 1900->2300:
   GameThread 64.6G -> 46.5G instr (-28%), wall ~14.0 -> ~13.5 s; duel 10000-11000 ~15.4 -> ~16.3 VBlanks/s. VU1 still
   ~66% of the duel GameThread (~43% map, ~130 instr/pair). Decision rule (>=28/s or VU1 <=20%) not met.
+- #49 (2026-10-23): the duel capture (README step 8, CLAUDE long script to 11000) merged into the map's: 143 -> 187
+  blocks (manifest refreshed, no runtime change). Duel `PS2X_VU_STATS`: generated 99.6% of pairs, tight loop 0.0%,
+  interpreter 0.4% (liveIn 96%, xgkickBusy 4%). Duel 10000-11000, 2 interleaved pairs: ~15.5 -> ~15.65 VBlanks/s
+  (+1%, near noise). All map/default/duel dumps identical; verify 0 mismatches (map 262K, duel 8.0M checks).
 - Patch 0027 (2026-10-22, #35): `perf --call-graph dwarf` found the map/hash share was `IopKernel::beginNextReady`/
   `nextWakeCycle` walking the thread `std::map` on every idle IOP step (~7.5%) and the GIF_STAT lookup in
   `advanceEeTimers` (~2.1%). Kernel caches "nothing ready until cycle W" behind a version bumped by every public
