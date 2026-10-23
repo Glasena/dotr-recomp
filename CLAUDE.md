@@ -221,6 +221,12 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   (`inlineUpper<>`, SSE, word constant; inline `queueClip`), no generator change. Map 1900->2300, 3 interleaved
   pairs vs post-#47: instructions 73.6G -> 68.8G (-6.6%), cycles ~37.9G -> ~35.4G, wall ~15.0 -> ~14.1 s.
   Dumps, verify (0/262K), flag check and `vu1_diff` unchanged.
+- Patch 0039 (2026-10-23, #44 lower): `Vu1Aot::lower<>` runs LQ/SQ/LQI/SQI/LQD/SQD, ILW/ISW/ILWR/ISWR, IADD/ISUB/
+  IADDI/IADDIU/ISUBIU/IAND/IOR and MOVE/MR32 inline; stores go through `Vu1Aot::store<dest>` (PATH1 caught up
+  first, as `queueStore`). `vu1_diff` now also uses vi14 as the LQ/SQ/ILW/ISW base. Map vs post-#47, 3 pairs:
+  instructions 73.6G -> 64.5G (-12.4% for #44), cycles ~37.9G -> ~33.0G, wall ~14.8 -> ~13.9 s. Table handlers
+  are now 1.4% of the GameThread (were ~20%). Now: inlined FMAC 22%, IOP 17%, block bodies 14%, block exit/
+  transitions 9%, EE code 7.5%, flag commit 5.7%, EE runtime 5.3%, VIF 3.3%, GS 2.8%, PATH1 1.6%.
 - Patch 0027 (2026-10-22, #35): `perf --call-graph dwarf` found the map/hash share was `IopKernel::beginNextReady`/
   `nextWakeCycle` walking the thread `std::map` on every idle IOP step (~7.5%) and the GIF_STAT lookup in
   `advanceEeTimers` (~2.1%). Kernel caches "nothing ready until cycle W" behind a version bumped by every public

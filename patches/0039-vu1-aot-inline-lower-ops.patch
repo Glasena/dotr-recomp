@@ -1,0 +1,210 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h b/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
+index 8886eaf..16001ca 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
+@@ -552,12 +552,173 @@ struct Vu1Aot
+             g_vu1UpperFn[UId](s, Upper);
+     }
+ 
++    // queueStore() on the fast-block path with the lane mask as a constant: PATH1 caught up to this cycle, then the
++    // store is written at once.
++    template <uint8_t Dest>
++    [[gnu::always_inline]] static inline void store(VU1Interpreter &s, uint32_t address, __m128 value)
++    {
++        if (!s.m_fastBlock)
++        {
++            uint32_t words[4];
++            _mm_storeu_ps(reinterpret_cast<float *>(words), value);
++            s.queueStore(address, words, Dest);
++            return;
++        }
++        if (s.m_xgkick.active)
++            s.catchUpXgkick(s.m_cycle);
++        else
++            s.m_xgkickSyncCycle = std::max(s.m_xgkickSyncCycle, s.m_cycle);
++        if (s.m_activeVuData && address + 16u <= s.m_activeVuDataSize)
++            storeDest<Dest>(reinterpret_cast<float *>(s.m_activeVuData + address), value);
++    }
++
++    // Lower ops the generated code runs inline (#44): LQ/SQ/LQI/SQI/LQD/SQD, ILW/ISW/ILWR/ISWR,
++    // IADD/ISUB/IADDI/IADDIU/ISUBIU/IAND/IOR, MOVE/MR32.
++    static constexpr bool isInlineLower(uint16_t id)
++    {
++        return id == 0x01u || id == 0x02u || id == 0x05u || id == 0x06u || id == 0x09u || id == 0x0Au ||
++               id == 0x130u || id == 0x131u || id == 0x132u || id == 0x134u || id == 0x135u ||
++               id == 0x170u || id == 0x171u || (id >= 0x174u && id <= 0x177u) || id == 0x17Eu || id == 0x17Fu;
++    }
++
++    // The ps2_vu1_lower.cpp handlers of those ops with the word as a constant (same address wrap, same 16-bit
++    // VI arithmetic, same lane picked by ILW/ILWR).
++    template <uint16_t LId, uint32_t Lower>
++    [[gnu::always_inline]] static inline void inlineLower(VU1Interpreter &s, Vu1AotRun &r)
++    {
++        constexpr uint8_t dest = static_cast<uint8_t>((Lower >> 21) & 0xFu);
++        constexpr uint8_t ft = static_cast<uint8_t>((Lower >> 16) & 0x1Fu);
++        constexpr uint8_t fs = static_cast<uint8_t>((Lower >> 11) & 0x1Fu);
++        constexpr uint8_t it = static_cast<uint8_t>((Lower >> 16) & 0xFu);
++        constexpr uint8_t is = static_cast<uint8_t>((Lower >> 11) & 0xFu);
++        constexpr uint8_t id = static_cast<uint8_t>((Lower >> 6) & 0xFu);
++        constexpr int16_t imm11 = static_cast<int16_t>(static_cast<int32_t>(Lower << 21) >> 21);
++        constexpr uint32_t comp = (dest & 0x8u) ? 0u : (dest & 0x4u) ? 1u : (dest & 0x2u) ? 2u : 3u; // ILW/ILWR
++        [[maybe_unused]] int32_t *const vi = s.m_state.vi;
++        [[maybe_unused]] float(&vf)[32][4] = s.m_state.vf;
++        [[maybe_unused]] const uint32_t size = r.dataSize;
++        [[maybe_unused]] const auto offsetAddress = [&](uint8_t base)
++        { return (static_cast<uint32_t>(static_cast<int32_t>(vi[base] + imm11)) * 16u) & (size - 1u); };
++        [[maybe_unused]] const auto streamAddress = [&](uint8_t base)
++        { return (static_cast<uint32_t>(static_cast<uint16_t>(vi[base])) * 16u) & (size - 1u); };
++        [[maybe_unused]] const auto load = [&](uint32_t address)
++        { return _mm_loadu_ps(reinterpret_cast<const float *>(r.vuData + address)); };
++        [[maybe_unused]] const auto loadVi = [&](uint32_t address)
++        {
++            uint32_t v;
++            std::memcpy(&v, r.vuData + address + comp * 4u, 4u);
++            return static_cast<int32_t>(static_cast<int16_t>(v & 0xFFFFu));
++        };
++        [[maybe_unused]] const auto viWords = [&](uint8_t reg)
++        { return _mm_castsi128_ps(_mm_set1_epi32(static_cast<int32_t>(static_cast<uint16_t>(vi[reg] & 0xFFFF)))); };
++
++        if constexpr (LId == 0x01u) // LQ ft, imm(is)
++        {
++            const uint32_t address = offsetAddress(is);
++            if (address + 16u <= size)
++                storeDest<dest>(vf[ft], load(address));
++        }
++        else if constexpr (LId == 0x02u) // SQ fs, imm(it)
++        {
++            const uint32_t address = offsetAddress(it);
++            if (address + 16u <= size)
++                store<dest>(s, address, _mm_loadu_ps(vf[fs]));
++        }
++        else if constexpr (LId == 0x05u) // ILW it, imm(is)
++        {
++            const uint32_t address = offsetAddress(is);
++            if (address + 16u <= size)
++            {
++                const int32_t value = loadVi(address);
++                if constexpr (it != 0u)
++                    vi[it] = value;
++            }
++        }
++        else if constexpr (LId == 0x06u) // ISW it, imm(is)
++        {
++            const uint32_t address = offsetAddress(is);
++            if (address + 16u <= size)
++                store<dest>(s, address, viWords(it));
++        }
++        else if constexpr (LId == 0x09u || LId == 0x0Au) // IADDIU/ISUBIU
++        {
++            constexpr int16_t imm15 = static_cast<int16_t>((Lower & 0x7FFu) | ((Lower >> 10) & 0x7800u));
++            if constexpr (it != 0u)
++                vi[it] = static_cast<int16_t>(LId == 0x09u ? vi[is] + imm15 : vi[is] - imm15);
++        }
++        else if constexpr (LId == 0x130u || LId == 0x131u || LId == 0x134u || LId == 0x135u) // IADD/ISUB/IAND/IOR
++        {
++            if constexpr (id != 0u)
++            {
++                if constexpr (LId == 0x130u)
++                    vi[id] = static_cast<int16_t>(vi[is] + vi[it]);
++                else if constexpr (LId == 0x131u)
++                    vi[id] = static_cast<int16_t>(vi[is] - vi[it]);
++                else if constexpr (LId == 0x134u)
++                    vi[id] = vi[is] & vi[it];
++                else
++                    vi[id] = vi[is] | vi[it];
++            }
++        }
++        else if constexpr (LId == 0x132u) // IADDI it, is, imm5
++        {
++            constexpr int16_t imm5 = static_cast<int16_t>(static_cast<int32_t>((Lower >> 6) & 0x1Fu) << 27 >> 27);
++            if constexpr (it != 0u)
++                vi[it] = static_cast<int16_t>(vi[is] + imm5);
++        }
++        else if constexpr (LId == 0x170u) // MOVE
++            storeDest<dest>(vf[ft], _mm_loadu_ps(vf[fs]));
++        else if constexpr (LId == 0x171u) // MR32
++        {
++            const __m128 v = _mm_loadu_ps(vf[fs]);
++            storeDest<dest>(vf[ft], _mm_shuffle_ps(v, v, _MM_SHUFFLE(0, 3, 2, 1)));
++        }
++        else if constexpr (LId == 0x174u || LId == 0x176u) // LQI ft, (is++) / LQD ft, (--is)
++        {
++            if constexpr (LId == 0x176u && is != 0u)
++                vi[is] = static_cast<int16_t>(vi[is] - 1);
++            const uint32_t address = streamAddress(is);
++            if (address + 16u <= size)
++                storeDest<dest>(vf[ft], load(address));
++            if constexpr (LId == 0x174u && is != 0u)
++                vi[is] = static_cast<int16_t>(vi[is] + 1);
++        }
++        else if constexpr (LId == 0x175u || LId == 0x177u) // SQI fs, (it++) / SQD fs, (--it)
++        {
++            if constexpr (LId == 0x177u && it != 0u)
++                vi[it] = static_cast<int16_t>(vi[it] - 1);
++            const uint32_t address = streamAddress(it);
++            if (address + 16u <= size)
++                store<dest>(s, address, _mm_loadu_ps(vf[fs]));
++            if constexpr (LId == 0x175u && it != 0u)
++                vi[it] = static_cast<int16_t>(vi[it] + 1);
++        }
++        else if constexpr (LId == 0x17Eu) // ILWR it, (is)
++        {
++            const uint32_t address = streamAddress(is);
++            if (address + 16u <= size)
++            {
++                const int32_t value = loadVi(address);
++                if constexpr (it != 0u)
++                    vi[it] = value;
++            }
++        }
++        else // ISWR it, (is)
++        {
++            const uint32_t address = streamAddress(is);
++            if (address + 16u <= size)
++                store<dest>(s, address, viWords(it));
++        }
++    }
++
+     // The lower op, or the I immediate.
+     template <uint16_t LId, uint32_t Lower, uint32_t Upper>
+     [[gnu::always_inline]] static inline void lower(VU1Interpreter &s, Vu1AotRun &r)
+     {
+         if constexpr ((Upper & 0x80000000u) != 0u)
+             s.m_state.i = std::bit_cast<float>(vu1fast::normalizedOperandBits(Lower));
++        else if constexpr (isInlineLower(LId))
++            inlineLower<LId, Lower>(s, r);
+         else if constexpr (LId != kVu1LowerNop) // the NOP handler is empty
+             g_vu1LowerFn[LId](s, Lower, r.vuData, r.dataSize);
+     }
+diff --git a/ps2xTest/src/ps2_vu1_diff_tests.cpp b/ps2xTest/src/ps2_vu1_diff_tests.cpp
+index c24e82f..b9facd1 100644
+--- a/ps2xTest/src/ps2_vu1_diff_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_diff_tests.cpp
+@@ -264,6 +264,18 @@ namespace
+         }
+     }
+ 
++    // LQ/SQ/ILW/ISW with an odd offset use vi14 (0x50, never written) as the base instead of vi0, with the same
++    // address: covers a non-zero base and negative offsets without drawing more random numbers (#44).
++    uint32_t varyBase(uint32_t lower)
++    {
++        const uint32_t opHi = lower >> 25;
++        if ((opHi != 0x00u && opHi != 0x01u && opHi != 0x04u && opHi != 0x05u) || (lower & 1u) == 0u)
++            return lower;
++        const uint32_t baseShift = opHi == 0x01u ? 16u : 11u; // SQ: it is the base; LQ/ILW/ISW: is
++        const uint32_t imm = (lower & 0x7FFu) - kIlwrQword;
++        return (lower & ~0x7FFu & ~(0xFu << baseShift)) | (14u << baseShift) | (imm & 0x7FFu);
++    }
++
+     // Programs 0..kFixedCount-1 are fixed code (with random inputs): minimal repros of the known differences.
+     constexpr uint32_t kXgkick = 0x80006EFCu; // XGKICK vi13
+     const std::vector<std::vector<uint32_t>> kFixedPrograms = {
+@@ -304,7 +316,7 @@ namespace
+         for (uint32_t k = 0; k < n; ++k)
+         {
+             upper[k] = randomUpper(r);
+-            lower[k] = randomLower(r);
++            lower[k] = varyBase(randomLower(r));
+         }
+         for (uint32_t k = 0; k < n;)
+         {
