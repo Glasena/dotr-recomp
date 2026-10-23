@@ -7,6 +7,9 @@ Everything in the repo (code, comments, docs, commit messages) is written in Eng
 - Nothing from the game in git: ISO, ELF, IRX, generated code. They live in `../dotr/`.
 - Generic PS2Recomp fixes become a file in `patches/` (upstream has 132 open PRs and merges ~3/month; don't depend
   on it). DotR-specific fixes go in `src/`.
+- Before committing a new patch, apply 0001..N in order to a clean `git worktree add --detach <scratch> eb8688b`
+  and `cmp` its files against `../PS2Recomp`. An earlier export (0019) was cut against a different tree and broke
+  every later VU1 patch on a fresh checkout.
 - Never re-enable the "Potential self-modifying code" patches that `ps2_analyzer` suggests (they become NOPs). In God
   of War they were ordinary `sw` into WAX `.data` and broke loading. DotR's 21 were already removed from
   `config/dotr.toml`.
