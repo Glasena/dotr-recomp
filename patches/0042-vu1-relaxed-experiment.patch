@@ -1,0 +1,235 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h b/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
+index 16001ca..ed92eac 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
+@@ -261,6 +261,7 @@ struct Vu1AotBlock
+     uint64_t key;      // fnv1a of the block's words seeded with its start pair (the PS2X_VU_STATS block key)
+     const Vu1AotPair *info;
+     Vu1AotFn fn;
++    Vu1AotFn relaxed; // the same block for PS2X_VU_RELAXED=1 (#48)
+ };
+ 
+ // Defined by the generated file (CMake PS2X_VU1_AOT_DIR); ps2_vu1_core.cpp reads them only with PS2X_VU1_AOT.
+@@ -451,6 +452,39 @@ struct Vu1Aot
+         entry.writesClip = true;
+     }
+ 
++    // PS2X_VU_RELAXED (#48): CLIP visible at once, and no older queued CLIP write may land after it.
++    static inline void clipNow(VU1Interpreter &s, uint32_t clip)
++    {
++        s.m_workingClip = ((s.m_workingClip << 6) | (clip & 0x3Fu)) & 0xFFFFFFu;
++        s.m_state.clip = s.m_workingClip;
++        for (uint32_t bits = s.m_flagMask; bits != 0u; bits &= bits - 1u)
++            s.m_flagPipeline[std::countr_zero(bits)].writesClip = false;
++    }
++
++    // PS2X_VU_RELAXED (#48): fmac() without MAC/status flags. Same math, same normalization of the result.
++    template <uint8_t Op, bool ToAcc, uint32_t Upper>
++    [[gnu::always_inline]] static inline void fmacRelaxed(VU1Interpreter &s)
++    {
++        constexpr uint8_t dest = static_cast<uint8_t>((Upper >> 21) & 0xFu);
++        if constexpr (dest != 0u)
++        {
++            constexpr int active = ((dest >> 3) & 1) | ((dest >> 1) & 2) | ((dest << 1) & 4) | ((dest << 3) & 8);
++            FmacMath m;
++            vu1fast::fmacMath<Op, ToAcc>(s.m_state, Upper, m);
++            __m128 value = m.result;
++            if ((m.ok & active) != active) [[unlikely]]
++            {
++                s.m_currentUpperInstruction = Upper; // read by normalizeFmacResult()
++                float result[4];
++                uint8_t laneFlags[4];
++                _mm_storeu_ps(result, value);
++                s.normalizeFmacResult(result, dest, laneFlags);
++                value = _mm_loadu_ps(result);
++            }
++            storeDest<dest>(ToAcc ? s.m_state.acc : s.m_state.vf[(Upper >> 6) & 0x1Fu], value);
++        }
++    }
++
+     // Upper ops other than FMAC and NOP that the generated code runs inline (#44): MAX/MINI (vector, broadcast,
+     // I), ITOF/FTOI, ABS and CLIP. The rest (reserved encodings) stay on g_vu1UpperFn.
+     static constexpr bool isInlineUpper(uint16_t id)
+@@ -462,7 +496,7 @@ struct Vu1Aot
+     // The ps2_vu1_upper.cpp handlers of those ops with the word as a constant: the same operand normalization,
+     // the same compare order for MAX/MINI ((vs > t) ? vs : t is MAXPS, (vs < t) ? vs : t is MINPS), the same
+     // FTOI saturation and the same CLIP flag queueing.
+-    template <uint16_t UId, uint32_t Upper>
++    template <bool Relaxed, uint16_t UId, uint32_t Upper>
+     [[gnu::always_inline]] static inline void inlineUpper(VU1Interpreter &s)
+     {
+         constexpr uint8_t dest = static_cast<uint8_t>((Upper >> 21) & 0xFu);
+@@ -522,16 +556,21 @@ struct Vu1Aot
+                 flags |= static_cast<int32_t>(bits[c]) > limit ? 1u << (2u * c) : 0u;
+                 flags |= static_cast<int32_t>(bits[c] ^ 0x80000000u) > limit ? 2u << (2u * c) : 0u;
+             }
+-            queueClip(s, flags);
++            if constexpr (Relaxed)
++                clipNow(s, flags);
++            else
++                queueClip(s, flags);
+         }
+     }
+ 
+     // The upper op of pair k, with its word and handler id as constants.
+-    template <uint16_t UId, uint32_t Upper>
++    template <bool Relaxed, uint16_t UId, uint32_t Upper>
+     [[gnu::always_inline]] static inline void upper(VU1Interpreter &s, Vu1AotRun &r, uint32_t k)
+     {
+         if constexpr (isInlineUpper(UId))
+-            inlineUpper<UId, Upper>(s);
++            inlineUpper<Relaxed, UId, Upper>(s);
++        else if constexpr (UId < 0x80u && vu1fast::isDirectFmacId(UId) && Relaxed)
++            fmacRelaxed<static_cast<uint8_t>(UId >= 0x40u ? UId - 0x40u : UId), UId >= 0x40u, Upper>(s);
+         else if constexpr (UId < 0x80u && vu1fast::isDirectFmacId(UId))
+         {
+             constexpr bool toAcc = UId >= 0x40u;
+@@ -742,20 +781,68 @@ struct Vu1Aot
+         s.m_state.vi[0] = 0;
+     }
+ 
+-    // One plain pair of a tight-loop run (run() in ps2_vu1_core.cpp), with its words and plan as constants.
+-    template <uint16_t UId, uint32_t Upper, uint16_t LId, uint32_t Lower, uint8_t ViReg, bool RecordVi>
+-    [[gnu::always_inline]] static inline void pair(VU1Interpreter &s, Vu1AotRun &r, uint32_t k)
++    // PS2X_VU_RELAXED (#48): with no flag writes queued by the block, only these pairs look at the cycle: Q
++    // readers (FMAC q forms), stores (PATH1 catch-up) and every op left to a handler (DIV/WAITQ/MFP/FCAND...).
++    static constexpr bool relaxedNeedsCycle(uint16_t uId, uint32_t upper, uint16_t lId)
++    {
++        const uint16_t op = uId >= 0x40u ? static_cast<uint16_t>(uId - 0x40u) : uId;
++        const bool fmac = uId < 0x80u && vu1fast::isDirectFmacId(uId);
++        const bool nop = uId == 0x40u + 0x2Fu || uId == 0x40u + 0x30u;
++        if ((!isInlineUpper(uId) && !fmac && !nop) ||
++            (fmac && (op == 0x1Cu || op == 0x20u || op == 0x21u || op == 0x24u || op == 0x25u)))
++            return true;
++        if ((upper & 0x80000000u) != 0u || lId == kVu1LowerNop)
++            return false;
++        return !isInlineLower(lId) || lId == 0x02u || lId == 0x06u || lId == 0x175u || lId == 0x177u ||
++               lId == 0x17Fu;
++    }
++
++    // PS2X_VU_RELAXED: whether the pair can write VF0/VI0 (else resetZeroRegs() is skipped).
++    static constexpr bool relaxedMayWriteZero(uint16_t uId, uint32_t upper, uint16_t lId, uint32_t lower)
++    {
++        const bool upperDest = ((upper >> 21) & 0xFu) != 0u;
++        const bool fmacToVf = uId < 0x40u && vu1fast::isDirectFmacId(uId);
++        const bool nop = uId == 0x40u + 0x2Fu || uId == 0x40u + 0x30u;
++        if (!nop && !fmacToVf && !isInlineUpper(uId) && !(uId < 0x80u && vu1fast::isDirectFmacId(uId)))
++            return true;
++        if (upperDest && (fmacToVf || (isInlineUpper(uId) && uId < 0x40u)) && ((upper >> 6) & 0x1Fu) == 0u)
++            return true; // FMAC/MAX/MINI fd
++        if (upperDest && isInlineUpper(uId) && uId >= 0x50u && uId != 0x5Fu && ((upper >> 16) & 0x1Fu) == 0u)
++            return true; // ITOF/FTOI/ABS ft
++        if ((upper & 0x80000000u) != 0u || lId == kVu1LowerNop)
++            return false;
++        if (!isInlineLower(lId))
++            return true;
++        const bool vfWrite = lId == 0x01u || lId == 0x170u || lId == 0x171u || lId == 0x174u || lId == 0x176u;
++        return vfWrite && ((lower >> 21) & 0xFu) != 0u && ((lower >> 16) & 0x1Fu) == 0u;
++    }
++
++    static inline void relaxedAdvance(VU1Interpreter &s, uint64_t issue)
+     {
+-        const uint64_t issue = s.m_fastStart + r.issue[k];
+         if (s.m_nextCommitCycle <= issue)
+             s.fastAdvanceTo(issue);
+         else
+             s.m_cycle = issue;
++    }
++
++    // One plain pair of a tight-loop run (run() in ps2_vu1_core.cpp), with its words and plan as constants.
++    template <bool Relaxed, uint16_t UId, uint32_t Upper, uint16_t LId, uint32_t Lower, uint8_t ViReg, bool RecordVi>
++    [[gnu::always_inline]] static inline void pair(VU1Interpreter &s, Vu1AotRun &r, uint32_t k)
++    {
++        if constexpr (!Relaxed || relaxedNeedsCycle(UId, Upper, LId))
++        {
++            const uint64_t issue = s.m_fastStart + r.issue[k];
++            if (s.m_nextCommitCycle <= issue)
++                s.fastAdvanceTo(issue);
++            else
++                s.m_cycle = issue;
++        }
+         const int32_t oldVi = s.m_state.vi[ViReg];
+-        upper<UId, Upper>(s, r, k);
++        upper<Relaxed, UId, Upper>(s, r, k);
+         lower<LId, Lower, Upper>(s, r);
+         afterOps<ViReg, RecordVi>(s, oldVi);
+-        resetZeroRegs(s);
++        if constexpr (!Relaxed || relaxedMayWriteZero(UId, Upper, LId, Lower))
++            resetZeroRegs(s);
+     }
+ 
+     // finishPair() in run(): PC, branch delay and E/D/T bits; true when the program ends.
+@@ -814,14 +901,17 @@ struct Vu1Aot
+     };
+ 
+     // The generic block step of run() for pair k. The state is synchronized up to the pair before it (sync()).
+-    template <uint16_t UId, uint32_t Upper, uint16_t LId, uint32_t Lower, uint8_t ViReg, bool RecordVi,
+-              uint8_t ShadowReg, uint8_t Kind>
++    template <bool Relaxed, uint16_t UId, uint32_t Upper, uint16_t LId, uint32_t Lower, uint8_t ViReg,
++              bool RecordVi, uint8_t ShadowReg, uint8_t Kind>
+     [[gnu::always_inline]] static inline int step(VU1Interpreter &s, Vu1AotRun &r, uint32_t k)
+     {
+         const uint64_t issue = s.m_fastStart + r.issue[k];
+         if (issue >= r.budgetEnd)
+             return kStepLeave;
+-        s.fastAdvanceTo(issue);
++        if constexpr (Relaxed)
++            relaxedAdvance(s, issue); // same as fastAdvanceTo(), without the call when nothing is due
++        else
++            s.fastAdvanceTo(issue);
+         if constexpr ((Kind & kAotXgkick) != 0u)
+         {
+             s.catchUpXgkick(s.m_cycle);
+@@ -831,7 +921,7 @@ struct Vu1Aot
+         const int32_t oldVi = s.m_state.vi[ViReg];
+         if constexpr ((Upper & 0x80000000u) != 0u || ShadowReg == 0u)
+         {
+-            upper<UId, Upper>(s, r, k);
++            upper<Relaxed, UId, Upper>(s, r, k);
+             lower<LId, Lower, Upper>(s, r);
+         }
+         else
+@@ -839,7 +929,7 @@ struct Vu1Aot
+             // The lower op reads (or writes) the upper's VF destination: it sees the old value.
+             float oldVf[4], upperVf[4];
+             std::memcpy(oldVf, s.m_state.vf[ShadowReg], sizeof(oldVf));
+-            upper<UId, Upper>(s, r, k);
++            upper<Relaxed, UId, Upper>(s, r, k);
+             std::memcpy(upperVf, s.m_state.vf[ShadowReg], sizeof(upperVf));
+             std::memcpy(s.m_state.vf[ShadowReg], oldVf, sizeof(oldVf));
+             lower<LId, Lower, Upper>(s, r);
+@@ -847,7 +937,10 @@ struct Vu1Aot
+         }
+         afterOps<ViReg, RecordVi>(s, oldVi);
+         const bool ended = finish<Kind>(s, r);
+-        s.fastAdvanceTo(issue + 1u);
++        if constexpr (Relaxed)
++            relaxedAdvance(s, issue + 1u);
++        else
++            s.fastAdvanceTo(issue + 1u);
+         s.m_state.cycles = s.m_cycle;
+         s.m_fastIndex = k + 1u;
+         return ended ? kStepEnded : kStepNext;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index c1c1348..e7fe3ab 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -81,6 +81,9 @@ namespace
+     const uint32_t g_aotBlockCount = 0u;
+ #endif
+     const bool g_aotVerify = std::getenv("PS2X_VU_AOT_VERIFY") != nullptr;
++    // #48 experiment: bind the generated blocks' relaxed variant (no MAC/status flags, CLIP at once, the cycle
++    // advanced only for pairs that read it). Values can differ from the exact engine.
++    const bool g_aotRelaxed = std::getenv("PS2X_VU_RELAXED") != nullptr;
+     const bool noElide = std::getenv("PS2X_VU_NO_FLAG_ELIDE") != nullptr;
+ 
+     // PS2X_VU_STATS=1 (#36): VU1 coverage counters. Off: one predictable branch on a static per hook.
+@@ -388,7 +391,7 @@ namespace
+                 same = same && info.shadowReg == shadowReg && info.kind == kind;
+             }
+             if (same)
+-                return block.fn;
++                return g_aotRelaxed ? block.relaxed : block.fn;
+             std::fprintf(stderr, "[vu1:aot] block %016llx:0x%04x does not match the generated code; not used\n",
+                          static_cast<unsigned long long>(ids.imageHash), pc);
+             return nullptr;
