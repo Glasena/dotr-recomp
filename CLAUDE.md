@@ -152,6 +152,11 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   VBlank ~1800: ~14.1 VBlanks/s (5 s samples 12.6–15.0; 1900–2300 ~14.5) vs ~13.4. Frames 1900/2100/2300
   byte-identical to `test_before`. Tests 444/445 (same pre-existing GS callback failure). Next slice: FMAC
   flag updates on the fast-block path.
+- Patch 0027 (2026-10-22, #35): `perf --call-graph dwarf` found the map/hash share was `IopKernel::beginNextReady`/
+  `nextWakeCycle` walking the thread `std::map` on every idle IOP step (~7.5%) and the GIF_STAT lookup in
+  `advanceEeTimers` (~2.1%). Kernel caches "nothing ready until cycle W" behind a version bumped by every public
+  mutator; GIF_STAT node pointer cached. IOP `runCycles` 14.9% -> 9.3% of the game thread; map 1900->2300
+  15.8 s -> 14.65 s (~25.3 -> ~27.3 VBlanks/s). Dumps and log identical, IOP tests pass.
 - Patch 0022 (2026-10-22, #30): fast-block MADD/MSUB (vector, broadcast, Q/I) and OPMSUB into VF with SSE (0020/0021
   did ADD/SUB/MUL). Map samples after VBlank ~1800: ~14.6 VBlanks/s (14.1-15.0) vs ~14.2; dumps byte-identical.
 - Patch 0023 (2026-10-22, #31): the same SSE path for the ACC forms (ADDA/SUBA/MULA/MADDA/MSUBA, broadcast, Q/I,
@@ -277,6 +282,8 @@ Order is tracked with the `priority: N` labels; #13 is pinned on GitHub.
    math is not the remaining cost. Profile before the next VU1 step. Do not port PCSX2 microVU.
    Patch 0024 (#32, raster thread) took the map to ~18.5, patch 0025 (#33, raster batching/balance) to ~21.7;
    the game thread now waits only at present (~1.3 s per 5 s). Patch 0026 (#34, FMAC flag classification and
-   dead-write elision) took it to ~25.6. Profile the game thread again before the next VU1 step.
+   dead-write elision) took it to ~25.6, patch 0027 (#35, IOP idle cache) to ~27.3. What is left outside VU1 is
+   real IOP instruction work (~9%, incl. `servicePendingDmaInterrupts` per IOP instruction ~1.8%). Profile the game
+   thread again before the next VU1 step.
 2. Then #10 (box glyphs), #14 (display env), #16, #17, #3-#5. Open an issue per new blocker.
 3. Pin the PS2Recomp commit in the README (`eb8688b`, as KIexster pins theirs).

@@ -1,0 +1,199 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -99,5 +99,10 @@
+         uint32_t m_nextSemaphoreId = 1;
+         uint32_t m_nextEventFlagId = 1;
+         IopThread *m_currentThread = nullptr;
++        // Bumped by every public call that can change a thread. While it matches m_idleVersion and the cycle is
++        // below m_idleWake, beginNextReady knows no thread is ready and m_idleWake is the earliest Delay wake.
++        uint64_t m_version = 0;
++        uint64_t m_idleVersion = ~0ull;
++        uint64_t m_idleWake = 0;
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -25,6 +25,7 @@
+ 
+     void IopKernel::reset()
+     {
++        ++m_version;
+         m_threads.clear();
+         m_semaphores.clear();
+         m_eventFlags.clear();
+@@ -36,6 +37,7 @@
+ 
+     bool IopKernel::dispatchThreadImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle)
+     {
++        ++m_version;
+         const auto setV0 = [&](int32_t value)
+         {
+             cpu.gpr[2] = static_cast<uint32_t>(value);
+@@ -352,6 +354,7 @@
+ 
+     bool IopKernel::dispatchSemaphoreImport(uint16_t ordinal, IopCpuState &cpu)
+     {
++        ++m_version;
+         const auto setV0 = [&](int32_t value)
+         {
+             cpu.gpr[2] = static_cast<uint32_t>(value);
+@@ -504,6 +507,7 @@
+ 
+     int IopKernel::createInternalEventFlag(uint32_t attr, uint32_t option, uint32_t bits)
+     {
++        ++m_version;
+         EventFlag event;
+         event.id = static_cast<int>(m_nextEventFlagId++);
+         event.attr = attr;
+@@ -516,6 +520,7 @@
+ 
+     bool IopKernel::setInternalEventFlag(int id, uint32_t bits)
+     {
++        ++m_version;
+         const auto event = m_eventFlags.find(id);
+         if (event == m_eventFlags.end())
+             return false;
+@@ -526,6 +531,7 @@
+ 
+     bool IopKernel::dispatchEventImport(uint16_t ordinal, IopCpuState &cpu)
+     {
++        ++m_version;
+         const auto setV0 = [&](int32_t value)
+         {
+             cpu.gpr[2] = static_cast<uint32_t>(value);
+@@ -654,6 +660,7 @@
+ 
+     void IopKernel::sleepCurrent(IopCpuState &cpu)
+     {
++        ++m_version;
+         if (m_currentThread == nullptr)
+             return;
+         m_currentThread->state = IopThreadState::Sleep;
+@@ -662,6 +669,7 @@
+ 
+     void IopKernel::delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu)
+     {
++        ++m_version;
+         if (m_currentThread == nullptr)
+             return;
+         m_currentThread->wakeCycle = wakeCycle;
+@@ -671,15 +679,24 @@
+ 
+     IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
+     {
+-        for (auto &[id, thread] : m_threads)
+-        {
+-            if (thread.state == IopThreadState::Delay && thread.wakeCycle <= currentCycle)
+-                thread.state = IopThreadState::Ready;
+-        }
++        if (m_idleVersion == m_version && currentCycle < m_idleWake)
++            return nullptr;
+ 
++        // One pass: waking a due Delay thread and picking the lowest (priority, id) Ready one do not depend on
++        // the visiting order.
+         IopThread *next = nullptr;
++        uint64_t wake = ~0ull;
+         for (auto &[id, thread] : m_threads)
+         {
++            if (thread.state == IopThreadState::Delay)
++            {
++                if (thread.wakeCycle > currentCycle)
++                {
++                    wake = std::min(wake, thread.wakeCycle);
++                    continue;
++                }
++                thread.state = IopThreadState::Ready;
++            }
+             if (thread.state != IopThreadState::Ready)
+                 continue;
+             if (next == nullptr || thread.priority < next->priority ||
+@@ -687,8 +704,13 @@
+                 next = &thread;
+         }
+         if (next == nullptr)
++        {
++            m_idleVersion = m_version;
++            m_idleWake = wake;
+             return nullptr;
++        }
+ 
++        ++m_version;
+         m_currentThread = next;
+         next->state = IopThreadState::Running;
+         next->cpu.stopped = false;
+@@ -698,6 +720,8 @@
+ 
+     uint64_t IopKernel::nextWakeCycle(uint64_t fallback) const
+     {
++        if (m_idleVersion == m_version)
++            return std::min(fallback, m_idleWake);
+         uint64_t nextWake = fallback;
+         for (const auto &[id, thread] : m_threads)
+         {
+@@ -709,6 +733,7 @@
+ 
+     void IopKernel::endTimeslice(IopThread &thread, uint32_t returnSentinel)
+     {
++        ++m_version;
+         if (thread.cpu.pc == returnSentinel || thread.cpu.stopped)
+             thread.state = IopThreadState::Dormant;
+         else if (thread.state == IopThreadState::Running)
+@@ -719,6 +744,7 @@
+ 
+     void IopKernel::cleanupDeadThreads()
+     {
++        ++m_version;
+         for (auto thread = m_threads.begin(); thread != m_threads.end();)
+         {
+             if (thread->second.state != IopThreadState::Dead)
+@@ -734,6 +760,7 @@
+ 
+     void IopKernel::terminateThreadsInRange(uint32_t base, uint32_t size)
+     {
++        ++m_version;
+         for (auto &[id, thread] : m_threads)
+         {
+             const uint32_t pc = IopMemory::physicalAddress(thread.cpu.pc);
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -353,6 +353,8 @@
+     std::atomic<uint64_t> m_vu1CodeGeneration{0};
+     // I/O registers
+     std::unordered_map<uint32_t, uint32_t> m_ioRegisters;
++    // GIF_STAT's node in m_ioRegisters once it exists (node pointers survive rehashing; reset on clear).
++    uint32_t *m_gifStatRegister = nullptr;
+ 
+     // Registers
+     GSRegisters gs_regs;
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -355,6 +355,7 @@
+ 
+         // Initialize I/O registers
+         m_ioRegisters.clear();
++        m_gifStatRegister = nullptr;
+ 
+         // Initialize GS registers
+         memset(&gs_regs, 0, sizeof(gs_regs));
+@@ -413,9 +414,14 @@
+ 
+     constexpr uint32_t kGifStat = 0x10003020u;
+     constexpr uint32_t kGifFqcMask = 0x1F000000u;
+-    auto gifStatIt = m_ioRegisters.find(kGifStat);
+-    if (gifStatIt != m_ioRegisters.end())
+-        gifStatIt->second &= ~kGifFqcMask;
++    if (m_gifStatRegister == nullptr)
++    {
++        auto gifStatIt = m_ioRegisters.find(kGifStat);
++        if (gifStatIt != m_ioRegisters.end())
++            m_gifStatRegister = &gifStatIt->second;
++    }
++    if (m_gifStatRegister != nullptr)
++        *m_gifStatRegister &= ~kGifFqcMask;
+ 
+     uint32_t interruptMask = 0u;
+     for (size_t index = 0; index < m_eeTimers.size(); ++index)
