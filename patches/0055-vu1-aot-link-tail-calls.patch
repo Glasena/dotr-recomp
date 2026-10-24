@@ -1,0 +1,129 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h b/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
+index f92875c..0875d64 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
+@@ -224,6 +224,8 @@ struct Vu1AotRun
+     uint64_t prevReadyMax = 0;            // m_regReadyMax before that block's exit
+     int (*next)(VU1Interpreter &, Vu1AotRun &) = nullptr; // kAotNext: the generated code of the block entered
+     bool refused = false;                 // kAotDone after tryEnterFastBlock() refused the next block
++    uint32_t linkDepth = 0;               // links linkNext() ran in a row since run() last called generated code
++    static constexpr uint32_t kMaxLinkDepth = 256;
+ };
+ 
+ // What a generated block returns to run() (#41).
+@@ -950,7 +952,7 @@ struct Vu1Aot
+     static inline void sync(VU1Interpreter &s, Vu1AotRun &r, uint32_t k)
+     {
+         s.m_state.pc = (r.startPair + k) * 8u;
+-        s.fastAdvanceTo(s.m_fastStart + r.issue[k - 1u] + 1u);
++        relaxedAdvance(s, s.m_fastStart + r.issue[k - 1u] + 1u); // fastAdvanceTo() without the call when nothing is due
+         s.m_state.cycles = s.m_cycle;
+         s.m_fastIndex = k;
+     }
+@@ -1035,6 +1037,7 @@ struct Vu1Aot
+     static void recordExit(VU1Interpreter &s, const VU1Interpreter::FastBlock &block);
+     static void flushDeferred(VU1Interpreter &s, Vu1AotRun &r);
+     static int linkNext(VU1Interpreter &s, Vu1AotRun &r, uint32_t slot, uint32_t pair);
++    static bool resolveLink(VU1Interpreter &s, Vu1AotRun &r, void *link, uint32_t pair); // a DirectIds::Link
+     static void resolveChain(const VU1Interpreter::FastBlock &from, const VU1Interpreter::FastBlock &to,
+                              uint32_t pair, void *chain);
+     static bool enterResolved(VU1Interpreter &s, Vu1AotRun &r, const VU1Interpreter::FastBlock &to,
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index cfeec86..f8be9cd 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -2854,35 +2854,44 @@ int Vu1Aot::enterNext(VU1Interpreter &s, Vu1AotRun &r)
+     return kAotNext;
+ }
+ 
++// Fills a link the first time its successor is found built and bound (out of line: linkNext() keeps no local whose
++// address escapes, so its calls stay tail calls).
++[[gnu::noinline]] bool Vu1Aot::resolveLink(VU1Interpreter &s, Vu1AotRun &r, void *resolved, uint32_t pair)
++{
++    DirectIds::Link &link = *static_cast<DirectIds::Link *>(resolved);
++    using FastBlock = VU1Interpreter::FastBlock;
++    DirectIds &ids = *static_cast<DirectIds *>(r.ids);
++    if (pair >= s.m_fastBlocks.size() || !s.m_fastBlocks[pair] || pair >= ids.aot.size() || !ids.aot[pair])
++        return false;
++    const FastBlock &from = *s.m_fastBlock;
++    const FastBlock &to = *s.m_fastBlocks[pair];
++    DirectIds::Chain chain;
++    resolveChain(from, to, pair, &chain);
++    link.to = &to;
++    link.issue = to.issue.data();
++    link.elide = !noElide && !ids.elide[pair].empty() ? ids.elide[pair].data() : nullptr;
++    link.last = to.issue.back();
++    link.fail = chain.fail;
++    link.fdivReq = static_cast<int32_t>(to.fdivReq);
++    link.efuReq = static_cast<int32_t>(to.efuReq);
++    link.waitPReq = static_cast<int32_t>(to.waitPReq);
++    link.restCount = static_cast<uint16_t>(chain.rest.size()); // at most one per liveIn lane
++    for (const VU1Interpreter::FastReady &w : to.exitReady)
++        link.lateMax = std::max(link.lateMax, w.offset);
++    link.rest = chain.rest.data(); // the vector's buffer survives the move into the list
++    ids.linkChains.push_back(std::move(chain));
++    link.fn = ids.aot[pair];
++    return true;
++}
++
+ int Vu1Aot::linkNext(VU1Interpreter &s, Vu1AotRun &r, uint32_t slot, uint32_t pair)
+ {
+     using FastBlock = VU1Interpreter::FastBlock;
+     const FastBlock &from = *s.m_fastBlock;
+     DirectIds::Link &link = static_cast<DirectIds::Link *>(r.links)[r.startPair * 2u + slot];
+-    if (!link.fn) [[unlikely]]
+-    {
+-        // Resolved once the successor is built and bound; until then the generic transition (run() builds it).
+-        DirectIds &ids = *static_cast<DirectIds *>(r.ids);
+-        if (pair >= s.m_fastBlocks.size() || !s.m_fastBlocks[pair] || pair >= ids.aot.size() || !ids.aot[pair])
+-            return after(s, r, kStepNext, from.pairCount - 1u, from.pairCount);
+-        const FastBlock &to = *s.m_fastBlocks[pair];
+-        DirectIds::Chain chain;
+-        resolveChain(from, to, pair, &chain);
+-        link.to = &to;
+-        link.issue = to.issue.data();
+-        link.elide = !noElide && !ids.elide[pair].empty() ? ids.elide[pair].data() : nullptr;
+-        link.last = to.issue.back();
+-        link.fail = chain.fail;
+-        link.fdivReq = static_cast<int32_t>(to.fdivReq);
+-        link.efuReq = static_cast<int32_t>(to.efuReq);
+-        link.waitPReq = static_cast<int32_t>(to.waitPReq);
+-        link.restCount = static_cast<uint16_t>(chain.rest.size()); // at most one per liveIn lane
+-        for (const VU1Interpreter::FastReady &w : to.exitReady)
+-            link.lateMax = std::max(link.lateMax, w.offset);
+-        link.rest = chain.rest.data(); // the vector's buffer survives the move into the list
+-        ids.linkChains.push_back(std::move(chain));
+-        link.fn = ids.aot[pair];
+-    }
++    // Until the successor is built and bound, the generic transition (run() builds it).
++    if (!link.fn && !resolveLink(s, r, &link, pair)) [[unlikely]]
++        return after(s, r, kStepNext, from.pairCount - 1u, from.pairCount);
+ 
+     // The block linkNext() left before this one: its exit ready cycles are dropped when they are all in the past
+     // and nothing older can still stall (then they are equivalent to the values the lanes hold), else recorded now,
+@@ -2996,6 +3005,11 @@ int Vu1Aot::linkNext(VU1Interpreter &s, Vu1AotRun &r, uint32_t slot, uint32_t pa
+     r.startPair = pair;
+     r.lateMax = link.lateMax;
+     r.next = link.fn;
++    // Run the successor right here: generated code reaches linkNext() by a tail call and this is one too, so a chain
++    // runs in constant stack without returning to run() per block. Every kMaxLinkDepth links it returns kAotNext
++    // anyway (run() resets the depth), which bounds the stack if a compiler ever emits these as plain calls.
++    if (++r.linkDepth < Vu1AotRun::kMaxLinkDepth)
++        return link.fn(s, r);
+     return kAotNext;
+ }
+ 
+@@ -3902,9 +3916,13 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     // Runs generated blocks from the one just entered for as long as they chain (#41).
+     auto runAot = [&](Vu1AotFn aot, Vu1AotRun &aotRun) -> int
+     {
++        aotRun.linkDepth = 0u;
+         int status = aot(*this, aotRun);
+         while (status == kAotNext)
++        {
++            aotRun.linkDepth = 0u;
+             status = aotRun.next(*this, aotRun);
++        }
+         if (aotRun.deferred)
+             Vu1Aot::flushDeferred(*this, aotRun);
+         return status;

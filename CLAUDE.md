@@ -257,6 +257,13 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   defers the exit ready cycles to the next transition, dropping them when all are past (AOT verify compares past
   ready cycles as equal). 178/187 blocks link statically, 97.8% of map block entries. Duel GameThread 143.9G ->
   133.5G instr (-7%), map 39.8G -> 37.9G; enter/exit share 13.4% -> ~10%. Wall/cycles within noise (pgs, busy host).
+- Patch 0055 (2026-10-24, #58, partial): re-profile (duel, pgs): `linkNext` 5.4%, commit 2.9% + `fastAdvanceTo` 1.1%.
+  Counters over the duel run (377M linked transitions): deferred flush 0.6%, liveIn rest loop 0.65%, commit at the
+  transition 0%, fdiv still valid 0.6%: the dynamic checks a static ready model would remove almost never run; the
+  cost is the call itself, and the commits are real CLIP/Q/kept-flag entries (54 CLIP, 41 FCAND in the image). Now
+  `linkNext` tail-calls the successor (generated code already jumps to it; depth bound 256 per run() call), its
+  resolve path is out of line, and `sync()` skips `fastAdvanceTo` when nothing is due. Duel 10000->11000, 3 pairs:
+  instr 133.5G -> 132.9G, cycles ~57.1G -> ~55.4G, wall ~18.8 -> ~19.3 s (host at 96 C, noise); map in noise.
 - Measuring pgs: the NVIDIA shader cache (`~/.cache/nvidia/GLCache`, 784 MB, full) keys on the executable path, so a
   new runner copy compiles shaders on the main thread every run (~2x slower). Use a private cache
   (`__GL_SHADER_DISK_CACHE_PATH=<scratch> __GL_SHADER_DISK_CACHE_SIZE=4000000000 __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1`)
