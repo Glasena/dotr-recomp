@@ -462,6 +462,13 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
   and movie frames 500/700/900 are byte-identical; keep comparing against those.
 - `sceGsSetDefDBuff`'s FRAME-mode second buffer at zbufaddr/2 (libgraph) is still not done (upstream PR #336).
 
+## Memory card first save (2026-10-24, #61)
+- Patch 0057: DotR creates its data file with `sceMcOpen("BASLUS-20515", 0x200)` (SCE_CREAT, no access bits; 0x23DBF4),
+  then writes it with flags 0x2. The HLE only created files for write modes and fell back to "rb" (-4 NoEntry); now
+  any open with O_CREAT on a missing file creates it (as mcman). `[MC] Open` logs path/flags/result; unit test added.
+- Not checked in game: no scripted path reaches a save point (tutorial duels still run at VBlank 48000).
+- `ps2x_tests` with the default threaded GS fails 38 GS tests; `PS2X_GS_THREAD=0` gives the known 1 failure (#65).
+
 ## Duel battle pink (2026-10-24, #59, open)
 - `tools/duel_attack_script.sh` prints the pad script to the tutorial battles (Celtic Guardian attacks at ~15060-15500).
   The pink is in the GS input, not a backend bug: CPU GS and pgs match, `PS2X_VU_EXACT=1 PS2X_VU_NO_AOT=1` too. It is

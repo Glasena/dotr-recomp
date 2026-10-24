@@ -1,0 +1,63 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+index 564d873..336fc67 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+@@ -442,7 +442,9 @@ namespace ps2_stubs
+             std::error_code ec;
+             const bool exists = std::filesystem::exists(hostPath, ec) && !ec;
+ 
+-            const char *mode = "rb";
++            // mcman creates a missing file for any access mode, also SCE_CREAT alone (DotR opens
++            // its data file with 0x200 before writing it with 0x2).
++            const char *mode = (create && !exists) ? "w+b" : "rb";
+             if (read && write)
+             {
+                 if (append)
+@@ -1040,6 +1042,8 @@ namespace ps2_stubs
+             }
+             setMcCommandResultLocked(kMcCmdOpen, result);
+         }
++        RUNTIME_LOG("[MC] Open port=" << port << " '" << path << "' flags=0x" << std::hex << flags << std::dec
++                                      << " -> result=" << result);
+         setReturnS32(ctx, 0);
+     }
+ 
+diff --git a/ps2xTest/src/ps2_runtime_io_tests.cpp b/ps2xTest/src/ps2_runtime_io_tests.cpp
+index 4f979be..44bf963 100644
+--- a/ps2xTest/src/ps2_runtime_io_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_io_tests.cpp
+@@ -543,6 +543,34 @@ void register_ps2_runtime_io_tests()
+             t.IsTrue(std::filesystem::exists(hostPath), "sceMcOpen/sceMcWrite should create the host file under mcRoot");
+         });
+ 
++        tc.Run("sceMcOpen with only O_CREAT creates the file", [](TestCase &t)
++        {
++            TestContext test;
++            int32_t cmd = 0;
++            clearContext(test.ctx);
++            ps2_stubs::sceMcFormat(test.rdram.data(), &test.ctx, nullptr); // card state is global
++            syncMc(test.rdram, &cmd);
++            std::filesystem::create_directories(test.paths.mcRoot / "SAVEDATA");
++            const uint32_t fileAddr = GUEST_STRING_AREA_START + 0x500;
++            writeGuestString(test.rdram.data(), fileAddr, "/SAVEDATA/new.bin");
++
++            clearContext(test.ctx);
++            setRegU32(test.ctx, 4, 0u);
++            setRegU32(test.ctx, 5, 0u);
++            setRegU32(test.ctx, 6, fileAddr);
++            setRegU32(test.ctx, 7, PS2_FIO_O_CREAT);
++            ps2_stubs::sceMcOpen(test.rdram.data(), &test.ctx, nullptr);
++            const int32_t fd = syncMc(test.rdram, &cmd);
++            t.IsTrue(fd > 0, "sceMcOpen(O_CREAT) should return a descriptor for a missing file");
++
++            clearContext(test.ctx);
++            setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
++            ps2_stubs::sceMcClose(test.rdram.data(), &test.ctx, nullptr);
++            t.Equals(syncMc(test.rdram, &cmd), 0, "sceMcClose should finish successfully");
++            t.IsTrue(std::filesystem::exists(test.paths.mcRoot / "SAVEDATA" / "new.bin"),
++                     "sceMcOpen(O_CREAT) should create the host file");
++        });
++
+         tc.Run("sceMcGetDir includes dot entries and file metadata", [](TestCase &t)
+         {
+             TestContext test;
