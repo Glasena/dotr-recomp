@@ -1,0 +1,21 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp b/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp
+index b09740f..04601c0 100644
+--- a/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp
+@@ -428,6 +428,16 @@ namespace
+         explicit ParallelBackend(GSRegisters &registers) : priv(registers)
+         {
+             Util::register_thread_index(0);
++            // parallel-gs precompiles every shader variant on hardware_concurrency/2 threads at init. Without a
++            // persistent pipeline cache that runs for minutes and takes half the host threads (incl. the game
++            // thread's HT sibling); the driver's own shader cache already serves the few variants a game uses.
++            // PGS_SKIP_COMPILATION_TASKS=0 restores the precompile.
++#ifdef _WIN32
++            if (!std::getenv("PGS_SKIP_COMPILATION_TASKS"))
++                _putenv_s("PGS_SKIP_COMPILATION_TASKS", "1");
++#else
++            setenv("PGS_SKIP_COMPILATION_TASKS", "1", 0);
++#endif
+             if (!gs.init(&vk.device, ParallelGS::GSOptions{}))
+                 throw std::runtime_error("parallel-gs: GS initialization failed; check Vulkan feature diagnostics above");
+             gs.set_signal_interface(this);

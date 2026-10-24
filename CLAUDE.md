@@ -473,6 +473,14 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
   alpha 0xFF. Now `ps2x::test::packWindowFrame` (shared by `UploadFrame` and test dumps) sets alpha 0xFF, and dumps are
   that texture blended over black like `DrawTexturePro`, so they show what the window shows (removing the alpha line
   turns the pgs movie dump black). All CPU references byte-identical; pgs cross gates pass.
+- Patch 0059 (2026-10-24, #64): `tools/map_walk_script.sh` (save in `../dotr/mc0`, CONTINUE, cursor walk + SYSTEM panel
+  open/close, never Save; map ~2800, 2850->6000 ~90 s). parallel-gs precompiled every shader variant on 6 threads
+  (hardware_concurrency/2) at init; with no persistent pipeline cache the NVIDIA cache takes ~4 runs per binary path
+  to fill, so each early run burned 6 threads for the whole walk (GameThread's HT sibling). Now
+  `PGS_SKIP_COMPILATION_TASKS=1` unless set: cold cache 37 on-demand stalls, 1.85 s total (max 215 ms) vs 38 / 3.7 s
+  with the precompile. Walk wall, interleaved: 106.7/98.4/91.2 -> 89.9/90.9/91.2 s (equal once the cache is warm).
+  Warm map is GameThread-bound (~94% of samples; 29-37 VBlanks/s): VU1 ~52% (generated bodies 19%, out-of-line
+  `fmacMath` 13%, transitions 5%), EE code 19%, EE runtime 6%, IOP 5%, pgs 5%, VIF 4%. GPU idles at P5/P8 (~25%).
 
 ## HLE display env (2026-10-24, #14)
 - Patch 0054: the HLE `sceGsSetDefDispEnv`/`sceGsSetDefDBuff{,Dc}` now build the display env like DotR's own libgraph
