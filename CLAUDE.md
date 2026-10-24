@@ -433,6 +433,16 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
   the backend lock, and on the GameThread in GIF pressure flushes. Now 8 frame contexts and the readback fence wait
   outside the lock: map 1900->2300 pgs 12.5-12.7 -> 9.2 s, duel 10000->11000 39.9-47.9 -> 33.4-36.6 s; dumps unchanged.
 
+## Duel battle pink (2026-10-24, #59, open)
+- `tools/duel_attack_script.sh` prints the pad script to the tutorial battles (Celtic Guardian attacks at ~15060-15500).
+  The pink is in the GS input, not a backend bug: CPU GS and pgs match, `PS2X_VU_EXACT=1 PS2X_VU_NO_AOT=1` too. It is
+  EE-built PATH2 untextured additive prims (ALPHA 0x48): a floor glow from `sub_001DBD50` (3 world squares, projected
+  by `sub_00207230`, clipped by `sub_00207AA0`) and a full-screen sprite into the offscreen FBP 0x118; colour from an
+  effect object +0x130 (B,G,R) set via `sub_001EFA80` (0x800060 since the Dark Magician summon). Skipping untextured
+  ABE prims removes it. Clipped glow vertices get z=0 (fixuns(z/w) hits 2^24, masked to 24 bits): the EE FPU runs
+  round-to-nearest, the PS2 truncates (`FPU_CVT_W_S` is `nearbyintf`); EE round-toward-zero does not remove the pink
+  and changes default frame 1700 (1684 px). Next: a hardware/PCSX2 reference of that battle.
+
 ## Next steps (2026-10-22)
 Order is tracked with the `priority: N` labels; #13 is pinned on GitHub.
 1. #13 (priority 3) is the parent. #22 (async VU1) did not help: the EE waits on the kick. #23 (patch 0016) and
