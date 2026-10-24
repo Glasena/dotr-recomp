@@ -443,6 +443,11 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
   adaptive weave, which bobs; Present runs per host frame anyway). Now `force_progressive`+`anti_blur` (parallel-gs
   player defaults: frame mode INT=1/FFMD=0 scanned progressive from circuit 2, no DY 50/51 blend) and
   `skip_deinterlace` (movie FFMD=1 comes out 640x224 like the CPU GS). Title consecutive frames 3.1 -> 0.0 mean diff.
+- Patch 0056 (2026-10-24, #60): the window draws its texture alpha-blended over black, and pgs scanout keeps GS alpha
+  (movie IMAGE alpha 0, menu logo layer low): black movie and menu background in the window only; test dumps forced
+  alpha 0xFF. Now `ps2x::test::packWindowFrame` (shared by `UploadFrame` and test dumps) sets alpha 0xFF, and dumps are
+  that texture blended over black like `DrawTexturePro`, so they show what the window shows (removing the alpha line
+  turns the pgs movie dump black). All CPU references byte-identical; pgs cross gates pass.
 
 ## HLE display env (2026-10-24, #14)
 - Patch 0054: the HLE `sceGsSetDefDispEnv`/`sceGsSetDefDBuff{,Dc}` now build the display env like DotR's own libgraph
