@@ -1,0 +1,19 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp b/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp
+index 9602d1d..87c6f6b 100644
+--- a/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp
+@@ -626,6 +626,14 @@ namespace
+             p.qwords_lo[28] = request.bgcolor;
+             ParallelGS::VSyncInfo info{};
+             info.phase = uint32_t(priv.csr.load() >> 13) & 1u;
++            // #55: deinterlacing by CSR.FIELD shook the picture by half a line per field (and Present runs per
++            // host frame, not per field). DotR scans out frame mode (INT=1, FFMD=0) with both circuits one line
++            // apart (flicker filter): use the parallel-gs player's defaults, a progressive scan of one circuit
++            // (anti-blur, as PCSX2's default). The movie is field mode (FFMD=1, one buffer for both fields): return
++            // the field as is (640x224, like the CPU backend) instead of a motion-adaptive weave of it.
++            info.force_progressive = true;
++            info.anti_blur = true;
++            info.skip_deinterlace = true;
+             info.dst_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+             info.dst_stage = VK_PIPELINE_STAGE_2_COPY_BIT;
+             info.dst_access = VK_ACCESS_2_TRANSFER_READ_BIT;

@@ -432,6 +432,10 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
   frame's GPU work (the GPU stays at P8/300 MHz here, ~13 ms per frame), on the main thread's Present while holding
   the backend lock, and on the GameThread in GIF pressure flushes. Now 8 frame contexts and the readback fence wait
   outside the lock: map 1900->2300 pgs 12.5-12.7 -> 9.2 s, duel 10000->11000 39.9-47.9 -> 33.4-36.6 s; dumps unchanged.
+- Patch 0053 (2026-10-24, #55): pgs shook by half a line per field: `vsync()` deinterlaced by CSR.FIELD (motion-
+  adaptive weave, which bobs; Present runs per host frame anyway). Now `force_progressive`+`anti_blur` (parallel-gs
+  player defaults: frame mode INT=1/FFMD=0 scanned progressive from circuit 2, no DY 50/51 blend) and
+  `skip_deinterlace` (movie FFMD=1 comes out 640x224 like the CPU GS). Title consecutive frames 3.1 -> 0.0 mean diff.
 
 ## Duel battle pink (2026-10-24, #59, open)
 - `tools/duel_attack_script.sh` prints the pad script to the tutorial battles (Celtic Guardian attacks at ~15060-15500).
