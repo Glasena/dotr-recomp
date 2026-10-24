@@ -36,7 +36,8 @@ workspace/
   dotr-recomp/    this repository
     patches/      fixes to PS2Recomp, applied in order
     config/       dotr.toml (recompiler config), funcmap.csv (function map)
-    src/          game-specific code (dotr_overlays.cpp: picks the recompiled overlay module at 0x1E00000)
+    src/          game-specific code (dotr_overlays.cpp: picks the recompiled overlay module at 0x1E00000;
+                  main.cpp: launcher, command-line flags, config file, ISO extraction)
     tools/        iso9660.py (extracts files from the ISO root, stdlib only)
                   find_functions.py (builds config/funcmap.csv from the ELF)
                   overlays.py (recompiles the overlay modules in DATA/*MODULE.MRG one by one)
@@ -44,6 +45,39 @@ workspace/
                   test_run.sh (headless scripted run with PNG frame dumps)
                   imgdiff.sh (PSNR / pixels off / PHASH of two dumps, plus a diff montage)
 ```
+
+## Playing
+
+You need your own copy of the game (USA, `SLUS-20515`) as an ISO image or as the extracted disc folder, and a
+`ps2EntryRunner` built as in [Building](#building) (or a release build of it). Nothing else from the game is needed.
+
+```bash
+ps2EntryRunner                                  # launcher: pick the disc, memory card folder, window size, controls
+ps2EntryRunner --no-launcher "/path/to/your.iso" # straight into the game
+```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `[disc]` | last launcher choice | your ISO, the extracted disc folder, or its `SLUS_205.15` |
+| `--memcard-dir DIR` | `saves/` next to the executable | memory cards (`DIR/mc0`, `DIR/mc1`, created if missing) |
+| `--gs-backend auto\|pgs\|cpu` | `auto` | `auto` uses paraLLEl-GS (Vulkan) when the build has it and a device works, else the CPU GS |
+| `--window WxH` | `1920x1080` | window size; the 640x448 picture is scaled with its aspect ratio kept |
+| `--no-launcher` | | skip the launcher |
+
+- The launcher saves its choices, including the key and gamepad bindings of its Controls screen, in
+  `$XDG_CONFIG_HOME/dotr-recomp/config.cfg` (`~/.config/dotr-recomp/config.cfg`), plain `key=value` lines.
+  Bindings are raylib key / gamepad button numbers (`bind.cross=88,32,7`: X, Space, the bottom face button).
+  Keyboard and the first gamepad work together; the analog sticks are the gamepad's left and right sticks.
+- An ISO is extracted once into `$XDG_CACHE_HOME/dotr-recomp/disc` (`~/.cache/...`, about 2 GB) and reused while
+  the image path and size stay the same: the runtime serves `cdrom0:` from a folder.
+- Order of precedence: command-line flag, then environment (`PS2X_GS_BACKEND`), then the config file. With
+  `PS2X_HEADLESS=1` (`tools/test_run.sh`) the config file and the launcher are ignored.
+
+A release is built on the release machine from the builder's own disc, exactly as in [Building](#building), and
+ships only the `ps2EntryRunner` binary and its libraries (FFmpeg, and the paraLLEl-GS licence/source note under
+the LGPL if it is enabled). Generated code and game data never go into git; the player still supplies the disc.
+Whether a binary that contains code recompiled from the game may be redistributed is the releaser's legal
+question, not something this repository settles.
 
 ## Building
 

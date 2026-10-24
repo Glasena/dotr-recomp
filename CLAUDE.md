@@ -363,6 +363,18 @@ hand, Dark Magician summon with its 3D model (VBlank ~10500). Not tested further
 - Configure through real paths (`/home/.../workspace/PS2Recomp`), not a symlinked checkout: paths end up in every
   compile command and a different spelling rebuilds everything.
 
+## Launcher and flags (2026-10-24, #62)
+- `src/main.cpp` replaces the runtime's `src/main.cpp` (sync copies it to `runner/main.cpp`, which CMake prefers):
+  flags `[disc] --memcard-dir --gs-backend auto|pgs|cpu --window WxH --no-launcher`, config
+  `~/.config/dotr-recomp/config.cfg`, raylib launcher (own window, closed before `runtime.initialize`), Controls
+  screen, ISO extracted once to `~/.cache/dotr-recomp/disc` (cdrom0: is a host folder everywhere; reading the image
+  in place would touch file opens, sceCdSearchFile and the IOP loader). Precedence: flag > env > config.
+  `PS2X_HEADLESS` skips config and launcher, so `tools/test_run.sh` dumps stay byte-identical (CPU GS, elf-dir mc0).
+- Patch 0058: `ps2x::pad::binding(bit)` table (defaults = old keys; keyboard and first gamepad read together),
+  `PS2X_GS_BACKEND=auto` (pgs, CPU on a Vulkan init exception), and an mc root set before `loadELF` is kept.
+- xdotool `click` is too short for raylib's `IsMouseButtonPressed`; use mousedown, 0.1 s, mouseup.
+- Not verified: a real USB pad (mapping, sticks, capture on the Controls screen) — #66.
+
 ## Backlog
 GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in the commit message.
 
