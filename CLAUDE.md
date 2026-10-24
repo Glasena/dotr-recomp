@@ -375,6 +375,19 @@ hand, Dark Magician summon with its 3D model (VBlank ~10500). Not tested further
 - xdotool `click` is too short for raylib's `IsMouseButtonPressed`; use mousedown, 0.1 s, mouseup.
 - Not verified: a real USB pad (mapping, sticks, capture on the Controls screen) — #66.
 
+## Deck cost mod and rand (2026-10-24, #72, #73)
+- Deck struct (player 0 at 0x32F790, player 1 = opponent at +0xFFA0; deck slot at +0xFD94 + slot*84): 41 u16 card ids,
+  then the DC at +0x52 (`sub_00215C40` sums byte +3 of each card record from `sub_001DD0E0`). `sub_00215F00(player,
+  slot)` reads it. Map HUD panels `sub_002347D0` (mine -> 0x1ED5442) and `sub_002354A0` (opponent -> 0x1ED5444) copy
+  it; the only reader is the map's duel check at 0x239E34 in `sub_00237730` (`mine > opponent` refuses Cross).
+- `src/dotr_mods.cpp`: with `--no-deck-cost-limit` / `mod.no_deck_cost=1` the 0x2354A0 table entry wraps the panel and
+  writes 0x7FFF to 0x1ED5444 after it. Tested with a temporary RAM poke (DC 2000 vs 1149): on -> duel, off -> refused.
+- #73: the HLE `rand` stub returned 0..0x7FFF; DotR's newlib rand returns 31 bits and the game scales by 1/2^31, so
+  every map duel hung dealing the deck (`sub_001DEA30`) and the story sky lost its clouds. The stub is gone from the
+  toml. `../dotr/test_before` (map 1900/2100/2300) was regenerated (old: `test_before_hostrand`); default dumps same.
+- Save with map access: `../dotr/mc0` (Continue = `start@1000,start@1400,down@1500,cross@1560,cross@1800`, map with
+  Tristan Grey selected at ~2800; Cross there starts a duel).
+
 ## Backlog
 GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in the commit message.
 

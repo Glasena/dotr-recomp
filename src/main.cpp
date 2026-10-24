@@ -3,6 +3,7 @@
 // Replaces PS2Recomp's ps2xRuntime/src/main.cpp (tools/sync_runner.sh copies it to src/runner/main.cpp).
 // Test mode (PS2X_HEADLESS=1, tools/test_run.sh) reads no config file and shows no launcher, so its runs stay as
 // before: the runtime's own defaults (CPU GS, <elf dir>/mc0) apply unless a flag says otherwise.
+#include "dotr_mods.h"
 #include "ps2_runtime.h"
 #include "ps2_host_backend.h"
 #include "runtime/ps2_pad.h"
@@ -36,6 +37,7 @@ namespace
         int width = 1920;
         int height = 1080;
         bool noLauncher = false;
+        bool noDeckCostLimit = false; // #72 mod
     };
 
     std::string envOr(const char *name, const std::string &fallback)
@@ -112,7 +114,7 @@ namespace
         std::ofstream out(configFile());
         out << "# dotr-recomp launcher settings\n"
             << "disc=" << o.disc << "\nmemcard_dir=" << o.memcardDir << "\ngs_backend=" << o.gsBackend
-            << "\nwindow=" << o.width << "x" << o.height << "\n";
+            << "\nwindow=" << o.width << "x" << o.height << "\nmod.no_deck_cost=" << o.noDeckCostLimit << "\n";
         for (int bit = 0; bit < ps2x::pad::kButtonCount; ++bit)
         {
             const ps2x::pad::Binding &b = ps2x::pad::binding(bit);
@@ -360,6 +362,10 @@ namespace
                         cur = i;
                 if (ui.button({30, 425, 120, 36}, backends[cur]))
                     o.gsBackend = backends[(cur + 1) % 3];
+                DrawText("Mods", 470, 370, 20, GRAY);
+                DrawText("Duel any opponent, whatever your deck costs:", 470, 400, 18, LIGHTGRAY);
+                if (ui.button({470, 425, 120, 36}, o.noDeckCostLimit ? "on" : "off"))
+                    o.noDeckCostLimit = !o.noDeckCostLimit;
                 if (ui.button({30, 520, 160, 50}, "Start"))
                 {
                     std::string err;
@@ -458,6 +464,7 @@ namespace
                      "  --gs-backend B         auto | pgs | cpu (default auto: pgs if Vulkan works)\n"
                      "  --window WxH           window size (default 1920x1080)\n"
                      "  --no-launcher          start the game directly\n"
+                     "  --no-deck-cost-limit   mod: duel any opponent whatever your deck costs\n"
                      "Settings chosen in the launcher are kept in " << configFile().string() << "\n";
     }
 }
@@ -490,6 +497,7 @@ int main(int argc, char *argv[])
             o.memcardDir = get("memcard_dir", (executableDir(argv[0]) / "saves").string());
             o.gsBackend = get("gs_backend", "auto");
             parseSize(get("window", ""), o.width, o.height);
+            o.noDeckCostLimit = get("mod.no_deck_cost", "0") == "1";
             loadBindings(cfg);
         }
         o.gsBackend = envOr("PS2X_GS_BACKEND", o.gsBackend); // env wins over the config file
@@ -508,6 +516,8 @@ int main(int argc, char *argv[])
                 return usage(), 0;
             else if (a == "--no-launcher")
                 o.noLauncher = true;
+            else if (a == "--no-deck-cost-limit")
+                o.noDeckCostLimit = true;
             else if (a == "--memcard-dir")
                 o.memcardDir = next();
             else if (a == "--gs-backend")
@@ -575,6 +585,8 @@ int main(int argc, char *argv[])
             return 1;
         }
 
+        if (o.noDeckCostLimit)
+            dotrInstallNoDeckCostLimit(runtime);
         runtime.run();
         std::cout.flush();
         std::cerr.flush();

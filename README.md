@@ -37,6 +37,8 @@ What works (USA disc, Linux, October 2026):
 - Memory card: loading an existing save, saving over it, and (since patch 0057) creating the first save on an empty
   card. A first save on an empty card has not yet been confirmed in a real play session.
 - A launcher (disc, memory card folder, window size, remappable keyboard and gamepad controls) and command-line flags.
+- Optional mod, off by default: no deck cost limit. The map refuses a duel when your deck's DC is above the
+  opponent's; with the mod on (launcher "Mods" switch or `--no-deck-cost-limit`) any deck can duel any opponent.
 - GPU rendering with paraLLEl-GS (Vulkan) by default; the CPU renderer is the fallback.
 
 Known problems (tracked in [GitHub Issues](https://github.com/Glasena/dotr-recomp/issues)):
@@ -72,7 +74,7 @@ workspace/
     patches/      fixes to PS2Recomp, applied in order
     config/       dotr.toml (recompiler config), funcmap.csv (function map)
     src/          game-specific code (dotr_overlays.cpp: picks the recompiled overlay module at 0x1E00000;
-                  main.cpp: launcher, command-line flags, config file, ISO extraction)
+                  main.cpp: launcher, command-line flags, config file, ISO extraction; dotr_mods.cpp: optional mods)
     tools/        iso9660.py (extracts files from the ISO root, stdlib only)
                   find_functions.py (builds config/funcmap.csv from the ELF)
                   overlays.py (recompiles the overlay modules in DATA/*MODULE.MRG one by one)
@@ -98,6 +100,7 @@ ps2EntryRunner --no-launcher "/path/to/your.iso" # straight into the game
 | `--gs-backend auto\|pgs\|cpu` | `auto` | `auto` uses paraLLEl-GS (Vulkan) when the build has it and a device works, else the CPU GS |
 | `--window WxH` | `1920x1080` | window size; the 640x448 picture is scaled with its aspect ratio kept |
 | `--no-launcher` | | skip the launcher |
+| `--no-deck-cost-limit` | off | mod: duel any opponent on the map, whatever your deck's DC (also a launcher switch, `mod.no_deck_cost=1`) |
 
 - The launcher saves its choices, including the key and gamepad bindings of its Controls screen, in
   `$XDG_CONFIG_HOME/dotr-recomp/config.cfg` (`~/.config/dotr-recomp/config.cfg`), plain `key=value` lines.
