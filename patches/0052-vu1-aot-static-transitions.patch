@@ -1,0 +1,518 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h b/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
+index ad59778..f92875c 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
+@@ -212,6 +212,14 @@ struct Vu1AotRun
+     uint64_t budgetEnd = 0;
+     uint64_t pairsDone = 0; // pairs of the blocks the generated code finished and left
+     void *ids = nullptr;                  // run()'s DirectIds (ps2_vu1_core.cpp)
++    void *links = nullptr;                // its DirectIds::Link array (#58)
++    // #58: the exit ready cycles of the block linkNext() left last are recorded lazily (Vu1Aot::flushDeferred),
++    // and dropped when they are all in the past by the next transition.
++    const void *deferred = nullptr;       // that FastBlock, or null
++    const void *deferredWrites = nullptr; // the exitLate or exitReady list exitFastBlock() would have recorded
++    uint64_t deferredStart = 0;           // its start cycle
++    uint64_t deferredMax = 0;             // its latest ready cycle
++    uint32_t lateMax = ~0u;               // the current block's latest exit ready offset when linkNext() entered it
+     const void *prev = nullptr;           // the FastBlock just left after running all its pairs, or null
+     uint64_t prevReadyMax = 0;            // m_regReadyMax before that block's exit
+     int (*next)(VU1Interpreter &, Vu1AotRun &) = nullptr; // kAotNext: the generated code of the block entered
+@@ -980,6 +988,9 @@ struct Vu1Aot
+             return kAotStop;
+         if (step == kStepEnded || k + 1u == pairs || s.m_state.pc != (r.startPair + k + 1u) * 8u)
+         {
++            if (r.deferred)
++                flushDeferred(s, r);
++            r.lateMax = ~0u;
+             r.pairsDone += s.m_fastIndex;
+             r.prev = s.m_fastIndex == s.m_fastBlock->pairCount ? s.m_fastBlock : nullptr;
+             r.prevReadyMax = s.m_regReadyMax;
+@@ -997,6 +1008,37 @@ struct Vu1Aot
+     // tryEnterFastBlock() for the block at `pair` right after Vu1AotRun::prev ran to its end, with the liveIn
+     // check resolved once per pair of blocks. Defined in ps2_vu1_core.cpp.
+     static bool enterChained(VU1Interpreter &s, Vu1AotRun &r, uint32_t pair);
++
++    // Static transitions (#58). The generated code names a block's successors as constants: `Taken` after its
++    // branch delay slot, `Fall` the pair after it (~0u: none, a JR/JALR or E-bit end, or not captured). When the
++    // last pair ran and the PC is one of them, linkNext() leaves the block and enters that successor in one call,
++    // with its block, its generated code, its elide row and its liveIn check resolved once per (block, slot), and
++    // no commit unless a queued entry is due. Anything else takes after().
++    template <uint32_t Taken, uint32_t Fall>
++    [[gnu::always_inline]] static inline int link(VU1Interpreter &s, Vu1AotRun &r, int step, uint32_t k,
++                                                  uint32_t pairs)
++    {
++        if (step == kStepNext)
++        {
++            if constexpr (Taken != ~0u)
++                if (s.m_state.pc == Taken * 8u)
++                    return linkNext(s, r, 0u, Taken);
++            if constexpr (Fall != ~0u)
++                if (s.m_state.pc == Fall * 8u)
++                    return linkNext(s, r, 1u, Fall);
++        }
++        return after(s, r, step, k, pairs);
++    }
++
++    // Defined in ps2_vu1_core.cpp. `chain` is a DirectIds::Chain there.
++    static void recordWrites(VU1Interpreter &s, const std::vector<VU1Interpreter::FastReady> &writes, uint64_t start);
++    static void recordExit(VU1Interpreter &s, const VU1Interpreter::FastBlock &block);
++    static void flushDeferred(VU1Interpreter &s, Vu1AotRun &r);
++    static int linkNext(VU1Interpreter &s, Vu1AotRun &r, uint32_t slot, uint32_t pair);
++    static void resolveChain(const VU1Interpreter::FastBlock &from, const VU1Interpreter::FastBlock &to,
++                             uint32_t pair, void *chain);
++    static bool enterResolved(VU1Interpreter &s, Vu1AotRun &r, const VU1Interpreter::FastBlock &to,
++                              const void *chain, uint64_t start);
+ };
+ 
+ #endif
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 2eef583..cfeec86 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -21,6 +21,7 @@
+ #include <map>
+ #include <ps2_log.h>
+ #include <set>
++#include <span>
+ #include <string>
+ #include <unordered_map>
+ #include <unordered_set>
+@@ -68,6 +69,26 @@ namespace
+             std::vector<ChainReq> rest; // liveIn lanes the predecessor does not write, in offset order
+         };
+         std::vector<std::array<Chain, 2>> chains;
++        // Per block start pair p, at [2p] and [2p + 1]: the two successors its generated code names as constants
++        // (#58, Vu1Aot::link), the branch target and the fall-through. Filled on the first transition that finds
++        // the successor built and bound; cleared with the fast blocks. What the transition reads of the successor
++        // is copied here, so it does not chase the FastBlock and its vectors.
++        struct alignas(64) Link // one cache line per transition
++        {
++            Vu1AotFn fn = nullptr;           // null: not resolved yet
++            const void *to = nullptr;        // VU1Interpreter::FastBlock (private, read by Vu1Aot)
++            const uint32_t *issue = nullptr; // its FastBlock::issue
++            const uint32_t *elide = nullptr; // its elide row, or null
++            const ChainReq *rest = nullptr;  // Chain::rest, kept alive in linkChains
++            uint16_t restCount = 0;
++            bool fail = false;               // Chain::fail
++            uint32_t last = 0;               // its issue.back()
++            uint32_t lateMax = 0;            // the latest offset in its exitReady
++            int32_t fdivReq = -1, efuReq = -1, waitPReq = -1;
++        };
++        static_assert(sizeof(Link) == 64);
++        std::vector<Chain> linkChains; // the rest lists of resolved links
++        std::vector<Link> links;
+         uint64_t imageHash = 0; // fnv1a of the code, when generated blocks exist
+         bool exact = false;     // PS2X_VU_RESULTS_VERIFY's reference twin: always bind the exact variant
+     };
+@@ -130,6 +151,7 @@ namespace
+         uint64_t imageHash = 0;
+         uint64_t fastPairs = 0, tightPairs = 0, aotPairs = 0, interpPairs = 0, blocks = 0, blockBuilds = 0, runs = 0;
+         uint64_t chainedBlocks = 0; // entered by generated code (#41), without returning to run()
++        uint64_t linkedBlocks = 0;  // of those, through a static transition (#58)
+         uint64_t refusals[RefusalCount]{};
+         std::unordered_map<uint32_t, std::array<uint64_t, RefusalCount>> refusalsByPc;
+         std::unordered_map<uint64_t, VuImageStats> images;
+@@ -166,12 +188,12 @@ namespace
+         std::fprintf(stderr,
+                      "[vu-stats:%s] last interval: fast %llu interp %llu (fast %.1f%%) | total: fast %llu interp %llu "
+                      "(fast %.1f%%, tight loop %.1f%%, generated %.1f%%) runs %llu blocks %llu (%.1f/run, %.1f pairs/block, chained "
+-                     "%.1f%%) builds %llu\n",
++                     "%.1f%%, static %.1f%%) builds %llu\n",
+                      tag, (unsigned long long)dFast, (unsigned long long)dInterp, pct(dFast, dFast + dInterp),
+                      (unsigned long long)s.fastPairs, (unsigned long long)s.interpPairs, pct(s.fastPairs, total),
+                      pct(s.tightPairs, total), pct(s.aotPairs, total), (unsigned long long)s.runs, (unsigned long long)s.blocks,
+                      s.runs ? double(s.blocks) / s.runs : 0.0, s.blocks ? double(s.fastPairs) / s.blocks : 0.0,
+-                     pct(s.chainedBlocks, s.blocks), (unsigned long long)s.blockBuilds);
++                     pct(s.chainedBlocks, s.blocks), pct(s.linkedBlocks, s.blocks), (unsigned long long)s.blockBuilds);
+         std::fprintf(stderr, "[vu-stats:%s] interp pairs by reason:", tag);
+         for (uint32_t r = 0; r < RefusalCount; ++r)
+             if (s.refusals[r])
+@@ -2222,6 +2244,8 @@ void VU1Interpreter::prepareCodeCache(const uint8_t *vuCode, uint32_t codeSize,
+             std::memcpy(m_cachedCodeCopy.data(), vuCode, pairCount * 8u);
+             m_fastBlocks.clear();
+             g_directIds[this].chains.clear();
++            g_directIds[this].links.clear();
++            g_directIds[this].linkChains.clear();
+             if (g_vuStats && m_unit == Unit::VU1)
+             {
+                 VuStats &st = vuStats();
+@@ -2246,6 +2270,8 @@ void VU1Interpreter::prepareCodeCache(const uint8_t *vuCode, uint32_t codeSize,
+     {
+         m_fastBlocks.clear();
+         g_directIds[this].chains.clear();
++        g_directIds[this].links.clear();
++        g_directIds[this].linkChains.clear();
+         m_fastBlocks.resize(pairCount);
+     }
+     m_codeCachePrepared = true;
+@@ -2621,6 +2647,40 @@ bool VU1Interpreter::tryEnterFastBlock(uint64_t budgetEnd)
+     return true;
+ }
+ 
++// The lanes' ready cycles of a block's exit writes, for the block started at `start`.
++inline void Vu1Aot::recordWrites(VU1Interpreter &s, const std::vector<VU1Interpreter::FastReady> &writes,
++                                 uint64_t start)
++{
++    for (const VU1Interpreter::FastReady &w : writes)
++    {
++        const uint64_t ready = start + w.offset;
++        if (w.kind == 0u)
++        {
++            s.m_vfReady[w.reg][w.component] = ready;
++            s.m_vfRegReadyMax[w.reg] = std::max(s.m_vfRegReadyMax[w.reg], ready);
++        }
++        else if (w.kind == 1u)
++            s.m_viReady[w.reg] = ready;
++        else
++            s.m_accReady[w.component] = ready;
++        s.m_regReadyMax = std::max(s.m_regReadyMax, ready);
++    }
++}
++
++// exitFastBlock() for a block that ran to its end: its register writes become the lanes' ready cycles.
++inline void Vu1Aot::recordExit(VU1Interpreter &s, const VU1Interpreter::FastBlock &block)
++{
++    // When nothing from before the block can still stall (m_regReadyMax <= now), ready cycles already passed are
++    // equivalent to any other past cycle, so only the writes still pending need recording.
++    recordWrites(s, s.m_regReadyMax <= s.m_cycle ? block.exitLate : block.exitReady, s.m_fastStart);
++}
++
++void Vu1Aot::flushDeferred(VU1Interpreter &s, Vu1AotRun &r)
++{
++    recordWrites(s, *static_cast<const std::vector<VU1Interpreter::FastReady> *>(r.deferredWrites), r.deferredStart);
++    r.deferred = nullptr;
++}
++
+ void VU1Interpreter::exitFastBlock()
+ {
+     const FastBlock &block = *m_fastBlock;
+@@ -2628,23 +2688,7 @@ void VU1Interpreter::exitFastBlock()
+     m_fastBlock = nullptr; // queueStore() and friends are back to the interpreter's pipelines
+     if (m_fastIndex == block.pairCount)
+     {
+-        // When nothing from before the block can still stall (m_regReadyMax <= now), ready cycles already passed
+-        // are equivalent to any other past cycle, so only the writes still pending need recording.
+-        const std::vector<FastReady> &writes = m_regReadyMax <= m_cycle ? block.exitLate : block.exitReady;
+-        for (const FastReady &w : writes)
+-        {
+-            const uint64_t ready = m_fastStart + w.offset;
+-            if (w.kind == 0u)
+-            {
+-                m_vfReady[w.reg][w.component] = ready;
+-                m_vfRegReadyMax[w.reg] = std::max(m_vfRegReadyMax[w.reg], ready);
+-            }
+-            else if (w.kind == 1u)
+-                m_viReady[w.reg] = ready;
+-            else
+-                m_accReady[w.component] = ready;
+-            m_regReadyMax = std::max(m_regReadyMax, ready);
+-        }
++        Vu1Aot::recordExit(*this, block);
+         return;
+     }
+     // Left early: replay the ready cycles of the pairs that ran.
+@@ -2679,41 +2723,34 @@ void VU1Interpreter::catchUpXgkick(uint64_t throughCycle)
+     m_xgkickSyncCycle = std::max(m_xgkickSyncCycle, throughCycle);
+ }
+ 
+-bool Vu1Aot::enterChained(VU1Interpreter &s, Vu1AotRun &r, uint32_t pair)
++// From the entry at start = from's start + span: a liveIn lane `from` leaves pending past its span is ready at
++// from's start + exit offset, so it passes or fails the same way every time. A lane it wrote earlier is ready by
++// start, whichever of exitReady/exitLate exitFastBlock() recorded. Any other lane keeps its earlier ready cycle and
++// is checked at entry, as tryEnterFastBlock() does.
++void Vu1Aot::resolveChain(const VU1Interpreter::FastBlock &from, const VU1Interpreter::FastBlock &to, uint32_t pair,
++                          void *resolved)
+ {
+-    using FastBlock = VU1Interpreter::FastBlock;
+-    const FastBlock &from = *static_cast<const FastBlock *>(r.prev);
+-    const FastBlock &to = *s.m_fastBlocks[pair];
+-    const uint64_t start = s.m_cycle;
+-    DirectIds &ids = *static_cast<DirectIds *>(r.ids);
+-    if (ids.chains.size() != s.m_cachedPairCount)
+-        ids.chains.resize(s.m_cachedPairCount);
+-    std::array<DirectIds::Chain, 2> &slots = ids.chains[from.startPair];
+-    DirectIds::Chain *chain = slots[0].to == pair ? &slots[0] : slots[1].to == pair ? &slots[1] : nullptr;
+-    if (!chain && (slots[0].to == ~0u || slots[1].to == ~0u))
+-    {
+-        // From the entry at start = from's start + span: a liveIn lane `from` leaves pending past its span is
+-        // ready at from's start + exit offset, so it passes or fails the same way every time. A lane it wrote
+-        // earlier is ready by start, whichever of exitReady/exitLate exitFastBlock() recorded. Any other lane
+-        // keeps its earlier ready cycle and is checked at entry, as tryEnterFastBlock() does.
+-        chain = slots[0].to == ~0u ? &slots[0] : &slots[1];
+-        chain->to = pair;
+-        const uint32_t span = from.issue.back() + 1u;
+-        for (const VU1Interpreter::FastReady &req : to.liveIn)
+-        {
+-            const auto written = std::find_if(from.exitReady.begin(), from.exitReady.end(),
+-                                              [&](const VU1Interpreter::FastReady &w)
+-                                              { return w.kind == req.kind && w.reg == req.reg && w.component == req.component; });
+-            if (written == from.exitReady.end())
+-                chain->rest.push_back({req.offset, req.kind, req.reg, req.component});
+-            else if (written->offset > span + req.offset)
+-                chain->fail = true;
+-        }
++    DirectIds::Chain &chain = *static_cast<DirectIds::Chain *>(resolved);
++    chain.to = pair;
++    const uint32_t span = from.issue.back() + 1u;
++    for (const VU1Interpreter::FastReady &req : to.liveIn)
++    {
++        const auto written = std::find_if(from.exitReady.begin(), from.exitReady.end(),
++                                          [&](const VU1Interpreter::FastReady &w)
++                                          { return w.kind == req.kind && w.reg == req.reg && w.component == req.component; });
++        if (written == from.exitReady.end())
++            chain.rest.push_back({req.offset, req.kind, req.reg, req.component});
++        else if (written->offset > span + req.offset)
++            chain.fail = true;
+     }
+-    if (!chain || start != s.m_fastStart + from.issue.back() + 1u)
+-        return s.tryEnterFastBlock(r.budgetEnd);
++}
+ 
+-    // The checks of tryEnterFastBlock() that can fail here, in its order; the others hold after a block ran.
++// The checks of tryEnterFastBlock() that can fail at `start` right after Vu1AotRun::prev ran to its end, in its
++// order (the others hold after a block ran), then the entry itself.
++bool Vu1Aot::enterResolved(VU1Interpreter &s, Vu1AotRun &r, const VU1Interpreter::FastBlock &to,
++                                  const void *resolved, uint64_t start)
++{
++    const DirectIds::Chain &chain = *static_cast<const DirectIds::Chain *>(resolved);
+     const auto refuse = [&](VuRefusal reason)
+     {
+         if (g_vuTrack)
+@@ -2726,11 +2763,11 @@ bool Vu1Aot::enterChained(VU1Interpreter &s, Vu1AotRun &r, uint32_t pair)
+         return refuse(RefuseStores);
+     if (start + to.issue.back() + 16u >= r.budgetEnd)
+         return refuse(RefuseBudget);
+-    if (chain->fail)
++    if (chain.fail)
+         return refuse(RefuseLiveIn);
+     if (r.prevReadyMax > start)
+     {
+-        for (const DirectIds::ChainReq &req : chain->rest)
++        for (const DirectIds::ChainReq &req : chain.rest)
+         {
+             if (start + req.offset >= r.prevReadyMax)
+                 break; // these lanes kept ready cycles <= r.prevReadyMax
+@@ -2760,6 +2797,27 @@ bool Vu1Aot::enterChained(VU1Interpreter &s, Vu1AotRun &r, uint32_t pair)
+     return true;
+ }
+ 
++bool Vu1Aot::enterChained(VU1Interpreter &s, Vu1AotRun &r, uint32_t pair)
++{
++    using FastBlock = VU1Interpreter::FastBlock;
++    const FastBlock &from = *static_cast<const FastBlock *>(r.prev);
++    const FastBlock &to = *s.m_fastBlocks[pair];
++    const uint64_t start = s.m_cycle;
++    DirectIds &ids = *static_cast<DirectIds *>(r.ids);
++    if (ids.chains.size() != s.m_cachedPairCount)
++        ids.chains.resize(s.m_cachedPairCount);
++    std::array<DirectIds::Chain, 2> &slots = ids.chains[from.startPair];
++    DirectIds::Chain *chain = slots[0].to == pair ? &slots[0] : slots[1].to == pair ? &slots[1] : nullptr;
++    if (!chain && (slots[0].to == ~0u || slots[1].to == ~0u))
++    {
++        chain = slots[0].to == ~0u ? &slots[0] : &slots[1];
++        resolveChain(from, to, pair, chain);
++    }
++    if (!chain || start != s.m_fastStart + from.issue.back() + 1u)
++        return s.tryEnterFastBlock(r.budgetEnd);
++    return enterResolved(s, r, to, chain, start);
++}
++
+ int Vu1Aot::enterNext(VU1Interpreter &s, Vu1AotRun &r)
+ {
+     if (s.m_cycle >= r.budgetEnd || s.m_stopRequested)
+@@ -2796,6 +2854,151 @@ int Vu1Aot::enterNext(VU1Interpreter &s, Vu1AotRun &r)
+     return kAotNext;
+ }
+ 
++int Vu1Aot::linkNext(VU1Interpreter &s, Vu1AotRun &r, uint32_t slot, uint32_t pair)
++{
++    using FastBlock = VU1Interpreter::FastBlock;
++    const FastBlock &from = *s.m_fastBlock;
++    DirectIds::Link &link = static_cast<DirectIds::Link *>(r.links)[r.startPair * 2u + slot];
++    if (!link.fn) [[unlikely]]
++    {
++        // Resolved once the successor is built and bound; until then the generic transition (run() builds it).
++        DirectIds &ids = *static_cast<DirectIds *>(r.ids);
++        if (pair >= s.m_fastBlocks.size() || !s.m_fastBlocks[pair] || pair >= ids.aot.size() || !ids.aot[pair])
++            return after(s, r, kStepNext, from.pairCount - 1u, from.pairCount);
++        const FastBlock &to = *s.m_fastBlocks[pair];
++        DirectIds::Chain chain;
++        resolveChain(from, to, pair, &chain);
++        link.to = &to;
++        link.issue = to.issue.data();
++        link.elide = !noElide && !ids.elide[pair].empty() ? ids.elide[pair].data() : nullptr;
++        link.last = to.issue.back();
++        link.fail = chain.fail;
++        link.fdivReq = static_cast<int32_t>(to.fdivReq);
++        link.efuReq = static_cast<int32_t>(to.efuReq);
++        link.waitPReq = static_cast<int32_t>(to.waitPReq);
++        link.restCount = static_cast<uint16_t>(chain.rest.size()); // at most one per liveIn lane
++        for (const VU1Interpreter::FastReady &w : to.exitReady)
++            link.lateMax = std::max(link.lateMax, w.offset);
++        link.rest = chain.rest.data(); // the vector's buffer survives the move into the list
++        ids.linkChains.push_back(std::move(chain));
++        link.fn = ids.aot[pair];
++    }
++
++    // The block linkNext() left before this one: its exit ready cycles are dropped when they are all in the past
++    // and nothing older can still stall (then they are equivalent to the values the lanes hold), else recorded now,
++    // in the order exitFastBlock() would have.
++    if (r.deferred)
++    {
++        if (r.deferredMax > s.m_cycle || s.m_regReadyMax > s.m_cycle)
++            flushDeferred(s, r);
++        r.deferred = nullptr;
++    }
++
++    // after(), leave() and exitFastBlock() for a block that ran to its end, at m_cycle = its start + span.
++    r.pairsDone += from.pairCount;
++    r.prev = &from;
++    const uint64_t prevReadyMax = s.m_regReadyMax;
++    r.prevReadyMax = prevReadyMax;
++    FlagElision &e = *r.flags;
++    if (e.count != 0u)
++    {
++        for (uint32_t n = e.count > 8u ? e.count - 8u : 0u; n < e.count; ++n)
++        {
++            const FlagElision::Write &write = e.writes[n & 7u];
++            if (write.nextReady > s.m_cycle)
++                queueFlags(s, write.issue, write.laneFlags, write.dest, write.sticky);
++        }
++        e.count = 0u;
++        e.stickyCarry = 0u;
++        s.commitReadyPipelines();
++    }
++    if (s.m_xgkick.active)
++        s.catchUpXgkick(s.m_cycle);
++    else
++        s.m_xgkickSyncCycle = std::max(s.m_xgkickSyncCycle, s.m_cycle);
++    s.m_fastBlock = nullptr;
++    // Its own exit ready cycles: deferred when linkNext() entered it (its latest offset is known), else recorded.
++    // Only the successor's liveIn check could read them before the next transition, and that check is resolved
++    // statically for this block's lanes (Link::fail).
++    if (r.lateMax != ~0u)
++    {
++        r.deferred = &from;
++        r.deferredWrites = prevReadyMax <= s.m_cycle ? &from.exitLate : &from.exitReady;
++        r.deferredStart = s.m_fastStart;
++        r.deferredMax = s.m_fastStart + r.lateMax;
++    }
++    else
++        recordExit(s, from);
++
++    // enterNext() and enterChained(): the successor is in range, built and bound, and entered at its
++    // predecessor's start + span; the commit is due only when a queued entry is.
++    if (s.m_cycle >= r.budgetEnd || s.m_stopRequested)
++        return kAotDone;
++    if (s.m_nextCommitCycle <= s.m_cycle)
++        s.commitReadyPipelines();
++    if (s.m_state.ebit)
++        return kAotDone;
++    const uint64_t start = s.m_cycle;
++    const auto refuse = [&](VuRefusal reason)
++    {
++        if (g_vuTrack)
++            vuStatsRefuse(reason, s.m_state.pc);
++        r.refused = true;
++        return kAotDone;
++    };
++    if (s.m_state.branchPending || s.m_state.haltAfterDelaySlot)
++        return refuse(RefuseBranch);
++    if (s.m_storeMask != 0u)
++        return refuse(RefuseStores);
++    if (start + link.last + 16u >= r.budgetEnd)
++        return refuse(RefuseBudget);
++    if (link.fail)
++        return refuse(RefuseLiveIn);
++    if (prevReadyMax > start)
++    {
++        for (const DirectIds::ChainReq &req : std::span(link.rest, link.restCount))
++        {
++            if (start + req.offset >= prevReadyMax)
++                break; // these lanes kept ready cycles <= prevReadyMax
++            const uint64_t ready = req.kind == 0u   ? s.m_vfReady[req.reg][req.component]
++                                   : req.kind == 1u ? s.m_viReady[req.reg]
++                                                    : s.m_accReady[req.component];
++            if (ready > start + req.offset)
++                return refuse(RefuseLiveIn);
++        }
++    }
++    if (link.fdivReq >= 0 && s.m_fdiv.valid && s.m_fdiv.readyCycle > start + static_cast<uint64_t>(link.fdivReq))
++        return refuse(RefuseFdiv);
++    if (link.efuReq >= 0 && s.m_efuResourceReady > start + static_cast<uint64_t>(link.efuReq))
++        return refuse(RefuseEfu);
++    if (link.waitPReq >= 0)
++    {
++        for (const VU1Interpreter::ScalarPipelineEntry &entry : s.m_efu)
++            if (entry.valid && entry.readyCycle > start + static_cast<uint64_t>(link.waitPReq))
++                return refuse(RefuseWaitP);
++    }
++    if ((s.m_vfMask | s.m_viMask | s.m_accMask) != 0u)
++        s.applyPendingRegisterWrites();
++    s.m_fastBlock = static_cast<const FastBlock *>(link.to);
++    s.m_fastIndex = 0;
++    s.m_fastStart = start;
++    s.m_xgkickSyncCycle = start;
++    e.blockElide = link.elide; // onBlockEnter(); count and stickyCarry are 0 here
++    if (g_vuStats)
++    {
++        ++vuStats().blocks;
++        ++vuStats().chainedBlocks;
++        ++vuStats().linkedBlocks;
++        if (vuStats().current)
++            ++vuStats().current->blocks;
++    }
++    r.issue = link.issue;
++    r.startPair = pair;
++    r.lateMax = link.lateMax;
++    r.next = link.fn;
++    return kAotNext;
++}
++
+ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                          uint8_t *vuData, uint32_t dataSize,
+                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
+@@ -3456,8 +3659,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                 a.stop == b.stop && a.storeMask == b.storeMask && a.fastBlock == b.fastBlock &&
+                 (!a.fastBlock || a.fastStart == b.fastStart) && a.pendingMasks == b.pendingMasks,
+             "other");
+-        add(a.regReadyMax == b.regReadyMax && same(a.vfReady, b.vfReady) && same(a.viReady, b.viReady) &&
+-                same(a.accReady, b.accReady) && same(a.vfRegReadyMax, b.vfRegReadyMax),
++        // A ready cycle already passed never stalls (cycles only grow until reset()), so past values compare equal:
++        // the generated code drops exit ready cycles that are in the past by the next transition (#58).
++        const auto sameReady = [&](const auto &x, const auto &y)
++        {
++            const uint64_t *px = reinterpret_cast<const uint64_t *>(&x), *py = reinterpret_cast<const uint64_t *>(&y);
++            for (size_t n = 0; n < sizeof(x) / sizeof(uint64_t); ++n)
++                if ((px[n] > a.cycle ? px[n] : 0u) != (py[n] > a.cycle ? py[n] : 0u))
++                    return false;
++            return true;
++        };
++        add(sameReady(a.regReadyMax, b.regReadyMax) && sameReady(a.vfReady, b.vfReady) &&
++                sameReady(a.viReady, b.viReady) && sameReady(a.accReady, b.accReady) &&
++                sameReady(a.vfRegReadyMax, b.vfRegReadyMax),
+             "ready");
+     };
+     // The loop top of run(): commit, then enter a fast block when none is active (and `enter`: the generated code
+@@ -3691,6 +3905,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         int status = aot(*this, aotRun);
+         while (status == kAotNext)
+             status = aotRun.next(*this, aotRun);
++        if (aotRun.deferred)
++            Vu1Aot::flushDeferred(*this, aotRun);
+         return status;
+     };
+ 
+@@ -3767,7 +3983,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         {
+             Vu1AotRun aotRun{m_fastBlock->issue.data(), m_fastBlock->startPair, &elision, vuData, dataSize, codeSize,
+                              budgetEnd};
+-            aotRun.ids = const_cast<DirectIds *>(directIds);
++            DirectIds &ids = *const_cast<DirectIds *>(directIds);
++            aotRun.ids = &ids;
++            if (ids.links.size() != 2u * m_cachedPairCount)
++                ids.links.assign(2u * m_cachedPairCount, {});
++            aotRun.links = ids.links.data();
+             const uint64_t before = fastPairsDone;
+             if (g_aotVerify)
+             {

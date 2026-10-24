@@ -250,6 +250,17 @@ logging to a file, or the runtime output is lost on timeout. Logs go to `../dotr
   relaxed engine on results only (odd programs have no sticky readers; dropping all writes fails 40/120). All
   dumps identical. pgs: duel 10000->11000 36.2 -> 25.7 s (~27.6 -> ~39 VBlanks/s), GameThread 215G -> 144G instr,
   93G -> 63G cycles; map 1900->2300 9.1 -> 6.3 s, 56.9G -> 39.8G instr.
+- Patch 0052 (2026-10-23, #58, partial): static block transitions. `vu1_gen.py` names each block's successors (branch
+  target after the delay slot, fall-through; only captured blocks, not JR/JALR/E) and the last step returns
+  `A::link<taken, fall>`; `Vu1Aot::linkNext` leaves and enters in one call through a 64-byte `DirectIds::Link` per
+  (block, slot) resolved once (successor block/code/elide row, liveIn fail/rest, reqs), commits only when due, and
+  defers the exit ready cycles to the next transition, dropping them when all are past (AOT verify compares past
+  ready cycles as equal). 178/187 blocks link statically, 97.8% of map block entries. Duel GameThread 143.9G ->
+  133.5G instr (-7%), map 39.8G -> 37.9G; enter/exit share 13.4% -> ~10%. Wall/cycles within noise (pgs, busy host).
+- Measuring pgs: the NVIDIA shader cache (`~/.cache/nvidia/GLCache`, 784 MB, full) keys on the executable path, so a
+  new runner copy compiles shaders on the main thread every run (~2x slower). Use a private cache
+  (`__GL_SHADER_DISK_CACHE_PATH=<scratch> __GL_SHADER_DISK_CACHE_SIZE=4000000000 __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1`)
+  and one warm-up run per binary and scene before timing.
 - Patch 0027 (2026-10-22, #35): `perf --call-graph dwarf` found the map/hash share was `IopKernel::beginNextReady`/
   `nextWakeCycle` walking the thread `std::map` on every idle IOP step (~7.5%) and the GIF_STAT lookup in
   `advanceEeTimers` (~2.1%). Kernel caches "nothing ready until cycle W" behind a version bumped by every public
