@@ -272,7 +272,6 @@ stubs = [
   "__malloc_unlock@0x00198A88",
   "_printf_r@0x00199AF0",
   "printf@0x00199B50",
-  "rand@0x0019A5C8",
   "_realloc_r@0x0019A690",
   "strcasecmp@0x0019B8F8",
   "strcat@0x0019B9D0",
