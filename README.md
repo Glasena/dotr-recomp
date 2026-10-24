@@ -4,7 +4,7 @@
 
 **Yu-Gi-Oh! The Duelists of the Roses — PS2 static recompilation for PC/Linux**
 
-![status](https://img.shields.io/badge/status-exploring-orange)
+![status](https://img.shields.io/badge/status-playable%2C%20early-yellow)
 ![platform](https://img.shields.io/badge/platform-Linux-blue)
 ![license](https://img.shields.io/badge/license-GPL--3.0-green)
 ![assets](https://img.shields.io/badge/game%20assets-not%20included-red)
@@ -25,7 +25,42 @@ A static recompilation of **Yu-Gi-Oh! The Duelists of the Roses** (PS2, NTSC-U `
 [PS2Recomp](https://github.com/ran-j/PS2Recomp). The MIPS R5900 code of *your* copy of the game is translated into
 C++ on *your* machine and linked against a runtime that emulates the PS2 hardware.
 
-**Status:** exploring. The recompiler produces code for all 3005 discovered functions; it does not run yet.
+**Status:** early but playable. The game boots, plays its movies and runs the story, its duels and the map;
+saves load and write. Expect slowdowns and a few visual bugs (see [Current state](#current-state)).
+
+## Current state
+
+What works (USA disc, Linux, October 2026):
+
+- Boot, intro and story movies (with FFmpeg), title screen, main menu, New Game, name entry, story dialogue.
+- The 3D map and duels, including card summons with their 3D models, and the BGM.
+- Memory card: loading an existing save, saving over it, and (since patch 0057) creating the first save on an empty
+  card. A first save on an empty card has not yet been confirmed in a real play session.
+- A launcher (disc, memory card folder, window size, remappable keyboard and gamepad controls) and command-line flags.
+- GPU rendering with paraLLEl-GS (Vulkan) by default; the CPU renderer is the fallback.
+
+Known problems (tracked in [GitHub Issues](https://github.com/Glasena/dotr-recomp/issues)):
+
+- **Speed.** Full speed is 60 VBlanks/s. With paraLLEl-GS on the development machine the map runs close to it, but
+  walking still lags at times (#64), and duels run at about 40/s, so they are visibly slow (#13). The cost is mostly
+  the emulated VU1 vector unit.
+- **Visual bugs.** Pink effects during duel attack animations (#59); a row of box glyphs on the NOW LOADING screen
+  (#10). The CPU renderer is darker than the hardware and shows a slightly different picture (#53).
+- **Gamepads.** USB gamepads go through raylib and can be remapped in the launcher, but have not been tested with a
+  real pad yet (#66). The keyboard works.
+- **Only Linux** has been built and tested. Only the USA disc (`SLUS-20515`) is supported.
+- There is no release build yet: you build it yourself from your own disc ([Building](#building)).
+- Planned: data mods (cards, text, images) loaded from a mods folder (#63).
+
+Default keys (change them in the launcher's Controls screen; a gamepad works alongside them):
+
+| PS2 | Keys | PS2 | Keys |
+| --- | --- | --- | --- |
+| D-pad | arrows / WASD | Cross | X / Space |
+| Start | Enter (also skips the movies) | Circle | C / Esc |
+| Select | Tab | Square | Z / Numpad 0 |
+| L1 / R1 | Q / E | Triangle | V / Numpad 1 |
+| L2 / R2 | Left Shift / Right Shift | | |
 
 ## Layout
 
@@ -154,9 +189,9 @@ ctest --test-dir ../PS2Recomp/out/build-vu1diff/ps2xTest -R vu1_diff --output-on
 # 10. (optional, experimental) paraLLEl-GS, a Vulkan compute GS (patch 0043, #50). Needs a Vulkan 1.3 GPU and
 #     loader. Pinned commit 3a66c19 (the one upstream PR #285 uses); the submodules take ~1.4 GB. Without
 #     FETCHCONTENT_SOURCE_DIR_PARALLEL_GS, CMake clones the same commit into the build directory at configure time.
-#     Only the new backend, ps2_runtime.cpp and parallel-gs itself compile (+~1 min, +42 MB binary). Selected at
-#     run time with PS2X_GS_BACKEND=pgs (headless scanout readback only, no on-screen interop yet); the CPU GS
-#     stays the default and the reference. Compare with tools/imgdiff.sh in cross mode (pgs dithers and blends
+#     Only the new backend, ps2_runtime.cpp and parallel-gs itself compile (+~1 min, +42 MB binary). The launcher
+#     and --gs-backend auto pick it when a Vulkan device works (PS2X_GS_BACKEND=pgs forces it); the CPU GS is the
+#     fallback and the reference for the test dumps. Compare with tools/imgdiff.sh in cross mode (pgs dithers and blends
 #     both CRTC circuits like the hardware; the CPU GS does not yet, #53).
 git clone https://github.com/Arntzen-Software/parallel-gs.git ../deps/src/parallel-gs
 git -C ../deps/src/parallel-gs checkout 3a66c1976170cbc2cb53a3593fabbc7c4b2ccfbd
