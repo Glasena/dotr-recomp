@@ -437,6 +437,19 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
   player defaults: frame mode INT=1/FFMD=0 scanned progressive from circuit 2, no DY 50/51 blend) and
   `skip_deinterlace` (movie FFMD=1 comes out 640x224 like the CPU GS). Title consecutive frames 3.1 -> 0.0 mean diff.
 
+## HLE display env (2026-10-24, #14)
+- Patch 0054: the HLE `sceGsSetDefDispEnv`/`sceGsSetDefDBuff{,Dc}` now build the display env like DotR's own libgraph
+  (0x184A18: PMODE 0x66, SMODE2 from the GParam, DISPLAY in hardware units: MAGH=(w+2559)/w-1, DX=636+dx*MAGH,
+  DY=50+dy, DW=MAGH*w-1, DH=2h-1 in interlaced FRAME mode), and `sceGsPutDispEnv`/`sceGsSwapDBuff` write PMODE,
+  SMODE2, circuit 2 and BGCOLOR only (0x184C88). The CPU presenter reads (DH+1)/2 buffer lines when SMODE2=3;
+  patch 0044's pgs DISPLAY rewrite is gone (pgs movie 640x224, cross gates pass 35.9-42 dB).
+- Repro before the fix: the game writes PMODE 0x7F23 + both circuits itself (sub_00100610, SMODE2=1); the only HLE
+  envs presented were the movie and, 0-2 times per run, one present during story/duel transitions (old: PMODE 0x8007,
+  DW=639, both circuits). No black/green-half frames over map 1900-1960 (every VBlank) or a skip-render run to 20000.
+  Now that transient carries the game's own circuit-2 values. All reference dumps (`test_before`, `test_033_ref`)
+  and movie frames 500/700/900 are byte-identical; keep comparing against those.
+- `sceGsSetDefDBuff`'s FRAME-mode second buffer at zbufaddr/2 (libgraph) is still not done (upstream PR #336).
+
 ## Duel battle pink (2026-10-24, #59, open)
 - `tools/duel_attack_script.sh` prints the pad script to the tutorial battles (Celtic Guardian attacks at ~15060-15500).
   The pink is in the GS input, not a backend bug: CPU GS and pgs match, `PS2X_VU_EXACT=1 PS2X_VU_NO_AOT=1` too. It is

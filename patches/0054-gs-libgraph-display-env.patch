@@ -1,0 +1,253 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+index 8d64b73..cffc529 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+@@ -895,11 +895,6 @@ namespace ps2_stubs
+         }
+ 
+         const uint32_t fbw = std::max<uint32_t>(1u, (w + 63u) / 64u);
+-        const uint64_t pmode = makePmode(1u, 1u, 0u, 0u, 0u, 0x80u);
+-        const uint64_t smode2 =
+-            (static_cast<uint64_t>(g_gparam.interlace & 0x1u) << 0) |
+-            (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
+-        const uint64_t display = makeDisplay(636u, 32u, 0u, 0u, w - 1u, h - 1u);
+ 
+         const int32_t drawWidth = static_cast<int32_t>(w);
+         const int32_t drawHeight = static_cast<int32_t>(h);
+@@ -916,11 +911,8 @@ namespace ps2_stubs
+         const uint64_t dispfb1 = makeDispFb(0u, fbw, psm, 0u, 0u);
+ 
+         GsDBuffDcMem db{};
+-        db.disp[0].pmode = pmode;
+-        db.disp[0].smode2 = smode2;
++        setDefGsDispEnv(db.disp[0], psm, drawWidth, drawHeight, 0, 0);
+         db.disp[0].dispfb = dispfb0;
+-        db.disp[0].display = display;
+-        db.disp[0].bgcolor = 0u;
+         db.disp[1] = db.disp[0];
+         db.disp[1].dispfb = dispfb1;
+ 
+@@ -966,12 +958,6 @@ namespace ps2_stubs
+         }
+ 
+         const uint32_t fbw = std::max<uint32_t>(1u, (w + 63u) / 64u);
+-        const uint64_t pmode = makePmode(1u, 1u, 0u, 0u, 0u, 0x80u);
+-        const uint64_t smode2 =
+-            (static_cast<uint64_t>(g_gparam.interlace & 0x1u) << 0) |
+-            (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
+-        const uint64_t dispfb = makeDispFb(0u, fbw, psm, 0u, 0u);
+-        const uint64_t display = makeDisplay(636u, 32u, 0u, 0u, w - 1u, h - 1u);
+ 
+         const int32_t drawWidth = static_cast<int32_t>(w);
+         const int32_t drawHeight = static_cast<int32_t>(h);
+@@ -984,11 +970,7 @@ namespace ps2_stubs
+         }
+ 
+         GsDBuffMem db{};
+-        db.disp[0].pmode = pmode;
+-        db.disp[0].smode2 = smode2;
+-        db.disp[0].dispfb = dispfb;
+-        db.disp[0].display = display;
+-        db.disp[0].bgcolor = 0u;
++        setDefGsDispEnv(db.disp[0], psm, drawWidth, drawHeight, 0, 0);
+         db.disp[1] = db.disp[0];
+ 
+         db.giftag0 = {makeGiftagAplusD(clear != 0u ? 14u : 8u), 0x0E0E0E0E0E0E0E0EULL};
+@@ -1011,24 +993,14 @@ namespace ps2_stubs
+ 
+     void sceGsSetDefDispEnv(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        uint32_t envAddr = getRegU32(ctx, 4);
+-        uint32_t psm = getRegU32(ctx, 5);
+-        uint32_t w = getRegU32(ctx, 6);
+-        uint32_t h = getRegU32(ctx, 7);
++        const uint32_t envAddr = getRegU32(ctx, 4);
+         const GsTrailingArgs2 trailing = decodeGsTrailingArgs2(rdram, ctx);
+-        uint32_t dx = trailing.arg0;
+-        uint32_t dy = trailing.arg1;
+-
+-        if (w == 0)
+-            w = 640;
+-        if (h == 0)
+-            h = 448;
+-
+-        uint32_t fbw = (w + 63) / 64;
+-        uint64_t dispfb = makeDispFb(0, fbw, psm, 0, 0);
+-        uint64_t display = makeDisplay(dx, dy, 0, 0, w - 1, h - 1);
+-
+-        writeGsDispEnv(rdram, envAddr, display, dispfb);
++        GsDispEnvMem env{};
++        readGsDispEnv(rdram, envAddr, env);
++        setDefGsDispEnv(env, getRegU32(ctx, 5),
++                        static_cast<int16_t>(getRegU32(ctx, 6)), static_cast<int16_t>(getRegU32(ctx, 7)),
++                        static_cast<int16_t>(trailing.arg0), static_cast<int16_t>(trailing.arg1));
++        writeGsDispEnv(rdram, envAddr, env);
+         setReturnS32(ctx, 0);
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+index b1bb6d8..343f1c8 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+@@ -1805,15 +1805,11 @@ namespace
+         return true;
+     }
+ 
+-    static bool writeGsDispEnv(uint8_t *rdram, uint32_t addr, uint64_t display, uint64_t dispfb)
++    static bool writeGsDispEnv(uint8_t *rdram, uint32_t addr, const GsDispEnvMem &env)
+     {
+         uint8_t *ptr = getMemPtr(rdram, addr);
+         if (!ptr)
+             return false;
+-        GsDispEnvMem env{};
+-        std::memcpy(&env, ptr, sizeof(env));
+-        env.dispfb = dispfb;
+-        env.display = display;
+         std::memcpy(ptr, &env, sizeof(env));
+         return true;
+     }
+@@ -1874,6 +1870,8 @@ namespace
+         return true;
+     }
+ 
++    // libgraph sceGsPutDispEnv (DotR 0x184C88): PMODE, SMODE2 and circuit 2 only. Circuit 1 is left to the
++    // game (DotR writes both circuits itself, #14).
+     static void applyGsDispEnv(PS2Runtime *runtime, const GsDispEnvMem &env)
+     {
+         if (!runtime || !runtime->syncCoreSubsystems())
+@@ -1881,13 +1879,33 @@ namespace
+         auto &regs = runtime->memory().gs();
+         regs.pmode = env.pmode;
+         regs.smode2 = env.smode2;
+-        regs.dispfb1 = env.dispfb;
+-        regs.display1 = env.display;
+         regs.dispfb2 = env.dispfb;
+         regs.display2 = env.display;
+         regs.bgcolor = env.bgcolor;
+     }
+ 
++    // libgraph sceGsSetDefDispEnv (DotR 0x184A18): PMODE 0x66 (circuit 2), SMODE2 from the GParam and DISPLAY in
++    // hardware units (MAGH = (w+2559)/w - 1, DW in VCK, DH doubled in interlaced FRAME mode). Other output modes
++    // keep the old DISPLAY, as libgraph does ("Not support displaymode").
++    static void setDefGsDispEnv(GsDispEnvMem &env, uint32_t psm, int32_t w, int32_t h, int32_t dx, int32_t dy)
++    {
++        const GsGParam &gp = g_gparam;
++        env.pmode = 0x66u;
++        env.smode2 = gp.interlace == 0u ? 2u : (gp.ffmode != 0u ? 3u : 1u);
++        env.dispfb = makeDispFb(0u, static_cast<uint32_t>((w + 63) >> 6), psm & 0xFu, 0u, 0u);
++        if ((gp.omode == 2u || gp.omode == 3u) && w > 0)
++        {
++            const bool pal = gp.omode == 3u;
++            const int32_t magh = (w + 2559) / w;
++            const int32_t x = magh * dx + (pal ? 656 : 636);
++            const int32_t y = dy + (gp.interlace == 1u ? (pal ? 72 : 50) : (pal ? 36 : 25));
++            const int32_t lines = gp.interlace == 1u && gp.ffmode != 0u ? 2 * h : h;
++            env.display = makeDisplay(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(magh - 1),
++                                      0u, static_cast<uint32_t>(magh * w - 1), static_cast<uint32_t>(lines - 1));
++        }
++        env.bgcolor = 0u;
++    }
++
+     static void applyGsRegPairs(PS2Runtime *runtime, const GsRegPairMem *pairs, size_t pairCount)
+     {
+         if (!runtime || !pairs || !runtime->syncCoreSubsystems())
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index ee25482..e28eb5c 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -332,14 +332,15 @@ namespace
+                                      ((a >= 0x40u) ? 0x8000u : 0u));
+     }
+ 
+-    void decodeDisplaySize(uint64_t display64, uint32_t &outWidth, uint32_t &outHeight)
++    // DH counts raster lines; in interlaced FRAME mode (SMODE2 INT=FFMD=1) each buffer line covers two (#14).
++    void decodeDisplaySize(uint64_t display64, uint64_t smode2, uint32_t &outWidth, uint32_t &outHeight)
+     {
+         const uint32_t dw = static_cast<uint32_t>((display64 >> 32) & 0x0FFFu);
+         const uint32_t dh = static_cast<uint32_t>((display64 >> 44) & 0x07FFu);
+         const uint32_t magh = static_cast<uint32_t>((display64 >> 23) & 0x0Fu);
+ 
+         outWidth = (dw + 1u) / (magh + 1u);
+-        outHeight = dh + 1u;
++        outHeight = (smode2 & 3u) == 3u ? (dh + 2u) / 2u : dh + 1u;
+         if (outWidth < 64u || outHeight < 64u)
+         {
+             outWidth = kDefaultDisplayWidth;
+@@ -2127,8 +2128,8 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+     const GSDisplayReadOrigin origin1 = decodeDisplayReadOrigin(request.dispfb1);
+     const GSDisplayReadOrigin origin2 = decodeDisplayReadOrigin(request.dispfb2);
+     uint32_t width1 = 0u, height1 = 0u, width2 = 0u, height2 = 0u;
+-    decodeDisplaySize(request.display1, width1, height1);
+-    decodeDisplaySize(request.display2, width2, height2);
++    decodeDisplaySize(request.display1, request.smode2, width1, height1);
++    decodeDisplaySize(request.display2, request.smode2, width2, height2);
+     const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
+     const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
+     if (!valid1 && !valid2)
+diff --git a/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp b/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp
+index 87c6f6b..b09740f 100644
+--- a/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_parallel_backend.cpp
+@@ -89,23 +89,6 @@ namespace
+         }
+     }
+ 
+-    // HLE sceGsSetDefDBuff/DefDBuffDc/DefDispEnv (used by the movie player, #51) write DISPLAY in the CPU
+-    // backend's units: MAGH=0, DW=width-1 pixels, DH=height-1 buffer lines, DY=32. Hardware counts DW in VCK
+-    // (MAGH+1 per pixel) and, in interlaced frame mode, DH in raster lines, so paraLLEl-GS scanned the movie out
+-    // at a quarter width and half height. Rewrite such values as libgraph's NTSC ones (636, 50, MAGH=2560/w-1).
+-    // ponytail: MAGH=0 with DW < 1024 is taken as HLE-written; no real NTSC display is that narrow.
+-    uint64_t hardwareDisplay(uint64_t display, uint64_t smode2)
+-    {
+-        const uint64_t dw = (display >> 32) & 0xfff, dh = (display >> 44) & 0x7ff, magh = (display >> 23) & 15;
+-        if (magh != 0 || dw >= 1024)
+-            return display;
+-        const uint64_t width = dw + 1, newMagh = std::max<uint64_t>(1, 2560 / width) - 1;
+-        const bool interlaced = smode2 & 1, frameMode = (smode2 >> 1) & 1;
+-        const uint64_t lines = interlaced && frameMode ? (dh + 1) * 2 : dh + 1;
+-        const uint64_t dy = interlaced ? 50 : 25;
+-        return 636 | (dy << 12) | (newMagh << 23) | ((width * (newMagh + 1) - 1) << 32) | ((lines - 1) << 44);
+-    }
+-
+     // PS2X_PGS_CENSUS=1 (#51): which GS features each primitive uses, from the raw register stream. Prints one
+     // frame's counts every 60 presents and each feature the first time it is seen. Off by default; not a model of
+     // the GS (XYZ3 kicks and PRIM-less strips are approximated).
+@@ -620,9 +603,9 @@ namespace
+             p.qwords_lo[4] = request.smode2;
+             p.qwords_lo[12] = priv.syncv;
+             p.qwords_lo[14] = request.dispfb1;
+-            p.qwords_lo[16] = hardwareDisplay(request.display1, request.smode2);
++            p.qwords_lo[16] = request.display1;
+             p.qwords_lo[18] = request.dispfb2;
+-            p.qwords_lo[20] = hardwareDisplay(request.display2, request.smode2);
++            p.qwords_lo[20] = request.display2;
+             p.qwords_lo[28] = request.bgcolor;
+             ParallelGS::VSyncInfo info{};
+             info.phase = uint32_t(priv.csr.load() >> 13) & 1u;
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 0458a8c..dcf54bf 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -557,8 +557,8 @@ void register_ps2_gs_tests()
+             std::memcpy(&xyoffset10Addr, rdram.data() + kEnvAddr + kXYOffset1AddrOffset, sizeof(xyoffset10Addr));
+ 
+             t.Equals((dispfb0 >> 9) & 0x3Fu, 10ull, "dbuff display env should seed FBW from width");
+-            t.Equals((display0 >> 32) & 0x0FFFull, 639ull, "dbuff display env should seed DW from width");
+-            t.Equals((display0 >> 44) & 0x07FFull, 447ull, "dbuff display env should seed DH from height");
++            t.Equals((display0 >> 32) & 0x0FFFull, 2559ull, "dbuff display env should seed DW in VCK like libgraph (MAGH 3)");
++            t.Equals((display0 >> 44) & 0x07FFull, 895ull, "dbuff display env should seed DH as 2h-1 in interlaced FRAME mode");
+             t.Equals((frame10 >> 16) & 0x3Full, 10ull, "dbuff draw env should seed FRAME FBW from width");
+             t.Equals(frame10Addr, 0x4Cull, "dbuff draw env should seed FRAME_1 register id");
+             t.Equals(xyoffset10 & 0xFFFFull, 0x6C00ull, "dbuff draw env should seed OFX in 12.4 fixed point");
+@@ -577,9 +577,9 @@ void register_ps2_gs_tests()
+             setRegU32(ctx, 5, 1u);
+             ps2_stubs::sceGsSwapDBuffDc(rdram.data(), &ctx, &runtime);
+ 
+-            t.Equals(runtime.memory().gs().dispfb1 & 0x1FFull, 151ull,
++            t.Equals(runtime.memory().gs().dispfb2 & 0x1FFull, 151ull,
+                      "sceGsSwapDBuffDc should program GS to the selected display page");
+-            t.Equals((runtime.memory().gs().display1 >> 32) & 0x0FFFull, 639ull,
++            t.Equals((runtime.memory().gs().display2 >> 32) & 0x0FFFull, 2559ull,
+                      "sceGsSwapDBuffDc should preserve the display width from the seeded env");
+         });
+ 
