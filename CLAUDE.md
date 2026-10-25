@@ -481,6 +481,13 @@ GitHub Issues on Glasena/dotr-recomp (`gh issue list`). Close with `Fixes #N` in
   with the precompile. Walk wall, interleaved: 106.7/98.4/91.2 -> 89.9/90.9/91.2 s (equal once the cache is warm).
   Warm map is GameThread-bound (~94% of samples; 29-37 VBlanks/s): VU1 ~52% (generated bodies 19%, out-of-line
   `fmacMath` 13%, transitions 5%), EE code 19%, EE runtime 6%, IOP 5%, pgs 5%, VIF 4%. GPU idles at P5/P8 (~25%).
+- Patch 0060 (2026-10-24, #64): `vu1fast::fmacMath<>` is `[[gnu::always_inline]]`: GCC kept it out of line in the
+  generated blocks (630 calls in the runner -> 0; the core's function-pointer table still takes its address). Map walk
+  2850->6000, pgs, warm cache, 3 interleaved pairs: wall 89.9/90.3/88.6 -> 87.7/85.6/85.0 s (~35.2 -> ~36.6
+  VBlanks/s), GameThread (whole run) 1029.5G -> 986.6G instr (-4.2%), 428.3G -> 414.8G cycles (-3.2%). CPU refs
+  byte-identical (`test_033_ref`, `test_before`, duel 5000/10000/10500/11000; `t51_long_cpu/frame_2300.png` predates
+  the #73 rand fix and differs before and after, #74). Results/AOT verify 0 mismatches (map 86k/262K, duel 1.54M/8.0M).
+  `ps2x_vu1_diff` targets now link `ps2_test_function_table` (they failed to link on a fresh build-vu1diff).
 
 ## HLE display env (2026-10-24, #14)
 - Patch 0054: the HLE `sceGsSetDefDispEnv`/`sceGsSetDefDBuff{,Dc}` now build the display env like DotR's own libgraph

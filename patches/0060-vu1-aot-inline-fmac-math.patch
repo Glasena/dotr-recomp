@@ -1,0 +1,38 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h b/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
+index 0875d64..de9dd0d 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_aot.h
+@@ -55,8 +55,9 @@ namespace vu1fast
+     };
+     using FmacMathFn = void (*)(VU1State &state, uint32_t word, FmacMath &m);
+ 
++    // Forced inline (#64): the generated blocks call it with constant op/form, and GCC kept it out of line.
+     template <uint8_t Op, bool ToAcc>
+-    inline void fmacMath(VU1State &state, uint32_t word, FmacMath &m)
++    [[gnu::always_inline]] inline void fmacMath(VU1State &state, uint32_t word, FmacMath &m)
+     {
+         constexpr bool qSource = Op == 0x1Cu || Op == 0x20u || Op == 0x24u || Op == 0x21u || Op == 0x25u;
+         constexpr bool iSource = Op == 0x1Eu || Op == 0x22u || Op == 0x26u || Op == 0x23u || Op == 0x27u;
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index ea2fb4b..d66703a 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -109,7 +109,7 @@ endif()
+ # executor, plus, with PS2X_VU1_GEN_SCRIPT (dotr-recomp tools/vu1_gen.py), code generated for those programs at
+ # build time from a capture of the fast-block run. Run with `ctest -R vu1_diff`.
+ if(UNIX)
+-    add_executable(ps2x_vu1_diff src/ps2_vu1_diff_tests.cpp)
++    add_executable(ps2x_vu1_diff src/ps2_vu1_diff_tests.cpp $<TARGET_OBJECTS:ps2_test_function_table>)
+     target_link_libraries(ps2x_vu1_diff PRIVATE ps2_runtime)
+     add_test(NAME vu1_diff COMMAND ps2x_vu1_diff 10000)
+ 
+@@ -131,7 +131,8 @@ if(UNIX)
+             VERBATIM)
+         # Its own copy of the VU1 sources with PS2X_VU1_AOT, linked ahead of ps2_runtime's.
+         add_executable(ps2x_vu1_diff_aot src/ps2_vu1_diff_tests.cpp "${VU1_SRC}/ps2_vu1_core.cpp"
+-                       "${VU1_SRC}/ps2_vu1_upper.cpp" "${VU1_SRC}/ps2_vu1_lower.cpp" "${VU1_DIFF_GEN}/vu1_aot.cpp")
++                       "${VU1_SRC}/ps2_vu1_upper.cpp" "${VU1_SRC}/ps2_vu1_lower.cpp" "${VU1_DIFF_GEN}/vu1_aot.cpp"
++                       $<TARGET_OBJECTS:ps2_test_function_table>)
+         set_source_files_properties("${VU1_SRC}/ps2_vu1_core.cpp" "${VU1_SRC}/ps2_vu1_upper.cpp"
+             "${VU1_SRC}/ps2_vu1_lower.cpp" "${VU1_DIFF_GEN}/vu1_aot.cpp" PROPERTIES COMPILE_OPTIONS "-O3")
+         target_include_directories(ps2x_vu1_diff_aot PRIVATE "${CMAKE_SOURCE_DIR}/ps2xRuntime/src/lib" "${VU1_SRC}")
